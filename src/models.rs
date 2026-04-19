@@ -214,7 +214,7 @@ pub fn parse_coeff_models(
         }
     }
 
-    if rac.get_prob(128) != 0 {
+    if rac.get_bit() != 0 {
         for pos in 1..64usize {
             if rac.get_prob(tables::VP6_COEFF_REORDER_PCT[pos]) != 0 {
                 model.coeff_reorder[pos] = rac.get_bits(4) as u8;

@@ -139,11 +139,18 @@ impl Vp6Decoder {
             ));
         }
 
-        let header = FrameHeader::parse(data)?;
-        if matches!(header.kind, FrameKind::Key) {
-            self.on_keyframe(&header);
+        // Decide whether the packet is a keyframe by sniffing bit 7 of
+        // byte 0 — cheap, no state needed.
+        let is_key = !data.is_empty() && (data[0] & 0x80) == 0;
+        let header = if is_key {
+            FrameHeader::parse(data)?
         } else if !self.initialised {
             return Err(Error::invalid("VP6: inter frame before keyframe"));
+        } else {
+            FrameHeader::parse_inter(data, self.filter_header, self.sub_version)?
+        };
+        if matches!(header.kind, FrameKind::Key) {
+            self.on_keyframe(&header);
         }
 
         mb::init_dequant(&mut self.scratch, header.qp);
@@ -215,6 +222,7 @@ impl Vp6Decoder {
         if !matches!(header.kind, FrameKind::Key) {
             models::parse_mb_type_models(&mut self.model, &mut rac);
             models::parse_vector_models(&mut self.model, &mut rac);
+            self.scratch.mb_type = tables::Vp56Mb::InterNoVecPf;
         }
         models::parse_coeff_models(
             &mut self.model,
@@ -592,7 +600,6 @@ fn vector_predictors(
 ) -> i32 {
     let mut nb_pred = 0i32;
     let mut candidates = [Mv::default(); 2];
-    scratch.vector_candidate_pos = 0;
 
     for (pos, d) in tables::VP56_CANDIDATE_PREDICTOR_POS.iter().enumerate() {
         let nc = col as i32 + d[0] as i32;

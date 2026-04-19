@@ -68,11 +68,11 @@ impl FrameHeader {
         let qp = (b0 >> 1) & 0x3F;
         let separated_coeff = (b0 & 0x01) != 0;
 
-        let mut mb_width = 0u16;
-        let mut mb_height = 0u16;
-        let mut display_mb_width = 0u16;
-        let mut display_mb_height = 0u16;
-        let mut interlaced = false;
+        let mb_width;
+        let mb_height;
+        let display_mb_width;
+        let display_mb_height;
+        let interlaced;
         let sub_version;
         let simple_profile;
         let filter_header;
@@ -113,22 +113,9 @@ impl FrameHeader {
             }
             range_coder_offset = cursor + 4;
         } else {
-            // Inter frame. No dims carried; sub_version / filter_header
-            // are carried forward by the caller.
-            sub_version = 0; // caller will override
-            simple_profile = false;
-            filter_header = 0; // caller will override
-            let mut cursor = 1usize;
-            if separated_coeff {
-                if buf.len() < cursor + 2 {
-                    return Err(Error::invalid("VP6: missing inter coeff offset"));
-                }
-                coeff_offset_bytes = (((buf[cursor] as i32) << 8) | (buf[cursor + 1] as i32)) - 2;
-                cursor += 2;
-            } else {
-                coeff_offset_bytes = 0;
-            }
-            range_coder_offset = cursor;
+            return Err(Error::invalid(
+                "VP6: inter frame requires parse_inter (needs cached filter_header)",
+            ));
         }
 
         if buf.len() < range_coder_offset + 1 {
@@ -149,6 +136,53 @@ impl FrameHeader {
             display_mb_height,
             range_coder_offset,
             interlaced,
+        })
+    }
+
+    /// Parse an inter-frame header. Callers must supply the
+    /// `filter_header` and `sub_version` cached from the previous
+    /// keyframe (FFmpeg keeps these in the `VP56Context`).
+    pub fn parse_inter(buf: &[u8], filter_header: u8, sub_version: u8) -> Result<Self> {
+        if buf.len() < 2 {
+            return Err(Error::invalid("VP6: inter frame too short"));
+        }
+        let b0 = buf[0];
+        if (b0 & 0x80) == 0 {
+            return Err(Error::invalid("VP6: parse_inter called on keyframe"));
+        }
+        let qp = (b0 >> 1) & 0x3F;
+        let separated_coeff = (b0 & 0x01) != 0;
+
+        let mut cursor = 1usize;
+        let coeff_offset_bytes;
+        if separated_coeff || filter_header == 0 {
+            if buf.len() < cursor + 2 {
+                return Err(Error::invalid("VP6: missing inter coeff offset"));
+            }
+            coeff_offset_bytes = (((buf[cursor] as i32) << 8) | (buf[cursor + 1] as i32)) - 2;
+            cursor += 2;
+        } else {
+            coeff_offset_bytes = 0;
+        }
+        let range_coder_offset = cursor;
+        if buf.len() < range_coder_offset + 1 {
+            return Err(Error::invalid("VP6: missing range-coder payload"));
+        }
+
+        Ok(FrameHeader {
+            kind: FrameKind::Inter,
+            qp,
+            separated_coeff,
+            coeff_offset_bytes,
+            sub_version,
+            simple_profile: sub_version == 0,
+            filter_header,
+            mb_width: 0,
+            mb_height: 0,
+            display_mb_width: 0,
+            display_mb_height: 0,
+            range_coder_offset,
+            interlaced: false,
         })
     }
 

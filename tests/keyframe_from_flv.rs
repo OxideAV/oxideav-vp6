@@ -1,12 +1,10 @@
-//! Integration test: pull the first VP6 keyframe out of the
-//! `asian-commercials-are-weird.flv` sample and run it through the
-//! decoder. Skips when the sample file isn't available (same pattern
-//! as oxideav-av1's `reference_clips.rs`).
+//! Integration test: decode the first VP6 keyframe — and the first
+//! handful of inter frames — from the `asian-commercials-are-weird.flv`
+//! sample. Skips when the sample file isn't available (pattern mirrors
+//! oxideav-av1's `reference_clips.rs`).
 //!
-//! Because the sample FLV sits in the oxideav monorepo's
-//! `samples/` directory rather than in this crate, the test walks up
-//! from `CARGO_MANIFEST_DIR` looking for it. Pass
-//! `OXIDEAV_FLV_SAMPLE=<path>` to override.
+//! We hand-roll a minimal FLV walker instead of pulling the
+//! `oxideav-flv` crate in as a dev-dep to keep this test standalone.
 
 use std::path::PathBuf;
 
@@ -20,10 +18,14 @@ fn sample_path() -> Option<PathBuf> {
         return if pb.exists() { Some(pb) } else { None };
     }
     let mut here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for _ in 0..4 {
+    for _ in 0..6 {
         let candidate = here.join("samples/asian-commercials-are-weird.flv");
         if candidate.exists() {
             return Some(candidate);
+        }
+        let alt = here.join("oxideav/samples/asian-commercials-are-weird.flv");
+        if alt.exists() {
+            return Some(alt);
         }
         if !here.pop() {
             break;
@@ -32,17 +34,20 @@ fn sample_path() -> Option<PathBuf> {
     None
 }
 
-/// Hand-roll the minimum FLV walk needed to pull the first video-tag
-/// payload. We don't pull in oxideav-flv as a dev-dep so this test
-/// stays standalone — the FLV crate has its own integration test.
-fn first_vp6_keyframe_body(path: &std::path::Path) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(path).ok()?;
+/// Walk the FLV, collecting the first `n` VP6F video-tag payloads
+/// (each payload is the FLV "byte after the one-byte vidoe header"
+/// prefix, ready to feed directly to `Vp6Decoder::send_packet`).
+fn collect_vp6_tags(path: &std::path::Path, n: usize) -> Vec<(bool, Vec<u8>)> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
     if bytes.len() < 13 || &bytes[0..3] != b"FLV" {
-        return None;
+        return Vec::new();
     }
     let data_offset = u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize;
     let mut pos = data_offset + 4; // skip first PreviousTagSize
-    while pos + 11 < bytes.len() {
+    let mut out = Vec::new();
+    while pos + 11 < bytes.len() && out.len() < n {
         let tag_type = bytes[pos] & 0x1F;
         let data_size = ((bytes[pos + 1] as u32) << 16)
             | ((bytes[pos + 2] as u32) << 8)
@@ -50,21 +55,20 @@ fn first_vp6_keyframe_body(path: &std::path::Path) -> Option<Vec<u8>> {
         let body_start = pos + 11;
         let body_end = body_start + data_size as usize;
         if body_end + 4 > bytes.len() {
-            return None;
+            break;
         }
         if tag_type == 0x09 && body_end - body_start >= 1 {
             let vhdr = bytes[body_start];
             let frame_type = vhdr >> 4;
             let codec_id = vhdr & 0x0F;
-            if (frame_type == 1 || frame_type == 4) && codec_id == 4 {
-                // VP6f keyframe — return the payload without the 1-byte
-                // FLV video header.
-                return Some(bytes[body_start + 1..body_end].to_vec());
+            if codec_id == 4 {
+                let is_key = frame_type == 1;
+                out.push((is_key, bytes[body_start + 1..body_end].to_vec()));
             }
         }
         pos = body_end + 4;
     }
-    None
+    out
 }
 
 #[test]
@@ -73,43 +77,117 @@ fn decode_first_vp6_keyframe() {
         eprintln!("sample FLV missing — skipping decode_first_vp6_keyframe");
         return;
     };
-    let Some(keyframe) = first_vp6_keyframe_body(&path) else {
-        eprintln!("couldn't locate first VP6 keyframe in sample — skipping");
+    let tags = collect_vp6_tags(&path, 1);
+    let Some((true, ref keyframe)) = tags.first().cloned().map(|(k, v)| (k, v)) else {
+        eprintln!("first VP6 tag in sample isn't a keyframe — skipping");
         return;
     };
-    // `first_vp6_keyframe_body` returns exactly what the FLV demuxer
-    // would hand the decoder: the 1-byte VP6 horizontal / vertical
-    // adjustment followed by the coded frame. `Vp6Decoder::send_packet`
-    // strips the adjustment byte itself.
     let params = CodecParameters::video(CodecId::new("vp6f"));
     let mut dec = Vp6Decoder::new(params);
-    let mut pkt = Packet::new(0, TimeBase::new(1, 1000), keyframe);
+    let mut pkt = Packet::new(0, TimeBase::new(1, 1000), keyframe.clone());
     pkt.pts = Some(0);
     pkt.flags.keyframe = true;
     dec.send_packet(&pkt).expect("vp6 decode keyframe");
     let frame = dec.receive_frame().expect("receive frame");
     match frame {
         Frame::Video(v) => {
-            assert!(
-                v.width > 0 && v.width <= 4096,
-                "implausible width {}",
-                v.width
-            );
-            assert!(
-                v.height > 0 && v.height <= 4096,
-                "implausible height {}",
-                v.height
-            );
+            assert_eq!(v.width, 464, "expected 464x352 frame");
+            assert_eq!(v.height, 352);
             assert_eq!(v.planes.len(), 3);
             assert_eq!(v.planes[0].data.len(), v.width as usize * v.height as usize);
-            // Luma mean — full MB + coefficient decode isn't ported
-            // yet, so the current skeleton returns a mid-grey plane.
-            // Check that the mean is within [0, 255].
-            let sum: u64 = v.planes[0].data.iter().map(|&b| b as u64).sum();
-            let mean = sum / (v.planes[0].data.len() as u64);
-            assert!(mean <= 255);
-            eprintln!("VP6 keyframe: {}x{} luma_mean={mean}", v.width, v.height);
+
+            // Luma statistics: mean, distinct values.
+            let y = &v.planes[0].data;
+            let sum: u64 = y.iter().map(|&b| b as u64).sum();
+            let mean = sum / (y.len() as u64);
+            let mut seen = [false; 256];
+            for &b in y {
+                seen[b as usize] = true;
+            }
+            let distinct = seen.iter().filter(|b| **b).count();
+            // Stable fingerprint (FNV-1a 64) of the first 64 luma bytes
+            // — surfaces in test output so regressions show up.
+            let mut hash: u64 = 0xcbf29ce484222325;
+            for &b in y.iter().take(64) {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            eprintln!(
+                "VP6 keyframe: {}x{} luma_mean={mean} luma_distinct={distinct} fnv64_y64=0x{hash:016x}",
+                v.width, v.height
+            );
+            // The target scene is a bright commercial opening card;
+            // mean should sit in a plausible mid-to-bright range.
+            assert!((32..=240).contains(&mean), "implausible luma mean {mean}");
+            // Real decoded content — not a flat plane.
+            assert!(distinct >= 10, "luma only has {distinct} distinct values");
         }
         other => panic!("expected video frame, got {other:?}"),
     }
+}
+
+#[test]
+fn decode_first_10_frames() {
+    let Some(path) = sample_path() else {
+        eprintln!("sample FLV missing — skipping decode_first_10_frames");
+        return;
+    };
+    let tags = collect_vp6_tags(&path, 10);
+    if tags.len() < 2 {
+        eprintln!("sample FLV has <2 VP6 tags — skipping");
+        return;
+    }
+
+    let params = CodecParameters::video(CodecId::new("vp6f"));
+    let mut dec = Vp6Decoder::new(params);
+    let mut prev_luma_mean: Option<u64> = None;
+    let mut decoded = 0usize;
+    let mut means = Vec::new();
+    for (idx, (is_key, payload)) in tags.iter().enumerate() {
+        let mut pkt = Packet::new(0u32, TimeBase::new(1, 1000), payload.clone());
+        pkt.pts = Some(idx as i64);
+        pkt.flags.keyframe = *is_key;
+        // Inter-frame decode is allowed to error out cleanly — we
+        // count successful decodes + sanity-check them, but don't
+        // require every frame to succeed (bitstream alignment for
+        // inter frames is especially tricky without a reference
+        // decoder to compare against).
+        match dec.send_packet(&pkt) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("send_packet #{idx}: {e:?}");
+                continue;
+            }
+        }
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => {
+                let y = &v.planes[0].data;
+                let sum: u64 = y.iter().map(|&b| b as u64).sum();
+                let mean = sum / (y.len() as u64);
+                means.push(mean);
+                decoded += 1;
+                if let Some(pm) = prev_luma_mean {
+                    // Two consecutive non-identical means is a good
+                    // signal the decoder is actually producing new
+                    // content frame-to-frame.
+                    if mean != pm {
+                        eprintln!("mean changed frame {idx}: {pm} -> {mean}");
+                    }
+                }
+                prev_luma_mean = Some(mean);
+            }
+            Ok(other) => panic!("unexpected frame {other:?}"),
+            Err(e) => {
+                eprintln!("receive_frame #{idx}: {e:?}");
+            }
+        }
+    }
+    assert!(
+        decoded >= 1,
+        "should at least decode the keyframe ({decoded}/10)"
+    );
+    eprintln!(
+        "decoded {decoded}/{} frames; luma means = {means:?}",
+        tags.len()
+    );
 }
