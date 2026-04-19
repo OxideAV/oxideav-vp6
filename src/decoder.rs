@@ -120,8 +120,7 @@ impl Vp6Decoder {
         self.height = Some(header.frame_height());
         self.scratch = BlockScratch::new(self.mb_width);
         self.model = Vp6Model::default();
-        self.model.reset_defaults(self.interlaced);
-        self.model.rebuild_coeff_tables(self.sub_version);
+        self.model.reset_defaults(self.interlaced, self.sub_version);
         self.macroblocks = vec![
             MacroblockInfo {
                 mb_type: tables::Vp56Mb::Intra,
@@ -292,7 +291,9 @@ impl Vp6Decoder {
                 // Coefficients.
                 let coeff_rac: &mut RangeCoder<'_> = rac2_storage.as_mut().unwrap_or(&mut rac);
                 if !mb::parse_coeff(&self.model, &mut self.scratch, coeff_rac) {
-                    return Err(Error::invalid("VP6: coeff stream ended prematurely"));
+                    return Err(Error::invalid(format!(
+                        "VP6: coeff stream ended prematurely at mb ({mb_row},{mb_col})"
+                    )));
                 }
 
                 // Prediction + reconstruction.
@@ -540,9 +541,9 @@ fn parse_vector_adjustment(
         }
 
         if comp == 0 {
-            vect.x = vect.x.saturating_add(delta as i16);
+            vect.x = vect.x.wrapping_add(delta as i16);
         } else {
-            vect.y = vect.y.saturating_add(delta as i16);
+            vect.y = vect.y.wrapping_add(delta as i16);
         }
     }
     vect

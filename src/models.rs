@@ -48,8 +48,9 @@ impl Default for Vp6Model {
 impl Vp6Model {
     /// Populate the model the way `vp6_default_models_init` does on
     /// every keyframe. `interlaced` selects the coefficient reorder
-    /// table.
-    pub fn reset_defaults(&mut self, interlaced: bool) {
+    /// table; `sub_version` is threaded through so the idct-selector
+    /// adjustment at sub_version > 6 fires.
+    pub fn reset_defaults(&mut self, interlaced: bool, sub_version: u8) {
         self.vector_dct = [0xA2, 0xA4];
         self.vector_sig = [0x80, 0x80];
         self.mb_types_stats = tables::DEF_MB_TYPES_STATS;
@@ -61,7 +62,7 @@ impl Vp6Model {
         } else {
             tables::VP6_DEF_COEFF_REORDER
         };
-        self.rebuild_coeff_tables(0);
+        self.rebuild_coeff_tables(sub_version);
     }
 
     /// Recompute `coeff_index_to_pos` + `coeff_index_to_idct_selector`
@@ -155,8 +156,10 @@ pub fn parse_mb_type_models(model: &mut Vp6Model, rac: &mut RangeCoder<'_>) {
                             delta = 4 * rac.get_bits(7) as i32;
                         }
                         let signed = if sign != 0 { -delta } else { delta };
-                        let new = (model.mb_types_stats[ctx][t][i] as i32 + signed).clamp(0, 255);
-                        model.mb_types_stats[ctx][t][i] = new as u8;
+                        // FFmpeg does a plain `+=` on u8 which wraps
+                        // modulo 256 — match that exactly.
+                        model.mb_types_stats[ctx][t][i] =
+                            (model.mb_types_stats[ctx][t][i] as i32 + signed) as u8;
                     }
                 }
             }
@@ -267,7 +270,7 @@ mod tests {
     #[test]
     fn default_init_matches_reference() {
         let mut model = Vp6Model::default();
-        model.reset_defaults(false);
+        model.reset_defaults(false, 0);
         assert_eq!(model.vector_dct, [0xA2, 0xA4]);
         assert_eq!(model.vector_sig, [0x80, 0x80]);
         assert_eq!(model.vector_fdv, tables::VP6_DEF_FDV_MODEL);
@@ -276,7 +279,7 @@ mod tests {
     #[test]
     fn coeff_tables_reset_consistent() {
         let mut model = Vp6Model::default();
-        model.reset_defaults(false);
+        model.reset_defaults(false, 0);
         // coeff_index_to_pos[0] always 0
         assert_eq!(model.coeff_index_to_pos[0], 0);
         // No duplicate positions — 64 unique positions.

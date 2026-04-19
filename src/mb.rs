@@ -399,7 +399,6 @@ pub fn render_mb_intra(
 /// Rebuild an inter MB: copy-or-filter from `ref_frame` then add the
 /// IDCT residual. Handles `VP56_MB_INTER_NOVEC_*` and the 7 other
 /// inter variants (including 4V) via per-block MVs cached in `scratch`.
-#[allow(clippy::too_many_arguments)]
 pub fn render_mb_inter(
     scratch: &mut BlockScratch,
     y_plane: &mut [u8],
@@ -465,18 +464,11 @@ pub fn render_mb_inter(
             PlaneRef::U => ref_u,
             PlaneRef::V => ref_v,
         };
-        let dst_plane = match plane {
-            PlaneRef::Y => y_plane.as_mut_ptr(),
-            PlaneRef::U => u_plane.as_mut_ptr(),
-            PlaneRef::V => v_plane.as_mut_ptr(),
-        };
-        // Copy the relevant 8x8 (or 12x12 including filter taps) out of
-        // ref_plane into `temp` with clamping — keeps indexing sane
-        // near edges.
-        let tap_pad_before = 1;
-        let tap_pad_after = 2;
-        let tile_side = 8 + tap_pad_before + tap_pad_after;
-        let mut temp = [0u8; (8 + 3) * (8 + 3)];
+        // Copy the relevant (8+1+2)x(8+1+2) tile out of ref_plane into
+        // `temp` with clamping — keeps indexing sane near edges.
+        let tap_pad_before = 1usize;
+        let tile_side = 11usize; // 8 + 1 + 2
+        let mut temp = [0u8; 11 * 11];
         for r in 0..tile_side {
             for c in 0..tile_side {
                 let sx =
@@ -488,29 +480,17 @@ pub fn render_mb_inter(
         }
         let src_base_in_temp = tap_pad_before * tile_side + tap_pad_before;
 
-        // Dispatch to the right filter kernel. VP6 luma uses the 4-tap
-        // bicubic table when we're in "bicubic" mode; half/quarter-pel
-        // positions that aren't both non-zero drop to the H264-chroma
-        // bilinear.
         let want_bicubic = matches!(plane, PlaneRef::Y) && use_bicubic_luma;
 
-        // SAFETY: `dst_plane` points into y/u/v_plane respectively;
-        // we don't hold concurrent borrows of the same plane because
-        // each branch picks exactly one above.
-        let dst_slice = unsafe {
-            std::slice::from_raw_parts_mut(
-                dst_plane,
-                match plane {
-                    PlaneRef::Y => y_plane.len(),
-                    PlaneRef::U => u_plane.len(),
-                    PlaneRef::V => v_plane.len(),
-                },
-            )
+        let dst_plane: &mut [u8] = match plane {
+            PlaneRef::Y => y_plane,
+            PlaneRef::U => u_plane,
+            PlaneRef::V => v_plane,
         };
 
         if x8 == 0 && y8 == 0 {
             dsp::put_block8(
-                dst_slice,
+                dst_plane,
                 dst_base,
                 stride,
                 &temp,
@@ -518,13 +498,12 @@ pub fn render_mb_inter(
                 tile_side,
             );
         } else if want_bicubic && (x8 == 0 || y8 == 0) {
-            // 1D bicubic filter — horizontal or vertical.
             let phase = if x8 != 0 { x8 } else { y8 } as usize;
             let delta = if x8 != 0 { 1 } else { tile_side as i32 };
-            let select = 16usize; // VP6 default "filter_selection"
+            let select = 16usize;
             let weights = &tables::VP6_BLOCK_COPY_FILTER[select][phase];
             dsp::filter_hv4_into(
-                dst_slice,
+                dst_plane,
                 dst_base,
                 stride,
                 &temp,
@@ -534,12 +513,11 @@ pub fn render_mb_inter(
                 weights,
             );
         } else if want_bicubic {
-            // 2D bicubic filter.
             let select = 16usize;
             let h = &tables::VP6_BLOCK_COPY_FILTER[select][x8 as usize];
             let v = &tables::VP6_BLOCK_COPY_FILTER[select][y8 as usize];
             dsp::filter_diag4(
-                dst_slice,
+                dst_plane,
                 dst_base,
                 stride,
                 &temp,
@@ -550,7 +528,7 @@ pub fn render_mb_inter(
             );
         } else {
             dsp::put_h264_chroma8(
-                dst_slice,
+                dst_plane,
                 dst_base,
                 stride,
                 &temp,
@@ -564,11 +542,7 @@ pub fn render_mb_inter(
         // Residual add.
         let mut block = scratch.block_coeff[b];
         let sel = scratch.idct_selector[b];
-        match plane {
-            PlaneRef::Y => idct_add_selector(&mut y_plane[dst_base..], stride, &mut block, sel),
-            PlaneRef::U => idct_add_selector(&mut u_plane[dst_base..], stride, &mut block, sel),
-            PlaneRef::V => idct_add_selector(&mut v_plane[dst_base..], stride, &mut block, sel),
-        }
+        idct_add_selector(&mut dst_plane[dst_base..], stride, &mut block, sel);
         scratch.block_coeff[b] = block;
     }
 }

@@ -78,7 +78,7 @@ fn decode_first_vp6_keyframe() {
         return;
     };
     let tags = collect_vp6_tags(&path, 1);
-    let Some((true, ref keyframe)) = tags.first().cloned().map(|(k, v)| (k, v)) else {
+    let Some((true, ref keyframe)) = tags.first().cloned() else {
         eprintln!("first VP6 tag in sample isn't a keyframe — skipping");
         return;
     };
