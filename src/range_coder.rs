@@ -1,150 +1,227 @@
 //! VP56 "bool coder" range decoder.
 //!
-//! VP6 inherits its arithmetic decoder from VP5/VP56 — an 8-bit range
-//! coder whose state is an unsigned range (`code_word` + `high`) and a
-//! count of bits still valid in `code_word`. The semantics match
-//! FFmpeg's `libavcodec/vp56rac.c`:
+//! VP6 inherits its arithmetic decoder from VPX (VP5..VP9). See
+//! FFmpeg's `libavcodec/vpx_rac.c` + `vpx_rac.h` — the decoder is
+//! initialised with the first 3 bytes of the partition (big-endian
+//! 24-bit seed) and refills `code_word` in 16-bit chunks.
 //!
-//! * `get_prob(p)`: decode a single binary symbol whose probability
-//!   of being zero is `p` (out of 256). Returns 0 or 1.
-//! * `get_bits(n)`: decode `n` uniformly-distributed raw bits (i.e.
-//!   `get_prob(128)` repeated `n` times). Used for raw fields and
-//!   trailing motion-vector magnitude bits.
-//! * `get_tree(tree, probs)`: walk a binary prob tree the way libvpx
-//!   / libavcodec express motion-vector / token / mode trees.
+//! Key functions:
+//! * [`RangeCoder::get_prob`] — probabilistic binary read (matches
+//!   `vpx_rac_get_prob`).
+//! * [`RangeCoder::get_bit`] — equiprobable binary read (matches
+//!   `vpx_rac_get`). **NOT** the same as `get_prob(128)` — the two
+//!   paths split the current interval at different points.
+//! * [`RangeCoder::get_bits`] — `n` equiprobable bits (MSB-first).
+//! * [`RangeCoder::get_tree`] — walk a [`Vp56Tree`] the way FFmpeg's
+//!   `vp56_rac_get_tree` does (used for PMBT/PVA trees).
 //!
-//! VP6 streams are MSB-first, so `load_byte()` shifts the next byte
-//! into the low end of `code_word` and advances the read cursor.
-//!
-//! A companion [`RangeEncoder`] lets the unit tests round-trip
-//! arbitrary symbol sequences without needing a reference stream.
+//! A [`RangeEncoder`] counterpart lives in tests / round-trip checks.
 
 use oxideav_core::{Error, Result};
+
+/// Shift lookup used during renormalisation — how many bit-shifts are
+/// needed to drag `high` back up to 128..=255. Mirrors
+/// `ff_vpx_norm_shift` in FFmpeg.
+const NORM_SHIFT: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 1usize;
+    while i < 256 {
+        let mut v = i as u32;
+        let mut s = 0u8;
+        while v < 128 {
+            v <<= 1;
+            s += 1;
+        }
+        t[i] = s;
+        i += 1;
+    }
+    t[0] = 8;
+    t
+};
+
+/// VP56 static binary probability tree. Each node has `val` — the jump
+/// distance if the bit reads `1` (0 or negative marks a leaf whose
+/// symbol is `-val`) — and `prob_idx` — the index into the caller-
+/// supplied probability slice.
+#[derive(Clone, Copy, Debug)]
+pub struct Vp56Tree {
+    pub val: i8,
+    pub prob_idx: u8,
+}
+
+impl Vp56Tree {
+    pub const fn new(val: i8, prob_idx: u8) -> Self {
+        Self { val, prob_idx }
+    }
+}
 
 /// VP56 bool-coder decoder.
 #[derive(Debug, Clone)]
 pub struct RangeCoder<'a> {
     data: &'a [u8],
-    /// Current byte offset within `data`.
+    /// Current byte cursor inside `data`.
     pos: usize,
-    /// Current range (the "high" value in FFmpeg). Always > 0x80 after
-    /// each renormalisation.
+    /// Current interval high value — `high` in FFmpeg.
     high: u32,
-    /// Current bits-remaining counter — when it drops to zero we need
-    /// to pull another byte from `data`.
+    /// "bits" counter — stored as a signed value that starts negative
+    /// (at `-16` after init) and ticks toward `0`, matching FFmpeg's
+    /// `c->bits` sign convention (stored negated so the common path is
+    /// a single add).
     bits: i32,
-    /// Current low word — the "code word" in FFmpeg.
-    code: u32,
+    /// Current 32-bit window into the stream.
+    code_word: u32,
+    /// Counts refills past the end of the stream. FFmpeg flags
+    /// `vpx_rac_is_end` after ~10 such refills; decoders use this to
+    /// bail out of infinite loops when the stream is malformed.
+    end_reached: u32,
 }
 
 impl<'a> RangeCoder<'a> {
-    /// Create a new decoder positioned at the start of `data`. Pulls
-    /// two bytes to prime the state (matches
-    /// `ff_vp56_init_range_decoder`).
+    /// Prime a decoder for `data`. Mirrors `ff_vpx_init_range_decoder`:
+    /// read a 24-bit big-endian seed into `code_word` and start with
+    /// `bits = -16` so the first `get_prob` triggers a 16-bit refill
+    /// at the correct time.
     pub fn new(data: &'a [u8]) -> Result<Self> {
-        if data.len() < 2 {
-            return Err(Error::invalid("VP56: range coder needs >= 2 bytes"));
+        if data.is_empty() {
+            return Err(Error::invalid("VP56: range coder needs >= 1 byte"));
         }
-        let code = ((data[0] as u32) << 8) | data[1] as u32;
+        let b0 = data[0] as u32;
+        let b1 = data.get(1).copied().unwrap_or(0) as u32;
+        let b2 = data.get(2).copied().unwrap_or(0) as u32;
+        let code_word = (b0 << 16) | (b1 << 8) | b2;
+        let pos = data.len().min(3);
         Ok(Self {
             data,
-            pos: 2,
+            pos,
             high: 255,
-            bits: 8,
-            code,
+            bits: -16,
+            code_word,
+            end_reached: 0,
         })
     }
 
-    /// Read one binary symbol whose probability-of-zero is `prob`
-    /// (256 = certain zero, 0 = certain one). Matches libavcodec's
-    /// `vp56_rac_get_prob`.
+    /// Refill `code_word` and scale `high` so the top octet is always
+    /// at least 128. Matches the `vpx_rac_renorm` inline helper.
+    /// Returns the fresh `code_word` for the caller to sample.
+    #[inline]
+    fn renorm(&mut self) -> u32 {
+        let shift = NORM_SHIFT[self.high as usize & 0xFF] as i32;
+        self.high <<= shift;
+        self.code_word <<= shift;
+        self.bits += shift;
+        if self.bits >= 0 && self.pos < self.data.len() {
+            let b0 = self.data[self.pos] as u32;
+            let b1 = self.data.get(self.pos + 1).copied().unwrap_or(0) as u32;
+            self.pos = (self.pos + 2).min(self.data.len());
+            // Shift the fresh 16 bits into the upper half of the 32-bit
+            // register — the precise position is given by `bits`
+            // (negative = room left, 0 = shift into positions 0..=15).
+            let shift_amount = self.bits as u32;
+            self.code_word |= ((b0 << 8) | b1) << shift_amount;
+            self.bits -= 16;
+        }
+        self.code_word
+    }
+
+    /// Probabilistic binary read (`vpx_rac_get_prob`). Returns 0/1 with
+    /// the given probability of `1`. `prob` is on a 0..=255 scale where
+    /// 0 means "always 0" and 255 means "almost always 1".
+    #[inline]
     pub fn get_prob(&mut self, prob: u8) -> u8 {
-        // `split` is the first-order split of the current interval.
-        // VP56 uses `1 + (((self.high - 1) * prob) >> 8)` — expressed
-        // here in u32 to avoid overflow on the multiply.
-        let split = 1 + (((self.high - 1) * prob as u32) >> 8);
-        let bit = if (self.code >> 8) >= split {
-            self.high -= split;
-            self.code -= split << 8;
-            1
+        let code_word = self.renorm();
+        let low = 1 + (((self.high - 1) * prob as u32) >> 8);
+        let low_shift = low << 16;
+        let bit = if code_word >= low_shift { 1u8 } else { 0u8 };
+        if bit != 0 {
+            self.high -= low;
+            self.code_word = code_word - low_shift;
         } else {
-            self.high = split;
-            0
-        };
-        self.renormalise();
+            self.high = low;
+            self.code_word = code_word;
+        }
         bit
     }
 
-    /// Read `n` uniformly-distributed raw bits.
+    /// Equiprobable binary read (`vpx_rac_get`). Functionally close to
+    /// `get_prob(128)` but uses a different interval split so the two
+    /// are **not** interchangeable when replaying an FFmpeg-encoded
+    /// stream.
+    #[inline]
+    pub fn get_bit(&mut self) -> u8 {
+        let code_word = self.renorm();
+        let low = (self.high + 1) >> 1;
+        let low_shift = low << 16;
+        let bit = if code_word >= low_shift { 1u8 } else { 0u8 };
+        if bit != 0 {
+            self.high -= low;
+            self.code_word = code_word - low_shift;
+        } else {
+            self.high = low;
+            self.code_word = code_word;
+        }
+        bit
+    }
+
+    /// Read `n` equiprobable bits, MSB-first. Matches VP56's
+    /// `vp56_rac_gets`.
     pub fn get_bits(&mut self, n: u32) -> u32 {
         let mut value = 0u32;
         for _ in 0..n {
-            value = (value << 1) | self.get_prob(128) as u32;
+            value = (value << 1) | self.get_bit() as u32;
         }
         value
     }
 
-    /// Walk a VP56 probability tree the way libvpx expresses them
-    /// (array of `(prob, next_index)`-ish encoded as a flat
-    /// `i8` slice with sentinel).
-    ///
-    /// This is a helper — callers with bespoke tree shapes should use
-    /// `get_prob` directly. The tree here takes a probability at each
-    /// step and returns the final leaf value as a `u8`, matching the
-    /// small VP6 intra-mode trees that don't need the full libvpx
-    /// encoding scheme.
-    pub fn get_tree(&mut self, probs: &[u8]) -> u8 {
-        // Walk a linear probability chain (used for small binary
-        // decisions) — extended trees are decoded by specialised
-        // functions rather than the generic helper.
-        let mut v = 0u8;
-        for &p in probs {
-            v = (v << 1) | self.get_prob(p);
+    /// Read a 7-bit "non-zero-nudged" value. Mirrors
+    /// `vp56_rac_gets_nn`: read 7 bits, shift left by 1, then force
+    /// bit 0 to be 1 if the result is zero (so the model never lands
+    /// on a zero probability). Returns 0..=255.
+    pub fn get_bits_nn(&mut self) -> u32 {
+        let v = self.get_bits(7) << 1;
+        if v == 0 {
+            1
+        } else {
+            v
         }
-        v
     }
 
-    fn renormalise(&mut self) {
-        // Left-shift both state words until `high` is at least 0x80
-        // again. Pull a new input byte each time bits runs out. Matches
-        // the tight inner loop in ff_vp56_rac_renormalize.
-        while self.high < 0x80 {
-            self.high <<= 1;
-            self.code <<= 1;
-            self.bits -= 1;
-            if self.bits == 0 {
-                self.load_byte();
+    /// Walk a [`Vp56Tree`] using per-node probabilities. Returns the
+    /// leaf symbol (positive integer). Mirrors `vp56_rac_get_tree`.
+    pub fn get_tree(&mut self, tree: &[Vp56Tree], probs: &[u8]) -> i32 {
+        let mut idx = 0usize;
+        loop {
+            let node = tree[idx];
+            if node.val <= 0 {
+                return (-node.val) as i32;
+            }
+            let bit = self.get_prob(probs[node.prob_idx as usize]);
+            if bit != 0 {
+                idx = idx.wrapping_add(node.val as usize);
+            } else {
+                idx += 1;
             }
         }
     }
 
-    fn load_byte(&mut self) {
-        let b = if self.pos < self.data.len() {
-            let v = self.data[self.pos];
-            self.pos += 1;
-            v
-        } else {
-            // FFmpeg simply reads past the end with zero fill when the
-            // stream is exhausted; match that behaviour so we don't
-            // trip on the last few symbols of a valid frame.
-            0
-        };
-        self.code |= b as u32;
-        self.bits = 8;
+    /// `true` after the stream is effectively exhausted — used by the
+    /// coefficient parser to abort on malformed data. Mirrors
+    /// `vpx_rac_is_end`.
+    pub fn is_end(&mut self) -> bool {
+        if self.pos >= self.data.len() && self.bits >= 0 {
+            self.end_reached = self.end_reached.saturating_add(1);
+        }
+        self.end_reached > 10
     }
 
-    /// How many bytes of the input have been consumed (advisory — VP6
-    /// coefficient decoding occasionally wants to pick up right where
-    /// the bool coder left off).
+    /// Advisory: number of input bytes consumed. Used by VP6's
+    /// coefficient-partition offset logic.
     pub fn bytes_consumed(&self) -> usize {
         self.pos
     }
 }
 
-/// Matching encoder for unit tests — ported from libvpx's
-/// `vp8_encode_bool` loop-free variant (RFC 6386 §20.2). VP6's
-/// decoder mirrors VP8's arithmetic exactly, so the same encoder
-/// round-trips here.
+/// Round-trip encoder for unit tests. Mirrors libvpx's VP8 bool-encoder
+/// which shares arithmetic with VP6.
 #[derive(Debug, Clone)]
 pub struct RangeEncoder {
     out: Vec<u8>,
@@ -205,16 +282,41 @@ impl RangeEncoder {
         self.lowvalue = lowvalue;
     }
 
+    /// Encode an equiprobable bit matching FFmpeg's `vpx_rac_get` split
+    /// (`low = (high+1) >> 1`).
+    pub fn put_bit(&mut self, bit: u8) {
+        let split = (self.range + 1) >> 1;
+        let (mut range, mut lowvalue) = if bit != 0 {
+            (self.range - split, self.lowvalue.wrapping_add(split))
+        } else {
+            (split, self.lowvalue)
+        };
+        while range < 128 {
+            range <<= 1;
+            if (lowvalue & 0x8000_0000) != 0 {
+                Self::add_one_to_output(&mut self.out);
+            }
+            lowvalue <<= 1;
+            self.count += 1;
+            if self.count == 0 {
+                self.out.push(((lowvalue >> 24) & 0xff) as u8);
+                lowvalue &= 0x00ff_ffff;
+                self.count = -8;
+            }
+        }
+        self.range = range;
+        self.lowvalue = lowvalue;
+    }
+
     pub fn put_bits(&mut self, n: u32, value: u32) {
         for i in (0..n).rev() {
-            self.put_prob(128, ((value >> i) & 1) as u8);
+            self.put_bit(((value >> i) & 1) as u8);
         }
     }
 
     pub fn finish(mut self) -> Vec<u8> {
-        // Pad with 32 uniform zero bits to flush the state register.
         for _ in 0..32 {
-            self.put_prob(128, 0);
+            self.put_bit(0);
         }
         self.out
     }
@@ -225,14 +327,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn init_requires_two_bytes() {
-        assert!(RangeCoder::new(&[0]).is_err());
+    fn init_requires_at_least_one_byte() {
         assert!(RangeCoder::new(&[]).is_err());
-        assert!(RangeCoder::new(&[0, 0]).is_ok());
+        assert!(RangeCoder::new(&[0]).is_ok());
     }
 
     #[test]
-    fn roundtrip_single_symbol() {
+    fn roundtrip_single_prob_symbol() {
         for prob in [1u8, 64, 128, 192, 250] {
             for bit in [0u8, 1u8] {
                 let mut enc = RangeEncoder::new();
@@ -245,32 +346,50 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_sequence() {
-        // Encode a deterministic sequence of mixed probs and decode it
-        // back. 64 symbols is enough to exercise several
-        // renormalisations and at least one byte boundary.
-        let script: Vec<(u8, u8)> = (0..64)
-            .map(|i| {
-                let prob = [16u8, 64, 128, 200, 240][i % 5];
-                let bit = ((i * 1103515245 + 12345) >> 7) as u8 & 1;
-                (prob, bit)
-            })
-            .collect();
-        let mut enc = RangeEncoder::new();
-        for (p, b) in &script {
-            enc.put_prob(*p, *b);
-        }
-        let bytes = enc.finish();
-        let mut dec = RangeCoder::new(&bytes).unwrap();
-        for (i, (p, b)) in script.iter().enumerate() {
-            let got = dec.get_prob(*p);
-            assert_eq!(got, *b, "mismatch at symbol {i} (prob={p} expect={b})");
+    fn roundtrip_single_equiprobable_bit() {
+        for bit in [0u8, 1u8] {
+            let mut enc = RangeEncoder::new();
+            enc.put_bit(bit);
+            let bytes = enc.finish();
+            let mut dec = RangeCoder::new(&bytes).unwrap();
+            assert_eq!(dec.get_bit(), bit, "bit={bit}");
         }
     }
 
     #[test]
-    fn raw_bits_roundtrip() {
-        // 16 bits of arbitrary data.
+    fn roundtrip_sequence_mixed() {
+        // Mix `put_prob` and `put_bit` — this catches any divergence
+        // between the two interval-split rules.
+        let script: Vec<(bool, u8, u8)> = (0..128)
+            .map(|i| {
+                let prob = [16u8, 64, 128, 200, 240][i % 5];
+                let bit = ((i * 1103515245 + 12345) >> 7) as u8 & 1;
+                let is_raw = (i & 3) == 0;
+                (is_raw, prob, bit)
+            })
+            .collect();
+        let mut enc = RangeEncoder::new();
+        for (is_raw, p, b) in &script {
+            if *is_raw {
+                enc.put_bit(*b);
+            } else {
+                enc.put_prob(*p, *b);
+            }
+        }
+        let bytes = enc.finish();
+        let mut dec = RangeCoder::new(&bytes).unwrap();
+        for (i, (is_raw, p, b)) in script.iter().enumerate() {
+            let got = if *is_raw {
+                dec.get_bit()
+            } else {
+                dec.get_prob(*p)
+            };
+            assert_eq!(got, *b, "mismatch at symbol {i} (raw={is_raw} p={p})");
+        }
+    }
+
+    #[test]
+    fn raw_bits_roundtrip_16_bits() {
         let value: u32 = 0xBEEF;
         let mut enc = RangeEncoder::new();
         enc.put_bits(16, value);
@@ -280,12 +399,42 @@ mod tests {
     }
 
     #[test]
-    fn zero_fill_past_end() {
-        // Starve the decoder and make sure it returns a defined result
-        // (FFmpeg-style zero fill) rather than panicking.
+    fn zero_fill_past_end_doesnt_panic() {
         let mut dec = RangeCoder::new(&[0, 0]).unwrap();
         for _ in 0..256 {
             let _ = dec.get_prob(128);
+        }
+        // is_end is a polling predicate that increments a counter each
+        // time it observes "buffer exhausted + bits didn't slide"; it
+        // flips to true after ~10 such calls, matching FFmpeg.
+        let mut flipped = false;
+        for _ in 0..32 {
+            if dec.is_end() {
+                flipped = true;
+                break;
+            }
+        }
+        assert!(flipped);
+    }
+
+    #[test]
+    fn get_tree_linear() {
+        // Two-leaf tree: probs[0] decides 0 vs 1. Encode + decode.
+        let tree = [
+            Vp56Tree::new(2, 0),
+            Vp56Tree::new(-5, 0),
+            Vp56Tree::new(-11, 0),
+        ];
+        let probs = [200u8];
+
+        for expected in [5i32, 11] {
+            let bit = if expected == 11 { 1 } else { 0 };
+            let mut enc = RangeEncoder::new();
+            enc.put_prob(probs[0], bit);
+            let bytes = enc.finish();
+            let mut dec = RangeCoder::new(&bytes).unwrap();
+            let got = dec.get_tree(&tree, &probs);
+            assert_eq!(got, expected);
         }
     }
 }
