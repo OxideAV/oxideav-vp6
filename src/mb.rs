@@ -399,6 +399,13 @@ pub fn render_mb_intra(
 /// Rebuild an inter MB: copy-or-filter from `ref_frame` then add the
 /// IDCT residual. Handles `VP56_MB_INTER_NOVEC_*` and the 7 other
 /// inter variants (including 4V) via per-block MVs cached in `scratch`.
+///
+/// When `deblock_filtering` is set (per-frame flag, controlled by the
+/// header bit `s->deblock_filtering`), we apply the VP3-style 4-tap
+/// edge filter on the source-tile scratch across any 8x8 block boundary
+/// that falls inside the MC region — this matches FFmpeg's
+/// `vp56_deblock_filter` call in `vp56_mc`.
+#[allow(clippy::too_many_arguments)]
 pub fn render_mb_inter(
     scratch: &mut BlockScratch,
     y_plane: &mut [u8],
@@ -415,7 +422,17 @@ pub fn render_mb_inter(
     plane_w: [usize; 3],
     plane_h: [usize; 3],
     use_bicubic_luma: bool,
+    deblock_filtering: bool,
 ) {
+    // 12x12 source tile: 2 pixels of pad on every side (FFmpeg uses a
+    // 12x16 scratch in `vp56_mc`; the extra width is alignment, not a
+    // semantic need). The put-target 8x8 block sits at position (2, 2).
+    //
+    // The VP3-style loop filter reads `p[-2..+2]` across an edge, so we
+    // need 2 pixels of context on each side — hence the pad width.
+    const TILE: usize = 12;
+    const TILE_PAD: usize = 2;
+
     for b in 0..6usize {
         let (plane, stride) = match tables::B2P[b] {
             0 => (PlaneRef::Y, y_stride),
@@ -452,33 +469,54 @@ pub fn render_mb_inter(
         let x8 = (mv.x as i32 & mask) * if matches!(plane, PlaneRef::Y) { 2 } else { 1 };
         let y8 = (mv.y as i32 & mask) * if matches!(plane, PlaneRef::Y) { 2 } else { 1 };
 
-        // Output tile.
+        // Output tile in the current frame.
         let dst_base = base_y * stride + base_x;
 
-        // Source tile top-left, computed as base + (dx, dy). Clamp to
-        // avoid reading out of bounds — we do a simple mirror-extend
-        // by clamping the sample positions (keeps the MV handling
-        // robust even for unusual streams).
         let ref_plane = match plane {
             PlaneRef::Y => ref_y,
             PlaneRef::U => ref_u,
             PlaneRef::V => ref_v,
         };
-        // Copy the relevant (8+1+2)x(8+1+2) tile out of ref_plane into
-        // `temp` with clamping — keeps indexing sane near edges.
-        let tap_pad_before = 1usize;
-        let tile_side = 11usize; // 8 + 1 + 2
-        let mut temp = [0u8; 11 * 11];
-        for r in 0..tile_side {
-            for c in 0..tile_side {
-                let sx =
-                    (base_x as i32 + dx + c as i32 - tap_pad_before as i32).clamp(0, pw as i32 - 1);
-                let sy =
-                    (base_y as i32 + dy + r as i32 - tap_pad_before as i32).clamp(0, ph as i32 - 1);
-                temp[r * tile_side + c] = ref_plane[sy as usize * stride + sx as usize];
+        // Materialise a 12x12 reference-tile scratch around `(base_x +
+        // dx - TILE_PAD, base_y + dy - TILE_PAD)`. We clamp sample
+        // positions so edge MVs stay well-defined.
+        let mut temp = [0u8; TILE * TILE];
+        for r in 0..TILE {
+            for c in 0..TILE {
+                let sx = (base_x as i32 + dx + c as i32 - TILE_PAD as i32).clamp(0, pw as i32 - 1);
+                let sy = (base_y as i32 + dy + r as i32 - TILE_PAD as i32).clamp(0, ph as i32 - 1);
+                temp[r * TILE + c] = ref_plane[sy as usize * stride + sx as usize];
             }
         }
-        let src_base_in_temp = tap_pad_before * tile_side + tap_pad_before;
+
+        // VP3-style edge filter on the scratch, applied across the
+        // nearest 8x8-aligned edge in the reference frame when the
+        // integer-pel component of the MV straddles a block. We use
+        // `rem_euclid` so negative MVs still map into [0, 7] the way
+        // FFmpeg's signed `& 7` does on 2's-complement.
+        //
+        // Edge column = `TILE_PAD + (8 - dx_mod8)` = `10 - dx_mod8`.
+        // Edge row = `TILE_PAD + (8 - dy_mod8)` = `10 - dy_mod8`.
+        // The filter reads 2 pixels before + writes 2 in-place, hence
+        // the 12-wide pad.
+        if deblock_filtering {
+            let dx_mod = dx.rem_euclid(8);
+            let dy_mod = dy.rem_euclid(8);
+            let bounding = scratch.bounding_values;
+            if dx_mod != 0 {
+                let col = 10 - dx_mod as usize;
+                // Filter 12 rows, so we run top-to-bottom of the whole
+                // 12-tall scratch. `first_pixel` is the row 0 column
+                // index of the left neighbour of the edge.
+                dsp::h_loop_filter_12(&mut temp, col, TILE, &bounding);
+            }
+            if dy_mod != 0 {
+                let row = 10 - dy_mod as usize;
+                dsp::v_loop_filter_12(&mut temp, row * TILE, TILE, &bounding);
+            }
+        }
+
+        let src_base_in_temp = TILE_PAD * TILE + TILE_PAD;
 
         let want_bicubic = matches!(plane, PlaneRef::Y) && use_bicubic_luma;
 
@@ -489,17 +527,10 @@ pub fn render_mb_inter(
         };
 
         if x8 == 0 && y8 == 0 {
-            dsp::put_block8(
-                dst_plane,
-                dst_base,
-                stride,
-                &temp,
-                src_base_in_temp,
-                tile_side,
-            );
+            dsp::put_block8(dst_plane, dst_base, stride, &temp, src_base_in_temp, TILE);
         } else if want_bicubic && (x8 == 0 || y8 == 0) {
             let phase = if x8 != 0 { x8 } else { y8 } as usize;
-            let delta = if x8 != 0 { 1 } else { tile_side as i32 };
+            let delta = if x8 != 0 { 1 } else { TILE as i32 };
             let select = 16usize;
             let weights = &tables::VP6_BLOCK_COPY_FILTER[select][phase];
             dsp::filter_hv4_into(
@@ -508,7 +539,7 @@ pub fn render_mb_inter(
                 stride,
                 &temp,
                 src_base_in_temp,
-                tile_side,
+                TILE,
                 delta,
                 weights,
             );
@@ -522,7 +553,7 @@ pub fn render_mb_inter(
                 stride,
                 &temp,
                 src_base_in_temp,
-                tile_side,
+                TILE,
                 h,
                 v,
             );
@@ -533,7 +564,7 @@ pub fn render_mb_inter(
                 stride,
                 &temp,
                 src_base_in_temp,
-                tile_side,
+                TILE,
                 x8,
                 y8,
             );

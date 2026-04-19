@@ -22,8 +22,7 @@ use crate::range_coder::RangeCoder;
 use crate::tables;
 
 /// VP6 flavour. Tracks whether we're decoding the FLV-only `vp6f` (no
-/// alpha) or `vp6a` (alpha plane prefixed). Today only `vp6f` decode
-/// proceeds — `vp6a` packets surface as `Error::Unsupported`.
+/// alpha) or `vp6a` (alpha plane prefixed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Vp6Variant {
     Flv,
@@ -39,33 +38,9 @@ impl Vp6Variant {
     }
 }
 
-/// Streaming VP6 decoder.
-pub struct Vp6Decoder {
-    codec_id: CodecId,
-    variant: Vp6Variant,
-    queued: VecDeque<VideoFrame>,
-    pending_pts: Option<i64>,
-    pending_tb: TimeBase,
-    width: Option<u32>,
-    height: Option<u32>,
-
-    // Persistent state across frames.
-    mb_width: usize,
-    mb_height: usize,
-    sub_version: u8,
-    filter_header: u8,
-    interlaced: bool,
-    model: Vp6Model,
-    scratch: BlockScratch,
-    prev_frame: Option<RefPlanes>,
-    golden_frame: Option<RefPlanes>,
-    macroblocks: Vec<MacroblockInfo>,
-    /// Set to `true` once we've decoded the first keyframe and know
-    /// `mb_width`/`mb_height` + sub_version etc.
-    initialised: bool,
-}
-
-/// Lightweight reference-frame plane holder.
+/// Lightweight reference-frame plane holder. For the YUV stream all
+/// three planes are populated; for the alpha stream only `y` is used
+/// (the alpha data rides in the luma slot of a monochrome VP6 decode).
 #[derive(Clone, Debug)]
 pub(crate) struct RefPlanes {
     pub y: Vec<u8>,
@@ -73,34 +48,34 @@ pub(crate) struct RefPlanes {
     pub v: Vec<u8>,
 }
 
-impl std::fmt::Debug for Vp6Decoder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Vp6Decoder")
-            .field("codec_id", &self.codec_id)
-            .field("variant", &self.variant)
-            .field("width", &self.width)
-            .field("height", &self.height)
-            .field("queued", &self.queued.len())
-            .finish()
-    }
+/// Per-stream VP6 decode state. An alpha-enabled packet carries two
+/// independent streams (YUV + alpha); we keep their state in separate
+/// [`Vp6Stream`] instances, matching FFmpeg's `s->alpha_context`.
+#[derive(Debug)]
+pub(crate) struct Vp6Stream {
+    pub mb_width: usize,
+    pub mb_height: usize,
+    pub sub_version: u8,
+    pub filter_header: u8,
+    pub interlaced: bool,
+    pub deblock_filtering: bool,
+    pub model: Vp6Model,
+    pub scratch: BlockScratch,
+    pub prev_frame: Option<RefPlanes>,
+    pub golden_frame: Option<RefPlanes>,
+    pub macroblocks: Vec<MacroblockInfo>,
+    pub initialised: bool,
 }
 
-impl Vp6Decoder {
-    pub fn new(params: CodecParameters) -> Self {
-        let variant = Vp6Variant::from_codec_id(&params.codec_id);
+impl Default for Vp6Stream {
+    fn default() -> Self {
         Self {
-            codec_id: params.codec_id,
-            variant,
-            queued: VecDeque::new(),
-            pending_pts: None,
-            pending_tb: TimeBase::new(1, 1000),
-            width: params.width,
-            height: params.height,
             mb_width: 0,
             mb_height: 0,
             sub_version: 0,
             filter_header: 0,
             interlaced: false,
+            deblock_filtering: true,
             model: Vp6Model::default(),
             scratch: BlockScratch::new(1),
             prev_frame: None,
@@ -109,15 +84,18 @@ impl Vp6Decoder {
             initialised: false,
         }
     }
+}
 
+/// Output planes plus (width, height) from a single frame decode.
+type DecodedPlanes = (Vec<u8>, Vec<u8>, Vec<u8>, usize, usize);
+
+impl Vp6Stream {
     fn on_keyframe(&mut self, header: &FrameHeader) {
         self.mb_width = header.mb_width as usize;
         self.mb_height = header.mb_height as usize;
         self.sub_version = header.sub_version;
         self.filter_header = header.filter_header;
         self.interlaced = header.interlaced;
-        self.width = Some(header.frame_width());
-        self.height = Some(header.frame_height());
         self.scratch = BlockScratch::new(self.mb_width);
         self.model = Vp6Model::default();
         self.model.reset_defaults(self.interlaced, self.sub_version);
@@ -131,15 +109,11 @@ impl Vp6Decoder {
         self.initialised = true;
     }
 
-    fn decode_bytes(&mut self, data: &[u8]) -> Result<VideoFrame> {
-        if matches!(self.variant, Vp6Variant::FlvAlpha) {
-            return Err(Error::unsupported(
-                "VP6: vp6a (alpha plane) decode not yet implemented",
-            ));
-        }
-
-        // Decide whether the packet is a keyframe by sniffing bit 7 of
-        // byte 0 — cheap, no state needed.
+    /// Decode a single VP6 frame's worth of bytes into three YUV planes
+    /// (luma stride = `width`, chroma stride = `width/2`). The alpha
+    /// stream calls this same routine — the `y` plane is the carrier
+    /// for the alpha sample data (chroma bands are produced but unused).
+    fn decode_frame(&mut self, data: &[u8]) -> Result<DecodedPlanes> {
         let is_key = !data.is_empty() && (data[0] & 0x80) == 0;
         let header = if is_key {
             FrameHeader::parse(data)?
@@ -155,25 +129,20 @@ impl Vp6Decoder {
         mb::init_dequant(&mut self.scratch, header.qp);
         self.scratch.keyframe = matches!(header.kind, FrameKind::Key);
 
-        // The bool coder starts at `range_coder_offset`. When there's a
-        // separated coefficient partition the secondary bool coder
-        // starts `coeff_offset_bytes` past that point.
         let rac_start = header.range_coder_offset;
         let rac_buf = &data[rac_start..];
         let mut rac = RangeCoder::new(rac_buf)?;
         let mut header_filter_info = false;
 
-        // Rest of the picture header.
         let mut golden_frame_flag = false;
         if matches!(header.kind, FrameKind::Key) {
-            // Skip 2 bits (`vp56_rac_gets(c, 2)`).
             let _ = rac.get_bits(2);
             header_filter_info = header.filter_header != 0;
         } else {
             golden_frame_flag = rac.get_bit() != 0;
             if self.filter_header != 0 {
-                let deblock_filtering = rac.get_bit() != 0;
-                if deblock_filtering {
+                self.deblock_filtering = rac.get_bit() != 0;
+                if self.deblock_filtering {
                     let _ = rac.get_bit();
                 }
                 if self.sub_version > 7 {
@@ -182,7 +151,6 @@ impl Vp6Decoder {
             }
         }
 
-        // Filter-info selection (carried through picture header).
         let vrt_shift: u32 = if matches!(header.kind, FrameKind::Key) && self.sub_version < 8 {
             5
         } else {
@@ -210,14 +178,8 @@ impl Vp6Decoder {
             ));
         }
 
-        // If coeff_offset is non-zero there's a second bool coder for
-        // the coefficient partition. We build it but don't drive it
-        // separately — FFmpeg's `vp6_parse_coeff` is a single function
-        // that pulls from `s->ccp`. We implement that here by handing
-        // in the right range coder.
         let coeff_offset_bytes = header.coeff_offset_bytes.max(0) as usize;
 
-        // Keyframe / inter picture headers.
         if !matches!(header.kind, FrameKind::Key) {
             models::parse_mb_type_models(&mut self.model, &mut rac);
             models::parse_vector_models(&mut self.model, &mut rac);
@@ -234,12 +196,9 @@ impl Vp6Decoder {
             let _il_prob = rac.get_bits(8);
         }
 
-        let _ = filter_mode;
         let _ = filter_selection;
         let _ = golden_frame_flag;
 
-        // Set up a secondary range coder for the coefficient partition
-        // if present. VP6 splits coeff/mb data in some streams.
         let mut rac2_storage: Option<RangeCoder<'_>> = if coeff_offset_bytes > 0 {
             let coeff_start = rac_start + coeff_offset_bytes;
             if coeff_start >= data.len() {
@@ -250,7 +209,6 @@ impl Vp6Decoder {
             None
         };
 
-        // Allocate output planes.
         let width = self.mb_width * 16;
         let height = self.mb_height * 16;
         let y_stride = width;
@@ -263,7 +221,6 @@ impl Vp6Decoder {
         let plane_w = [width, width / 2, width / 2];
         let plane_h = [height, height / 2, height / 2];
 
-        // Primary-pass DC-predictor / MV predictor state.
         self.scratch.reset_row(self.mb_width);
 
         let use_bicubic_luma = filter_mode != 0;
@@ -271,9 +228,8 @@ impl Vp6Decoder {
         for mb_row in 0..self.mb_height {
             self.scratch.start_row(self.mb_width);
             for mb_col in 0..self.mb_width {
-                // MB-type + MV decode.
-                let mb_type = if matches!(header.kind, FrameKind::Key) {
-                    tables::Vp56Mb::Intra
+                let (mb_type, stored_mv) = if matches!(header.kind, FrameKind::Key) {
+                    (tables::Vp56Mb::Intra, Mv::default())
                 } else {
                     decode_mv(
                         &mut self.model,
@@ -286,9 +242,10 @@ impl Vp6Decoder {
                     )
                 };
                 self.scratch.mb_type = mb_type;
-                self.macroblocks[mb_row * self.mb_width + mb_col].mb_type = mb_type;
+                let cell = &mut self.macroblocks[mb_row * self.mb_width + mb_col];
+                cell.mb_type = mb_type;
+                cell.mv = stored_mv;
 
-                // Coefficients.
                 let coeff_rac: &mut RangeCoder<'_> = rac2_storage.as_mut().unwrap_or(&mut rac);
                 if !mb::parse_coeff(&self.model, &mut self.scratch, coeff_rac) {
                     return Err(Error::invalid(format!(
@@ -296,7 +253,6 @@ impl Vp6Decoder {
                     )));
                 }
 
-                // Prediction + reconstruction.
                 let ref_kind: RefKind = tables::REFERENCE_FRAME[mb_type as usize].into();
                 mb::add_predictors_dc(&mut self.scratch, ref_kind);
 
@@ -337,11 +293,9 @@ impl Vp6Decoder {
                                 plane_w,
                                 plane_h,
                                 use_bicubic_luma,
+                                self.deblock_filtering,
                             );
                         } else {
-                            // No valid reference — fall back to intra
-                            // reconstruction (matches FFmpeg's conceal
-                            // path).
                             mb::render_mb_intra(
                                 &mut self.scratch,
                                 &mut y_plane,
@@ -361,7 +315,6 @@ impl Vp6Decoder {
             }
         }
 
-        // Build the output frame and update reference pools.
         let output = RefPlanes {
             y: y_plane.clone(),
             u: u_plane.clone(),
@@ -372,34 +325,147 @@ impl Vp6Decoder {
         }
         self.prev_frame = Some(output);
 
-        let frame = VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: width as u32,
-            height: height as u32,
-            pts: self.pending_pts,
-            time_base: self.pending_tb,
-            planes: vec![
-                VideoPlane {
-                    stride: y_stride,
-                    data: y_plane,
-                },
-                VideoPlane {
-                    stride: uv_stride,
-                    data: u_plane,
-                },
-                VideoPlane {
-                    stride: uv_stride,
-                    data: v_plane,
-                },
-            ],
+        Ok((y_plane, u_plane, v_plane, width, height))
+    }
+}
+
+/// Streaming VP6 decoder.
+pub struct Vp6Decoder {
+    codec_id: CodecId,
+    variant: Vp6Variant,
+    queued: VecDeque<VideoFrame>,
+    pending_pts: Option<i64>,
+    pending_tb: TimeBase,
+    width: Option<u32>,
+    height: Option<u32>,
+
+    /// Primary YUV decode context.
+    stream: Vp6Stream,
+    /// Secondary decode context used by `vp6a` for the alpha plane.
+    alpha_stream: Vp6Stream,
+}
+
+impl std::fmt::Debug for Vp6Decoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Vp6Decoder")
+            .field("codec_id", &self.codec_id)
+            .field("variant", &self.variant)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("queued", &self.queued.len())
+            .finish()
+    }
+}
+
+impl Vp6Decoder {
+    pub fn new(params: CodecParameters) -> Self {
+        let variant = Vp6Variant::from_codec_id(&params.codec_id);
+        Self {
+            codec_id: params.codec_id,
+            variant,
+            queued: VecDeque::new(),
+            pending_pts: None,
+            pending_tb: TimeBase::new(1, 1000),
+            width: params.width,
+            height: params.height,
+            stream: Vp6Stream::default(),
+            alpha_stream: Vp6Stream::default(),
+        }
+    }
+
+    fn decode_bytes(&mut self, data: &[u8]) -> Result<VideoFrame> {
+        // vp6a prefix: 3-byte BE24 offset to the alpha partition. The
+        // bytes after the prefix up to that offset are the primary YUV
+        // bitstream; the remainder is a second, independently-coded
+        // VP6 bitstream carrying the alpha plane.
+        let (yuv_data, alpha_data) = if matches!(self.variant, Vp6Variant::FlvAlpha) {
+            if data.len() < 3 {
+                return Err(Error::invalid(
+                    "VP6 vp6a: packet too short for alpha offset",
+                ));
+            }
+            let alpha_offset =
+                (((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32)) as usize;
+            let rest = &data[3..];
+            if alpha_offset > rest.len() {
+                return Err(Error::invalid("VP6 vp6a: alpha offset past end"));
+            }
+            (&rest[..alpha_offset], Some(&rest[alpha_offset..]))
+        } else {
+            (data, None)
         };
-        Ok(frame)
+
+        let (y_plane, u_plane, v_plane, width, height) = self.stream.decode_frame(yuv_data)?;
+        self.width = Some(width as u32);
+        self.height = Some(height as u32);
+        let y_stride = width;
+        let uv_stride = width / 2;
+
+        if let Some(alpha_bytes) = alpha_data {
+            // The alpha stream is a standalone monochrome VP6. Its luma
+            // plane is the alpha sample data; chroma is discarded.
+            let (alpha_plane, _, _, aw, ah) = self.alpha_stream.decode_frame(alpha_bytes)?;
+            if aw != width || ah != height {
+                return Err(Error::invalid(
+                    "VP6 vp6a: alpha dimensions disagree with YUV",
+                ));
+            }
+            let frame = VideoFrame {
+                format: PixelFormat::Yuva420P,
+                width: width as u32,
+                height: height as u32,
+                pts: self.pending_pts,
+                time_base: self.pending_tb,
+                planes: vec![
+                    VideoPlane {
+                        stride: y_stride,
+                        data: y_plane,
+                    },
+                    VideoPlane {
+                        stride: uv_stride,
+                        data: u_plane,
+                    },
+                    VideoPlane {
+                        stride: uv_stride,
+                        data: v_plane,
+                    },
+                    VideoPlane {
+                        stride: y_stride,
+                        data: alpha_plane,
+                    },
+                ],
+            };
+            Ok(frame)
+        } else {
+            let frame = VideoFrame {
+                format: PixelFormat::Yuv420P,
+                width: width as u32,
+                height: height as u32,
+                pts: self.pending_pts,
+                time_base: self.pending_tb,
+                planes: vec![
+                    VideoPlane {
+                        stride: y_stride,
+                        data: y_plane,
+                    },
+                    VideoPlane {
+                        stride: uv_stride,
+                        data: u_plane,
+                    },
+                    VideoPlane {
+                        stride: uv_stride,
+                        data: v_plane,
+                    },
+                ],
+            };
+            Ok(frame)
+        }
     }
 }
 
 /// Port of `vp56_decode_mv` / `vp6_parse_vector_adjustment` + the MB
-/// candidate predictor walk. Returns the decoded MB type and updates
-/// `scratch.mv[..]` + `scratch.vector_candidate[..]`.
+/// candidate predictor walk. Returns the decoded MB type and the MV to
+/// stash into the persistent `macroblocks[]` slot.
 fn decode_mv(
     model: &mut Vp6Model,
     scratch: &mut BlockScratch,
@@ -408,7 +474,7 @@ fn decode_mv(
     mb_width: usize,
     row: usize,
     col: usize,
-) -> tables::Vp56Mb {
+) -> (tables::Vp56Mb, Mv) {
     let ctx = vector_predictors(
         scratch,
         macroblocks,
@@ -419,18 +485,24 @@ fn decode_mv(
     );
     let mb_type = parse_mb_type(rac, model, scratch.mb_type, ctx as usize);
 
-    match mb_type {
+    // The MV stored back into `macroblocks[row*mb_width + col].mv` drives
+    // future MV-candidate lookups from neighbouring MBs. FFmpeg's
+    // `vp56_decode_mv` assigns `*mv` into that slot at function exit
+    // (and the 4V branch stores `s->mv[3]` explicitly). Mirror that here.
+    let stored_mv = match mb_type {
         tables::Vp56Mb::InterV1Pf => {
             let mv = scratch.vector_candidate[0];
             for b in 0..6 {
                 scratch.mv[b] = mv;
             }
+            mv
         }
         tables::Vp56Mb::InterV2Pf => {
             let mv = scratch.vector_candidate[1];
             for b in 0..6 {
                 scratch.mv[b] = mv;
             }
+            mv
         }
         tables::Vp56Mb::InterV1Gf => {
             vector_predictors(
@@ -445,6 +517,7 @@ fn decode_mv(
             for b in 0..6 {
                 scratch.mv[b] = mv;
             }
+            mv
         }
         tables::Vp56Mb::InterV2Gf => {
             vector_predictors(
@@ -459,12 +532,14 @@ fn decode_mv(
             for b in 0..6 {
                 scratch.mv[b] = mv;
             }
+            mv
         }
         tables::Vp56Mb::InterDeltaPf => {
             let mv = parse_vector_adjustment(rac, model, scratch);
             for b in 0..6 {
                 scratch.mv[b] = mv;
             }
+            mv
         }
         tables::Vp56Mb::InterDeltaGf => {
             vector_predictors(
@@ -479,18 +554,22 @@ fn decode_mv(
             for b in 0..6 {
                 scratch.mv[b] = mv;
             }
+            mv
         }
         tables::Vp56Mb::Inter4V => {
             decode_4mv(rac, model, scratch);
+            // FFmpeg stores block 3's MV for the whole-MB predictor.
+            scratch.mv[3]
         }
         _ => {
             for b in 0..6 {
                 scratch.mv[b] = Mv::default();
             }
+            Mv::default()
         }
-    }
+    };
 
-    mb_type
+    (mb_type, stored_mv)
 }
 
 fn parse_mb_type(
@@ -666,9 +745,8 @@ impl Decoder for Vp6Decoder {
     fn reset(&mut self) -> Result<()> {
         self.queued.clear();
         self.pending_pts = None;
-        self.prev_frame = None;
-        self.golden_frame = None;
-        self.initialised = false;
+        self.stream = Vp6Stream::default();
+        self.alpha_stream = Vp6Stream::default();
         Ok(())
     }
 }
@@ -676,16 +754,6 @@ impl Decoder for Vp6Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn alpha_variant_errors() {
-        let params = CodecParameters::video(CodecId::new("vp6a"));
-        let mut dec = Vp6Decoder::new(params);
-        let mut data = vec![0u8];
-        data.extend_from_slice(&[0u8, 0, 0, 2, 12, 16, 12, 16, 0xFF, 0xFF, 0xFF, 0, 0]);
-        let pkt = Packet::new(0, TimeBase::new(1, 1000), data);
-        assert!(matches!(dec.send_packet(&pkt), Err(Error::Unsupported(_))));
-    }
 
     #[test]
     fn inter_before_keyframe_errors() {
@@ -697,6 +765,19 @@ mod tests {
         data.push((1 << 7) | ((qp << 1) & 0x7E));
         data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0]);
         let pkt = Packet::new(0, TimeBase::new(1, 1000), data);
+        let res = dec.send_packet(&pkt);
+        assert!(matches!(res, Err(Error::InvalidData(_))), "{res:?}");
+    }
+
+    #[test]
+    fn alpha_packet_too_short_for_offset_prefix() {
+        // Without enough bytes for the 3-byte alpha offset prefix, the
+        // decoder reports InvalidData (not Unsupported).
+        let params = CodecParameters::video(CodecId::new("vp6a"));
+        let mut dec = Vp6Decoder::new(params);
+        // 1-byte flv prefix + 2 body bytes → after strip, len=2, short
+        // for alpha prefix.
+        let pkt = Packet::new(0, TimeBase::new(1, 1000), vec![0u8, 0, 0]);
         let res = dec.send_packet(&pkt);
         assert!(matches!(res, Err(Error::InvalidData(_))), "{res:?}");
     }
