@@ -491,4 +491,55 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn h_loop_filter_smooths_sharp_edge() {
+        // Build a 12-row tall, 12-col wide scratch with a sharp vertical
+        // step at col 6: cols 0..6 = 100, cols 6..12 = 200. The filter
+        // should soften that edge at cols 5,6 (one each side).
+        let mut data = [0u8; 12 * 12];
+        for r in 0..12 {
+            for c in 0..12 {
+                data[r * 12 + c] = if c < 6 { 100 } else { 200 };
+            }
+        }
+        let mut bounding = [0i32; 256];
+        set_bounding_values(&mut bounding, 30);
+        h_loop_filter_12(&mut data, 6, 12, &bounding);
+        // After filtering: col 5 should rise, col 6 should fall; the
+        // rest of the row is untouched.
+        for r in 0..12 {
+            assert!(
+                data[r * 12 + 5] > 100,
+                "row {r} col 5 should have risen (is {})",
+                data[r * 12 + 5]
+            );
+            assert!(
+                data[r * 12 + 6] < 200,
+                "row {r} col 6 should have fallen (is {})",
+                data[r * 12 + 6]
+            );
+            assert_eq!(data[r * 12 + 4], 100, "row {r} col 4 should be untouched");
+            assert_eq!(data[r * 12 + 7], 200, "row {r} col 7 should be untouched");
+        }
+    }
+
+    #[test]
+    fn v_loop_filter_smooths_sharp_edge() {
+        // Horizontal edge: rows 0..6 = 50, rows 6..12 = 220. Filter
+        // across row 6 smooths it.
+        let mut data = [0u8; 12 * 12];
+        for r in 0..12 {
+            for c in 0..12 {
+                data[r * 12 + c] = if r < 6 { 50 } else { 220 };
+            }
+        }
+        let mut bounding = [0i32; 256];
+        set_bounding_values(&mut bounding, 30);
+        v_loop_filter_12(&mut data, 6 * 12, 12, &bounding);
+        for c in 0..12 {
+            assert!(data[5 * 12 + c] > 50, "col {c} row 5 should have risen");
+            assert!(data[6 * 12 + c] < 220, "col {c} row 6 should have fallen");
+        }
+    }
 }

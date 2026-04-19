@@ -3,9 +3,10 @@
 Pure-Rust On2 **VP6** video decoder for oxideav. Zero C dependencies,
 no FFI, no `*-sys` crates.
 
-Covers the `vp6f` flavour used inside FLV (Flash Video). `vp6a`
-(VP6 with an alpha plane) is not yet implemented and returns
-`Error::Unsupported`.
+Covers both FLV flavours:
+* **vp6f** — the Flash Video codec-id-4 stream, YUV 4:2:0.
+* **vp6a** — codec-id-5 with an additional full-resolution alpha plane;
+  output as `Yuva420P`.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -46,7 +47,10 @@ bicubic interpolator + `vpx_rac.h` for the bool coder).
   (per-8x8 MVs, averaged chroma MV), `INTER_DELTA_*`
   (`vp6_parse_vector_adjustment` with the predicted-delta tree and
   the full-delta bit layout), and the 12-position MV candidate
-  predictor walk.
+  predictor walk. The chosen MV is stashed back into the persistent
+  `macroblocks[]` table so future neighbours see it — the missing
+  piece of that write-back was the cause of inter-frame drift
+  through the 0.0.1 series.
 - **Coefficient decode — range path**: full port of `vp6_parse_coeff`,
   including zero-run categories, the 6-category long tree, the
   `coeff_dcct` / `coeff_ract` / `coeff_runv` trees, and the reorder
@@ -63,6 +67,18 @@ bicubic interpolator + `vpx_rac.h` for the bool coder).
   phases. Edge pixels are mirror-clamped into a scratch tile instead
   of FFmpeg's `emulated_edge_mc` — functionally equivalent for
   interior-dominated streams.
+- **VP3-style deblock loop filter**: per-block edge filter
+  (`ff_vp3dsp_{h,v}_loop_filter_12`) applied to the 12x12 MC scratch
+  tile before sub-pel filtering, gated by the `deblock_filtering`
+  bit in the picture header (keyframe default = on, matching
+  FFmpeg's `ff_vp56_init_context`). Only the VP6 variant is wired;
+  VP5's separate `vp56dsp.edge_filter_{hor,ver}` path is irrelevant
+  to FLV/vp6 streams.
+- **`vp6a` alpha plane**: two-stream decode driven by the 3-byte
+  BE24 alpha offset at the head of each packet. The primary context
+  decodes YUV as usual; a second context decodes the alpha partition
+  as a monochrome VP6 stream and the luma samples surface as the
+  `A` plane of a `Yuva420P` output.
 - **Reference-frame management**: tracks `prev_frame` and
   `golden_frame` planes inside the decoder. Keyframes overwrite both;
   inter frames refresh golden when the golden-frame flag is set.
@@ -74,31 +90,31 @@ bicubic interpolator + `vpx_rac.h` for the bool coder).
   `use_huffman = 1`, the decoder returns `Error::Unsupported`. Out of
   scope for the first release; the main FLV sample and most real
   streams use the range-coder path.
-- **`vp6a` alpha plane**: the FLV `vp6a` codec-id carries a VP6
-  alpha-channel stream prefixed by a 3-byte offset into the payload.
-  Decoder accepts the codec-id for registration but errors on
-  `send_packet`.
-- **Loop filter** (`vp56_deblock_filter` — a VP3-style 4-tap edge
-  filter applied per-block around non-zero-phase MVs). The IDCT
-  bounding-values table is computed (`dsp::set_bounding_values`) but
-  not yet wired into the MC path. Streams with deblock-on see
-  slightly blockier output than FFmpeg's.
 - **Interlaced profile**: parsed but not exercised end-to-end.
 
 ### Test coverage
 
-The crate ships:
+The crate ships 30 library unit tests plus 4 integration tests:
 
-- Unit tests for the range coder round-trip, the IDCT (DC-only flat
-  block, add-zero identity), the loop filter bounding-values table,
-  the H.264 chroma MC integer-pel fast path, model defaults, and the
-  MB-type enum layout. 28 tests total.
-- `tests/keyframe_from_flv.rs`, which walks the
+- **Unit tests** for the range coder round-trip, the IDCT (DC-only flat
+  block, add-zero identity), the loop filter bounding-values table and
+  edge-smoothing (`h_loop_filter_smooths_sharp_edge`,
+  `v_loop_filter_smooths_sharp_edge`), the H.264 chroma MC
+  integer-pel fast path, model defaults, and the MB-type enum layout.
+- `tests/keyframe_from_flv.rs` — walks the
   `asian-commercials-are-weird.flv` sample (skipped if absent;
   override path via `OXIDEAV_FLV_SAMPLE=...`), decodes the first
-  VP6F keyframe, and sanity-checks width/height + non-trivial luma
-  content. A companion test decodes the first 10 tags and reports
-  how many complete.
+  VP6F keyframe, then runs 20 consecutive frames through the inter
+  decode path and asserts all 20 decode cleanly.
+- `tests/loop_filter_delta.rs` — synthetic test that renders an inter
+  MB over a block-aligned reference edge with deblock-filtering off
+  vs. on, asserts the filter reduces the output gradient across the
+  former edge.
+- `tests/vp6a_roundtrip.rs` — synthesises a vp6a packet by wrapping a
+  real VP6F keyframe in the 3-byte alpha-offset prefix + duplicating
+  it into the alpha partition, decodes it, and verifies a 4-plane
+  YUVA frame with non-zero alpha pixels. No real vp6a FLV fixture is
+  shipped in the tree; if you have one, set `OXIDEAV_FLV_SAMPLE`.
 
 ## Quick use
 

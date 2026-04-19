@@ -127,31 +127,26 @@ fn decode_first_vp6_keyframe() {
 }
 
 #[test]
-fn decode_first_10_frames() {
+fn decode_first_20_frames() {
     let Some(path) = sample_path() else {
-        eprintln!("sample FLV missing — skipping decode_first_10_frames");
+        eprintln!("sample FLV missing — skipping decode_first_20_frames");
         return;
     };
-    let tags = collect_vp6_tags(&path, 10);
+    let tags = collect_vp6_tags(&path, 20);
     if tags.len() < 2 {
         eprintln!("sample FLV has <2 VP6 tags — skipping");
         return;
     }
+    let want = tags.len();
 
     let params = CodecParameters::video(CodecId::new("vp6f"));
     let mut dec = Vp6Decoder::new(params);
-    let mut prev_luma_mean: Option<u64> = None;
     let mut decoded = 0usize;
     let mut means = Vec::new();
     for (idx, (is_key, payload)) in tags.iter().enumerate() {
         let mut pkt = Packet::new(0u32, TimeBase::new(1, 1000), payload.clone());
         pkt.pts = Some(idx as i64);
         pkt.flags.keyframe = *is_key;
-        // Inter-frame decode is allowed to error out cleanly — we
-        // count successful decodes + sanity-check them, but don't
-        // require every frame to succeed (bitstream alignment for
-        // inter frames is especially tricky without a reference
-        // decoder to compare against).
         match dec.send_packet(&pkt) {
             Ok(()) => {}
             Err(e) => {
@@ -166,15 +161,6 @@ fn decode_first_10_frames() {
                 let mean = sum / (y.len() as u64);
                 means.push(mean);
                 decoded += 1;
-                if let Some(pm) = prev_luma_mean {
-                    // Two consecutive non-identical means is a good
-                    // signal the decoder is actually producing new
-                    // content frame-to-frame.
-                    if mean != pm {
-                        eprintln!("mean changed frame {idx}: {pm} -> {mean}");
-                    }
-                }
-                prev_luma_mean = Some(mean);
             }
             Ok(other) => panic!("unexpected frame {other:?}"),
             Err(e) => {
@@ -182,12 +168,9 @@ fn decode_first_10_frames() {
             }
         }
     }
-    assert!(
-        decoded >= 1,
-        "should at least decode the keyframe ({decoded}/10)"
-    );
-    eprintln!(
-        "decoded {decoded}/{} frames; luma means = {means:?}",
-        tags.len()
+    eprintln!("decoded {decoded}/{want} frames; luma means = {means:?}");
+    assert_eq!(
+        decoded, want,
+        "all {want} frames should decode (got {decoded})"
     );
 }
