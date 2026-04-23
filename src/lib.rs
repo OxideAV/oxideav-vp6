@@ -22,8 +22,8 @@ pub mod models;
 pub mod range_coder;
 pub mod tables;
 
-use oxideav_codec::{Decoder, DecoderFactory};
-use oxideav_core::{CodecId, CodecParameters, Result};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, DecoderFactory};
+use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
 
 pub use decoder::{Vp6Decoder, Vp6Variant};
 pub use frame_header::{FrameHeader, FrameKind};
@@ -54,4 +54,28 @@ pub fn vp6f_codec_id() -> CodecId {
 /// Short-hand `CodecId` constructor for `vp6a`.
 pub fn vp6a_codec_id() -> CodecId {
     CodecId::new(CODEC_ID_VP6A)
+}
+
+/// Register the VP6 decoder(s) with a codec registry.
+///
+/// Two codec ids are registered:
+/// * `vp6f` — Flash Video codec-id 4, plain YUV 4:2:0.
+/// * `vp6a` — Flash Video codec-id 5, YUVA 4:2:0:4 with an alpha plane.
+pub fn register(reg: &mut CodecRegistry) {
+    let caps = CodecCapabilities::video("vp6_sw")
+        .with_lossy(true)
+        .with_intra_only(false)
+        .with_max_size(16383, 16383);
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_VP6F))
+            .capabilities(caps.clone())
+            .decoder(make_decoder)
+            .tags([CodecTag::fourcc(b"VP60"), CodecTag::fourcc(b"VP61"), CodecTag::fourcc(b"VP62")]),
+    );
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_VP6A))
+            .capabilities(caps)
+            .decoder(make_decoder)
+            .tags([CodecTag::fourcc(b"VP6A")]),
+    );
 }
