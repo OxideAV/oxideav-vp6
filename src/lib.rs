@@ -16,6 +16,7 @@
 
 pub mod decoder;
 pub mod dsp;
+pub mod encoder;
 pub mod frame_header;
 pub mod mb;
 pub mod models;
@@ -26,8 +27,9 @@ use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, DecoderFactory};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
 
 pub use decoder::{Vp6Decoder, Vp6Variant};
+pub use encoder::Vp6Encoder;
 pub use frame_header::{FrameHeader, FrameKind};
-pub use range_coder::RangeCoder;
+pub use range_coder::{RangeCoder, RangeEncoder};
 pub use tables::Vp56Mb;
 
 /// Stable codec-id strings.
@@ -70,7 +72,11 @@ pub fn register(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_VP6F))
             .capabilities(caps.clone())
             .decoder(make_decoder)
-            .tags([CodecTag::fourcc(b"VP60"), CodecTag::fourcc(b"VP61"), CodecTag::fourcc(b"VP62")]),
+            .tags([
+                CodecTag::fourcc(b"VP60"),
+                CodecTag::fourcc(b"VP61"),
+                CodecTag::fourcc(b"VP62"),
+            ]),
     );
     reg.register(
         CodecInfo::new(CodecId::new(CODEC_ID_VP6A))
