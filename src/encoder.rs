@@ -45,15 +45,27 @@ struct EncRefDc {
 /// VP6F encoder.
 ///
 /// Each [`Vp6Encoder::encode_keyframe`] call emits a complete elementary-
-/// stream frame. Internal state (model, reference frames) is reset at
-/// the start of every keyframe so the encoder is "stateless" across
-/// keyframes until inter-frame support lands.
+/// stream frame and resets internal state; subsequent
+/// [`Vp6Encoder::encode_skip_frame`] calls emit inter frames that are
+/// byte-valid P-frames with every MB coded as `InterNoVecPf` (copy the
+/// previous frame, no residual). That's the minimum viable scaffolding
+/// for the P-frame bitstream layer; a motion-compensated residual-
+/// carrying encode is the next step.
 #[derive(Debug)]
 pub struct Vp6Encoder {
     /// Quantiser parameter (0 = highest quality, 63 = coarsest).
     pub qp: u8,
     /// Use the `sub_version = 0` "simple profile" layout.
     pub sub_version: u8,
+    /// Dimensions (in MBs) from the last encoded keyframe. Needed so
+    /// [`Vp6Encoder::encode_skip_frame`] can produce a well-formed
+    /// inter-frame header without requiring callers to re-supply them.
+    mb_width: u16,
+    mb_height: u16,
+    /// True once a keyframe has been successfully emitted — gates
+    /// `encode_skip_frame` so callers can't emit an inter before a
+    /// keyframe is established.
+    have_keyframe: bool,
 }
 
 impl Default for Vp6Encoder {
@@ -61,6 +73,9 @@ impl Default for Vp6Encoder {
         Self {
             qp: 32,
             sub_version: 0,
+            mb_width: 0,
+            mb_height: 0,
+            have_keyframe: false,
         }
     }
 }
@@ -71,6 +86,9 @@ impl Vp6Encoder {
         Self {
             qp: qp.min(63),
             sub_version: 0,
+            mb_width: 0,
+            mb_height: 0,
+            have_keyframe: false,
         }
     }
 
@@ -301,7 +319,173 @@ impl Vp6Encoder {
         }
 
         out.extend_from_slice(&enc.finish());
+        self.mb_width = mb_width as u16;
+        self.mb_height = mb_height as u16;
+        self.have_keyframe = true;
         Ok(out)
+    }
+
+    /// Emit a minimal P-frame: every macroblock is `InterNoVecPf`
+    /// (reference = previous frame, zero motion vector) with no coded
+    /// residual. Our in-tree decoder reconstructs by copying the
+    /// previous frame 1:1, so this is a valid "identity" inter frame.
+    ///
+    /// Scope:
+    /// * Bitstream layout: inter-frame header, bool-coded picture header
+    ///   with zero updates to every prob model (mb-type, vector, and
+    ///   inter coefficient), one `stay on prev_type` bit per MB, and
+    ///   three zero-EOB bits per block (all coefficients zero).
+    /// * Compatibility: verified end-to-end with our decoder; the
+    ///   ffmpeg reference decoder currently rejects the output (the
+    ///   prob-encoding of the mb-type model update pass and/or some
+    ///   subsequent flag diverges from ffmpeg's expectations). The
+    ///   mismatch is limited to inter-frame probabilities, not the
+    ///   keyframe path which rides through cleanly.
+    /// * Next steps: fixing the ffmpeg-side acceptance, wiring up real
+    ///   MV decisions via `VP56_PVA_TREE` / `vector_fdv`, and emitting
+    ///   actual residual coefficients through the inter-key coeff-model
+    ///   branch. All three can build on top of this scaffold without
+    ///   reshaping the bitstream surface.
+    ///
+    /// Returns an error if no keyframe has been encoded yet, since the
+    /// decoder needs to have parsed the keyframe-side of the model /
+    /// dimensions before it can consume an inter frame.
+    pub fn encode_skip_frame(&mut self) -> Result<EncodedFrame> {
+        if !self.have_keyframe {
+            return Err(Error::invalid(
+                "VP6 encode: skip frame requires a preceding keyframe",
+            ));
+        }
+        let mb_width = self.mb_width as usize;
+        let mb_height = self.mb_height as usize;
+
+        // --- Fixed header (inter layout) ---------------------------------
+        // byte 0: frame_mode=1 (top bit), 6-bit QP, separated_coeff=0.
+        let mut out = Vec::<u8>::with_capacity(16 + mb_width * mb_height * 2);
+        out.push(0x80 | ((self.qp << 1) & 0x7E));
+        // With `filter_header == 0` and `separated_coeff == 0` on the
+        // keyframe-side, the inter header layout is: 2-byte coeff-offset
+        // field (so adjusted-value = 0), then the bool-coded picture
+        // header starts immediately. See `FrameHeader::parse_inter`.
+        out.push(0);
+        out.push(2);
+
+        // --- Bool-coded body --------------------------------------------
+        let mut enc = RangeEncoder::new();
+        // golden_frame_flag = 0. No filter-info path because our
+        // keyframes use filter_header = 0 + sub_version = 0.
+        enc.put_bit(0);
+        // use_huffman = 0 (always bool-coded path here).
+        enc.put_bit(0);
+
+        // --- MB-type probability model update pass (parse_mb_type_models).
+        // For every context and prob flag we emit 0 so the decoder
+        // retains its default DEF_MB_TYPES_STATS; after rebuild those
+        // give prob(mb_type[ctx][InterNoVecPf][0]) = a usable value we
+        // then feed "stay on prev_type" bits through.
+        for _ctx in 0..3 {
+            enc.put_prob(174, 0); // no per-context stats reset
+            enc.put_prob(254, 0); // no per-entry delta updates
+        }
+
+        // --- Vector-model update pass (parse_vector_models). Zero for
+        // every flag => defaults retained.
+        for comp in 0..2 {
+            enc.put_prob(tables::VP6_SIG_DCT_PCT[comp][0], 0);
+            enc.put_prob(tables::VP6_SIG_DCT_PCT[comp][1], 0);
+        }
+        for comp in 0..2 {
+            for node in 0..7 {
+                enc.put_prob(tables::VP6_PDV_PCT[comp][node], 0);
+            }
+        }
+        for comp in 0..2 {
+            for node in 0..8 {
+                enc.put_prob(tables::VP6_FDV_PCT[comp][node], 0);
+            }
+        }
+
+        // --- Coefficient-model update pass (parse_coeff_models, key=false).
+        // Zero for every flag. On `key=false` the decoder does NOT copy
+        // `def_prob` through for skipped nodes — the table carries over
+        // whatever the keyframe established, which is what we want.
+        for pt in 0..2 {
+            for node in 0..11 {
+                enc.put_prob(tables::VP6_DCCV_PCT[pt][node], 0);
+            }
+        }
+        // Coefficient-reorder update flag = 0.
+        enc.put_bit(0);
+        // Run-value update probabilities.
+        for cg in 0..2 {
+            for node in 0..14 {
+                enc.put_prob(tables::VP6_RUNV_PCT[cg][node], 0);
+            }
+        }
+        // AC coefficient update probabilities.
+        for ct in 0..3 {
+            for pt in 0..2 {
+                for cg in 0..6 {
+                    for node in 0..11 {
+                        enc.put_prob(tables::VP6_RACT_PCT[ct][pt][cg][node], 0);
+                    }
+                }
+            }
+        }
+
+        // --- Per-MB: keep mb_type = InterNoVecPf for every MB, emit
+        // zero-residual for all 6 blocks.
+        //
+        // `parse_mb_type` reads `rac.get_prob(mb_type_model[ctx][prev][0])`
+        // as a "stay on prev_type" prob: bit=1 means "yes, same as
+        // prev_type". We want InterNoVecPf every time, so we shadow the
+        // decoder's model-rebuild sequence on the encoder side too, and
+        // feed bit=1 through the correct prob.
+        let mut model = Vp6Model::default();
+        model.reset_defaults(false, self.sub_version);
+        // parse_mb_type_models emitted no updates => stats untouched =>
+        // mb_type[] matches what rebuild_mb_type_probs produces from
+        // DEF_MB_TYPES_STATS.
+        model.rebuild_mb_type_probs();
+
+        for _mb_row in 0..mb_height {
+            for _mb_col in 0..mb_width {
+                // `vector_predictors` returns `nb_pred + 1`. All our
+                // neighbours are either out of bounds or zero-MV
+                // InterNoVecPf macroblocks; the decoder's candidate
+                // filter skips both, so `nb_pred = 0` and `ctx = 1`
+                // for every MB we emit.
+                let ctx: usize = 1;
+                let prev_type = tables::Vp56Mb::InterNoVecPf as usize;
+                let prob = model.mb_type[ctx][prev_type][0];
+                enc.put_prob(prob, 1); // stay on InterNoVecPf
+
+                // 6 blocks per MB. Each block: 3 bool bits for "all zero"
+                // (m2_0 at idx=0, m2_0 at idx=1, m2_1 at idx=1 = EOB).
+                for b in 0..6usize {
+                    let pt = if b > 3 { 1 } else { 0 };
+                    // ctx for DC = 0 (both left + above not_null_dc = 0
+                    // in a skip frame).
+                    let dc_ctx = 0usize;
+                    // idx=0: skip path. m2_0 = coeff_dcct[pt][0][0].
+                    enc.put_prob(model.coeff_dcct[pt][dc_ctx][0], 0);
+                    // idx=1: still within go_parse = false shortcut
+                    // boundary (`coeff_idx > 1 && ct == 0` requires
+                    // idx>=2); emit m2_0 = coeff_ract[pt][0][cg=0][0].
+                    enc.put_prob(model.coeff_ract[pt][0][0][0], 0);
+                    // idx=1, coeff_idx>0: EOB bit = coeff_ract[...][1].
+                    enc.put_prob(model.coeff_ract[pt][0][0][1], 0);
+                }
+            }
+        }
+
+        out.extend_from_slice(&enc.finish());
+        Ok(out)
+    }
+
+    /// Current encoder dims in macroblocks — exposed for tests + diagnostics.
+    pub fn dims_mb(&self) -> (u16, u16) {
+        (self.mb_width, self.mb_height)
     }
 }
 
@@ -706,6 +890,28 @@ mod tests {
         assert_eq!(bytes[0], 64);
         assert_eq!(bytes[1], 0);
         assert!(bytes.len() > 8);
+    }
+
+    #[test]
+    fn skip_frame_requires_preceding_keyframe() {
+        let mut enc = Vp6Encoder::new(32);
+        let res = enc.encode_skip_frame();
+        assert!(res.is_err(), "skip before keyframe should error");
+    }
+
+    #[test]
+    fn skip_frame_after_keyframe_has_inter_mode_bit() {
+        let w = 16usize;
+        let h = 16usize;
+        let y = vec![128u8; w * h];
+        let u = vec![128u8; (w / 2) * (h / 2)];
+        let v = vec![128u8; (w / 2) * (h / 2)];
+        let mut enc = Vp6Encoder::new(32);
+        enc.encode_keyframe(&y, &u, &v, w, h).unwrap();
+        let skip = enc.encode_skip_frame().unwrap();
+        // Top bit of byte 0 is frame_mode — 1 means inter.
+        assert_eq!(skip[0] & 0x80, 0x80);
+        assert_eq!(enc.dims_mb(), (1, 1));
     }
 
     #[test]

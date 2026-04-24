@@ -349,6 +349,55 @@ fn ffmpeg_vp6f_decodes_gradient_keyframe() {
     assert!(v_mad <= 1.0, "V mean-abs-diff vs ffmpeg: {v_mad}");
 }
 
+/// P-frame scaffold: encode a keyframe, then an identity skip frame,
+/// push both through the decoder in sequence, and verify the skip
+/// frame reconstructs to the same planes as the preceding keyframe.
+#[test]
+fn skip_frame_identity_reproduces_previous_frame() {
+    let (w, h) = (32usize, 16usize);
+    let y = vec![96u8; w * h];
+    let u = vec![64u8; (w / 2) * (h / 2)];
+    let v = vec![200u8; (w / 2) * (h / 2)];
+
+    let mut enc = Vp6Encoder::new(16);
+    let key = enc.encode_keyframe(&y, &u, &v, w, h).expect("keyframe");
+    let skip = enc.encode_skip_frame().expect("skip frame");
+
+    // Decode both packets through a single decoder so the skip frame's
+    // inter-decode path picks up the keyframe's state.
+    let params = CodecParameters::video(CodecId::new("vp6f"));
+    let mut dec = Vp6Decoder::new(params);
+
+    let mut key_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(key));
+    key_pkt.pts = Some(0);
+    key_pkt.flags.keyframe = true;
+    dec.send_packet(&key_pkt).expect("send keyframe");
+    let key_frame = match dec.receive_frame().expect("receive keyframe") {
+        Frame::Video(v) => v,
+        other => panic!("expected video frame, got {other:?}"),
+    };
+
+    let mut skip_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(skip));
+    skip_pkt.pts = Some(1);
+    dec.send_packet(&skip_pkt).expect("send skip");
+    let skip_frame = match dec.receive_frame().expect("receive skip") {
+        Frame::Video(v) => v,
+        other => panic!("expected video frame, got {other:?}"),
+    };
+
+    // Skip frame should decode to the same dimensions + planes as the
+    // preceding keyframe: the decoder copies the previous frame with no
+    // residual, matching what our scaffold encoder asked for.
+    assert_eq!(skip_frame.width, key_frame.width);
+    assert_eq!(skip_frame.height, key_frame.height);
+    for plane in 0..3usize {
+        assert_eq!(
+            skip_frame.planes[plane].data, key_frame.planes[plane].data,
+            "skip plane {plane} should mirror keyframe plane"
+        );
+    }
+}
+
 #[test]
 fn vertical_gradient_plane_mean_preserved() {
     // A vertical gradient: each 8x8 block has a clearly different mean.
