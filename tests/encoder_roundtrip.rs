@@ -37,6 +37,63 @@ fn decode_first_frame(bytes: Vec<u8>) -> (Vec<u8>, Vec<u8>, Vec<u8>, usize, usiz
     (y, u, v, width, height)
 }
 
+/// Wrap an encoded VP6F elementary-stream frame in a minimal FLV
+/// container and decode it with an external `ffmpeg` process. Returns
+/// the three YUV420p planes. Panics if ffmpeg isn't on PATH — callers
+/// should gate on availability first.
+fn ffmpeg_decode_frame(frame: &[u8], w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    use std::process::Command;
+    let mut flv = Vec::new();
+    flv.extend_from_slice(b"FLV");
+    flv.push(0x01);
+    flv.push(0x01);
+    flv.extend_from_slice(&9u32.to_be_bytes());
+    flv.extend_from_slice(&0u32.to_be_bytes());
+    let video_payload_len = 1 + 1 + frame.len();
+    flv.push(9);
+    flv.extend_from_slice(&(video_payload_len as u32).to_be_bytes()[1..]);
+    flv.extend_from_slice(&[0, 0, 0, 0]);
+    flv.extend_from_slice(&[0, 0, 0]);
+    flv.push(0x14);
+    flv.push(0x00);
+    flv.extend_from_slice(frame);
+    flv.extend_from_slice(&(11 + video_payload_len as u32).to_be_bytes());
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let stamp = std::process::id();
+    let flv_path = std::env::temp_dir().join(format!("oxideav_vp6_t{stamp}_{seq}.flv"));
+    let yuv_path = std::env::temp_dir().join(format!("oxideav_vp6_t{stamp}_{seq}.yuv"));
+    std::fs::write(&flv_path, &flv).unwrap();
+    let status = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "flv",
+            "-i",
+        ])
+        .arg(&flv_path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to decode frame");
+    let raw = std::fs::read(&yuv_path).unwrap();
+    let ylen = w * h;
+    let uvlen = (w / 2) * (h / 2);
+    assert_eq!(raw.len(), ylen + 2 * uvlen);
+    let ff_y = raw[0..ylen].to_vec();
+    let ff_u = raw[ylen..ylen + uvlen].to_vec();
+    let ff_v = raw[ylen + uvlen..].to_vec();
+    let _ = std::fs::remove_file(flv_path);
+    let _ = std::fs::remove_file(yuv_path);
+    (ff_y, ff_u, ff_v)
+}
+
 fn plane_psnr(src: &[u8], dst: &[u8]) -> f64 {
     assert_eq!(src.len(), dst.len());
     let mut sse: u64 = 0;
@@ -168,6 +225,95 @@ fn ffmpeg_vp6f_decodes_our_flat_keyframe() {
 
     let _ = std::fs::remove_file(flv_path);
     let _ = std::fs::remove_file(yuv_path);
+}
+
+#[test]
+fn vertical_gradient_psnr_recovers_detail() {
+    // A vertical gradient — every 8x8 block has both non-zero DC and
+    // non-zero low-frequency AC. With AC coding enabled, PSNR should
+    // lift well above the DC-only ~26 dB.
+    //
+    // Note: our in-tree decoder has a known transpose wrinkle relative
+    // to FFmpeg's VP6 reference (issues 2/4 `block[8]` vs `block[1]`
+    // scan placement — see the `IDCT_SCANTABLE` transpose chain). So we
+    // don't round-trip via our own decoder here; instead we encode and
+    // verify that the ffmpeg reference decoder reproduces the gradient
+    // at ≥ 35 dB PSNR against the source. If ffmpeg isn't installed we
+    // skip the assertion — there's no standalone way to verify the AC
+    // path without a second decoder to corroborate.
+    use std::process::Command;
+
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("ffmpeg not available — skipping PSNR assertion");
+        return;
+    }
+
+    let (w, h) = (64usize, 32usize);
+    let mut y = vec![0u8; w * h];
+    for row in 0..h {
+        let val = (row as u32 * 255 / (h as u32 - 1)) as u8;
+        for col in 0..w {
+            y[row * w + col] = val;
+        }
+    }
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+    let mut enc = Vp6Encoder::new(8);
+    let frame = enc.encode_keyframe(&y, &u, &v, w, h).unwrap();
+
+    let ff_y = ffmpeg_decode_frame(&frame, w, h).0;
+    let py = plane_psnr(&y, &ff_y);
+    assert!(
+        py >= 35.0,
+        "Y PSNR via ffmpeg too low with AC encoding: {py} (target >= 35 dB)"
+    );
+}
+
+/// Gradient content: verify ffmpeg accepts our output and decodes it
+/// with ≥ 35 dB Y PSNR against the source. Chroma planes are flat, so
+/// they should round-trip within DC-only precision.
+#[test]
+fn ffmpeg_vp6f_decodes_gradient_keyframe() {
+    use std::process::Command;
+
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("ffmpeg not available — skipping");
+        return;
+    }
+
+    let (w, h) = (64usize, 32usize);
+    let mut y = vec![0u8; w * h];
+    for row in 0..h {
+        let val = (row as u32 * 255 / (h as u32 - 1)) as u8;
+        for col in 0..w {
+            y[row * w + col] = val;
+        }
+    }
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+    let mut enc = Vp6Encoder::new(8);
+    let frame = enc.encode_keyframe(&y, &u, &v, w, h).unwrap();
+
+    let (ff_y, ff_u, ff_v) = ffmpeg_decode_frame(&frame, w, h);
+    let py = plane_psnr(&y, &ff_y);
+    let pu = plane_psnr(&u, &ff_u);
+    let pv = plane_psnr(&v, &ff_v);
+    assert!(
+        py >= 35.0,
+        "Y PSNR via ffmpeg too low on gradient: {py} (target >= 35 dB)"
+    );
+    assert!(pu >= 30.0, "U PSNR via ffmpeg too low: {pu}");
+    assert!(pv >= 30.0, "V PSNR via ffmpeg too low: {pv}");
 }
 
 #[test]
