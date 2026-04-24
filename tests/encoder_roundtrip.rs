@@ -231,28 +231,14 @@ fn ffmpeg_vp6f_decodes_our_flat_keyframe() {
 fn vertical_gradient_psnr_recovers_detail() {
     // A vertical gradient — every 8x8 block has both non-zero DC and
     // non-zero low-frequency AC. With AC coding enabled, PSNR should
-    // lift well above the DC-only ~26 dB.
+    // lift well above the DC-only ~26 dB via our own decoder.
     //
-    // Note: our in-tree decoder has a known transpose wrinkle relative
-    // to FFmpeg's VP6 reference (issues 2/4 `block[8]` vs `block[1]`
-    // scan placement — see the `IDCT_SCANTABLE` transpose chain). So we
-    // don't round-trip via our own decoder here; instead we encode and
-    // verify that the ffmpeg reference decoder reproduces the gradient
-    // at ≥ 35 dB PSNR against the source. If ffmpeg isn't installed we
-    // skip the assertion — there's no standalone way to verify the AC
-    // path without a second decoder to corroborate.
-    use std::process::Command;
-
-    if Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| !o.status.success())
-        .unwrap_or(true)
-    {
-        eprintln!("ffmpeg not available — skipping PSNR assertion");
-        return;
-    }
-
+    // After the Round-9 axis-transpose fix, encoder <-> our decoder
+    // round-trips cleanly on gradient content: the forward DCT now
+    // uses natural `out[u*8+v] = F[u,v]` layout, the scan permutation
+    // matches the spec's `default_dequant_table` (no transpose), and
+    // our decoder's IDCT sees coefficients in the same raster order
+    // ffmpeg's VP6 decoder does.
     let (w, h) = (64usize, 32usize);
     let mut y = vec![0u8; w * h];
     for row in 0..h {
@@ -266,17 +252,44 @@ fn vertical_gradient_psnr_recovers_detail() {
     let mut enc = Vp6Encoder::new(8);
     let frame = enc.encode_keyframe(&y, &u, &v, w, h).unwrap();
 
-    let ff_y = ffmpeg_decode_frame(&frame, w, h).0;
-    let py = plane_psnr(&y, &ff_y);
+    let (dy, _, _, _, _) = decode_first_frame(frame);
+    let py = plane_psnr(&y, &dy);
     assert!(
         py >= 35.0,
-        "Y PSNR via ffmpeg too low with AC encoding: {py} (target >= 35 dB)"
+        "Y PSNR via in-tree decoder too low with AC encoding: {py} (target >= 35 dB)"
+    );
+}
+
+#[test]
+fn horizontal_gradient_psnr_recovers_detail() {
+    // Mirror of the vertical gradient test — exercises the other axis
+    // to catch any residual row/col swap. Each 8x8 block now has a
+    // purely horizontal AC component.
+    let (w, h) = (64usize, 32usize);
+    let mut y = vec![0u8; w * h];
+    for row in 0..h {
+        for col in 0..w {
+            let val = (col as u32 * 255 / (w as u32 - 1)) as u8;
+            y[row * w + col] = val;
+        }
+    }
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+    let mut enc = Vp6Encoder::new(8);
+    let frame = enc.encode_keyframe(&y, &u, &v, w, h).unwrap();
+
+    let (dy, _, _, _, _) = decode_first_frame(frame);
+    let py = plane_psnr(&y, &dy);
+    assert!(
+        py >= 35.0,
+        "Y PSNR via in-tree decoder too low on horizontal gradient: {py}"
     );
 }
 
 /// Gradient content: verify ffmpeg accepts our output and decodes it
-/// with ≥ 35 dB Y PSNR against the source. Chroma planes are flat, so
-/// they should round-trip within DC-only precision.
+/// with ≥ 35 dB Y PSNR against the source AND that our own decoder
+/// produces a bit-identical reconstruction. This is the cross-check
+/// that guards the Round-9 axis-transpose fix.
 #[test]
 fn ffmpeg_vp6f_decodes_gradient_keyframe() {
     use std::process::Command;
@@ -314,6 +327,26 @@ fn ffmpeg_vp6f_decodes_gradient_keyframe() {
     );
     assert!(pu >= 30.0, "U PSNR via ffmpeg too low: {pu}");
     assert!(pv >= 30.0, "V PSNR via ffmpeg too low: {pv}");
+
+    // Round-9: our decoder now matches ffmpeg byte-close on the same
+    // keyframe. A handful of single-ULP differences come from
+    // shift-and-round divergences between the spec's fixed-point IDCT
+    // chain and ffmpeg's internal one; anything larger (or a wholesale
+    // transpose) would blow well past `mean_abs_diff <= 1` here.
+    let (ours_y, ours_u, ours_v, _, _) = decode_first_frame(frame.clone());
+    let mean_abs = |a: &[u8], b: &[u8]| -> f64 {
+        let mut s = 0u64;
+        for (x, y) in a.iter().zip(b) {
+            s += (*x as i32 - *y as i32).unsigned_abs() as u64;
+        }
+        s as f64 / a.len() as f64
+    };
+    let y_mad = mean_abs(&ff_y, &ours_y);
+    let u_mad = mean_abs(&ff_u, &ours_u);
+    let v_mad = mean_abs(&ff_v, &ours_v);
+    assert!(y_mad <= 1.0, "Y mean-abs-diff vs ffmpeg: {y_mad}");
+    assert!(u_mad <= 1.0, "U mean-abs-diff vs ffmpeg: {u_mad}");
+    assert!(v_mad <= 1.0, "V mean-abs-diff vs ffmpeg: {v_mad}");
 }
 
 #[test]

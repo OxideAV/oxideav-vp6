@@ -1230,18 +1230,21 @@ pub const ZIGZAG_DIRECT: [u8; 64] = [
     52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
-/// VP6 idct scan = transposed zigzag — matches the TRANSPOSE macro in
-/// FFmpeg's `ff_vp56_init_context`.
-pub const IDCT_SCANTABLE: [u8; 64] = {
-    let mut out = [0u8; 64];
-    let mut i = 0;
-    while i < 64 {
-        let v = ZIGZAG_DIRECT[i];
-        out[i] = (v >> 3) | ((v & 7) << 3);
-        i += 1;
-    }
-    out
-};
+/// VP6 scan table — maps scan index to raw-order position within the
+/// 8x8 block. Per the VP6 bitstream spec (section 12.1), the default
+/// scan is the standard zig-zag shown in Figure 14 and the decoder
+/// uses `default_dequant_table` (== [`ZIGZAG_DIRECT`]) to rearrange
+/// scan-ordered coefficients back to raster order before the IDCT.
+///
+/// Earlier revisions of this file applied an extra `(v>>3)|((v&7)<<3)`
+/// transpose to match an assumed axis convention in a third-party
+/// reference. That transpose introduced an axis swap: the first scan
+/// AC coefficient (spec: F[0,1], horizontal freq 1, raw index 1) was
+/// being placed at raw index 8 (F[1,0], vertical freq 1), so pure
+/// horizontal patterns decoded as vertical and vice versa. The spec
+/// is unambiguous — scan index `i` maps to raw index `ZIGZAG_DIRECT[i]`
+/// — so this alias preserves that direct relationship.
+pub const IDCT_SCANTABLE: [u8; 64] = ZIGZAG_DIRECT;
 
 #[cfg(test)]
 mod tests {
@@ -1268,10 +1271,12 @@ mod tests {
     }
 
     #[test]
-    fn idct_scantable_is_transposed_zigzag() {
-        // (0) maps to 0, (1) → (8>>3|(8&7)<<3)=1|0=1  -> wait, zigzag[1]=1
-        // so transpose: (1>>3)|((1&7)<<3) = 0|8 = 8
+    fn idct_scantable_matches_default_dequant_table() {
+        // VP6 spec section 12.1: default_dequant_table[64] = ZIGZAG_DIRECT.
+        // Scan index i -> raw-order position ZIGZAG_DIRECT[i].
         assert_eq!(IDCT_SCANTABLE[0], 0);
-        assert_eq!(IDCT_SCANTABLE[1], 8);
+        assert_eq!(IDCT_SCANTABLE[1], 1); // first AC: raster (0,1)
+        assert_eq!(IDCT_SCANTABLE[2], 8); // second AC: raster (1,0)
+        assert_eq!(IDCT_SCANTABLE, ZIGZAG_DIRECT);
     }
 }

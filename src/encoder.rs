@@ -13,10 +13,12 @@
 //! * Interlaced flag = 0, `sub_version = 0` (simple profile),
 //!   `filter_header = 0`, bool-path coefficients (no Huffman).
 //!
-//! The forward DCT is a float-based DCT-II scaled so `block[u*8+v]`
-//! feeds through the decoder's two-stage IDCT back to the same tile
-//! (within rounding). Quantisation is a nearest-integer division by
-//! `dequant_ac` for AC bins, matched to the decoder's multiply-back.
+//! The forward DCT is a float-based DCT-II scaled so `block[u*8+v] =
+//! F[u,v]` feeds through the decoder's two-stage IDCT back to the same
+//! tile (within rounding). Natural raster layout — `u` vertical freq,
+//! `v` horizontal freq — matches the VP6 spec (section 12.1 / 16).
+//! Quantisation is a nearest-integer division by `dequant_ac` for AC
+//! bins, matched to the decoder's multiply-back.
 
 use oxideav_core::{Error, Result};
 
@@ -342,9 +344,9 @@ fn sample_block_tile(
 /// DCT-II formula without the `1/4` factor so the per-block scale is
 /// exactly 4x the orthonormal normalisation.
 ///
-/// Output `out[u*8+v]` is the coefficient at frequency (u, v), stored in
-/// the natural "row-major" layout the decoder's IDCT reads (each IDCT
-/// pass treats `input[i*8+col]` / `input[row*8+i]` as frequencies).
+/// Output `out[u*8+v] = F[u, v]`: raster layout with `u` as vertical
+/// frequency and `v` as horizontal frequency — the exact convention
+/// the VP6 spec uses for its `default_dequant_table` and IDCT stages.
 fn forward_dct8x8(tile: &[i32; 64], out: &mut [i32; 64]) {
     // Precomputed cos((2k+1)*n*pi/16) for k,n in 0..8.
     let mut cos = [[0.0f64; 8]; 8];
@@ -375,14 +377,14 @@ fn forward_dct8x8(tile: &[i32; 64], out: &mut [i32; 64]) {
         }
     }
 
-    // Column-wise 1D DCT, then store transposed: `out[v*8+u]`. VP6's
-    // IDCT consumes `block[i*8+j]` with `i` being the dimension its
-    // column pass iterates first — which is the **horizontal** freq
-    // dimension in FFmpeg's VP6 reference (confirmed empirically
-    // against the ffmpeg `vp6f` decoder on vertical / horizontal
-    // gradient fixtures). We therefore output with axes swapped
-    // relative to the textbook 2D DCT-II `F[u][v]` layout so a
-    // vertical AC lands at the FFmpeg-expected `block[8]`.
+    // Column-wise 1D DCT, stored in natural 2D-DCT-II raster layout
+    // `out[u*8+v] = F[u][v]` — `u` is the vertical frequency index
+    // (iterated in the decoder's column IDCT pass) and `v` is the
+    // horizontal frequency index (iterated in the row pass). This
+    // matches the VP6 spec (section 12.1 + section 16): scan index 1
+    // maps via `default_dequant_table` to raw position 1 = F[0,1] (the
+    // first horizontal AC), scan index 2 to raw position 8 = F[1,0]
+    // (the first vertical AC), and so on.
     for u in 0..8 {
         for v in 0..8 {
             let mut s = 0.0f64;
@@ -391,7 +393,7 @@ fn forward_dct8x8(tile: &[i32; 64], out: &mut [i32; 64]) {
             }
             let cu = if u == 0 { inv_sqrt2 } else { 1.0 };
             let cv = if v == 0 { inv_sqrt2 } else { 1.0 };
-            out[v * 8 + u] = (s * cu * cv).round() as i32;
+            out[u * 8 + v] = (s * cu * cv).round() as i32;
         }
     }
 }
