@@ -1,5 +1,5 @@
 //! Streaming VP6 decoder, implementing
-//! [`oxideav_codec::Decoder`](oxideav_codec::Decoder).
+//! [`oxideav_core::Decoder`](oxideav_core::Decoder).
 //!
 //! This module ties together the pieces in `range_coder`, `models`,
 //! `mb`, and `dsp` to produce a decoded `VideoFrame` per input packet.
@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
     VideoPlane,

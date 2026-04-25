@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 use oxideav_vp6::Vp6Decoder;
 

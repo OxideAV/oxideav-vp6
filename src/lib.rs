@@ -23,8 +23,8 @@ pub mod models;
 pub mod range_coder;
 pub mod tables;
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, DecoderFactory};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder, DecoderFactory};
 
 pub use decoder::{Vp6Decoder, Vp6Variant};
 pub use encoder::Vp6Encoder;

@@ -9,7 +9,7 @@
 //! lot of detail, but a constant-color frame should reconstruct within
 //! a handful of ULPs per pixel.
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_vp6::{Vp6Decoder, Vp6Encoder};
 
