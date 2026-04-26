@@ -394,17 +394,23 @@ impl Vp6Encoder {
         let mb_height = self.mb_height as usize;
 
         // --- Fixed header (inter layout) ---------------------------------
-        // byte 0: frame_mode=1 (top bit), 6-bit QP, separated_coeff=0.
+        // byte 0: frame_mode=1 (top bit), 6-bit QP, separated_coeff=1.
+        // VP6 spec §5: SIMPLE_PROFILE encoders MUST use two partitions
+        // (MultiStream=1), DCT tokens in the second partition. ffmpeg's
+        // vp6f decoder enforces this on inter frames even when our
+        // keyframe (MultiStream=0) slips through. r19: encode the
+        // picture-header bool stream into partition 1 and the per-MB
+        // prediction + coefficient streams into partition 2; Buff2Offset
+        // points at the start of partition 2.
         let mut out = Vec::<u8>::with_capacity(16 + mb_width * mb_height * 2);
-        out.push(0x80 | ((self.qp << 1) & 0x7E));
-        // With `filter_header == 0` and `separated_coeff == 0` on the
-        // keyframe-side, the inter header layout is: 2-byte coeff-offset
-        // field (so adjusted-value = 0), then the bool-coded picture
-        // header starts immediately. See `FrameHeader::parse_inter`.
+        out.push(0x80 | ((self.qp << 1) & 0x7E) | 0x01); // MultiStream=1
+                                                         // Buff2Offset placeholder; overwritten once partition 1 is sized.
         out.push(0);
-        out.push(2);
+        out.push(0);
+        let buff2_hi_idx = out.len() - 2;
+        let buff2_lo_idx = out.len() - 1;
 
-        // --- Bool-coded body --------------------------------------------
+        // --- Partition 1: bool-coded picture header ----------------------
         let mut enc = RangeEncoder::new();
         // golden_frame_flag = 0. No filter-info path because our
         // keyframes use filter_header = 0 + sub_version = 0.
@@ -517,38 +523,54 @@ impl Vp6Encoder {
         // DEF_MB_TYPES_STATS.
         model.rebuild_mb_type_probs();
 
+        // Partition 2: per-MB DCT coefficients only.
+        let mut enc2 = RangeEncoder::new();
         for _mb_row in 0..mb_height {
             for _mb_col in 0..mb_width {
-                // `vector_predictors` returns `nb_pred + 1`. All our
-                // neighbours are either out of bounds or zero-MV
-                // InterNoVecPf macroblocks; the decoder's candidate
-                // filter skips both, so `nb_pred = 0` and `ctx = 1`
-                // for every MB we emit.
+                // -- Partition 1: prediction info (MB-type only — every
+                // MB stays on InterNoVecPf so no MV bits). All neighbour
+                // candidate slots are out-of-bounds / zero-MV, so the
+                // decoder's `vector_predictors` returns nb_pred=0 and the
+                // MB-type ctx is 1 throughout.
                 let ctx: usize = 1;
                 let prev_type = tables::Vp56Mb::InterNoVecPf as usize;
                 let prob = model.mb_type[ctx][prev_type][0];
                 enc.put_prob(prob, 1); // stay on InterNoVecPf
 
-                // 6 blocks per MB. Each block: 3 bool bits for "all zero"
-                // (m2_0 at idx=0, m2_0 at idx=1, m2_1 at idx=1 = EOB).
+                // -- Partition 2: 6 blocks per MB. Each block: 3 bool
+                // bits for "all zero" (m2_0 at idx=0, m2_0 at idx=1,
+                // m2_1 at idx=1 = EOB).
                 for b in 0..6usize {
                     let pt = if b > 3 { 1 } else { 0 };
                     // ctx for DC = 0 (both left + above not_null_dc = 0
                     // in a skip frame).
                     let dc_ctx = 0usize;
                     // idx=0: skip path. m2_0 = coeff_dcct[pt][0][0].
-                    enc.put_prob(model.coeff_dcct[pt][dc_ctx][0], 0);
+                    enc2.put_prob(model.coeff_dcct[pt][dc_ctx][0], 0);
                     // idx=1: still within go_parse = false shortcut
                     // boundary (`coeff_idx > 1 && ct == 0` requires
                     // idx>=2); emit m2_0 = coeff_ract[pt][0][cg=0][0].
-                    enc.put_prob(model.coeff_ract[pt][0][0][0], 0);
+                    enc2.put_prob(model.coeff_ract[pt][0][0][0], 0);
                     // idx=1, coeff_idx>0: EOB bit = coeff_ract[...][1].
-                    enc.put_prob(model.coeff_ract[pt][0][0][1], 0);
+                    enc2.put_prob(model.coeff_ract[pt][0][0][1], 0);
                 }
             }
         }
 
-        out.extend_from_slice(&enc.finish());
+        // Mux: header (3 bytes) + partition1 + partition2.
+        // Buff2Offset is from the start of the buffer to partition2;
+        // FrameHeader::parse_inter subtracts 2 (the on-wire convention is
+        // `buff2_byte_offset = field_value - 2 + range_coder_offset`).
+        let p1 = enc.finish();
+        let p2 = enc2.finish();
+        out.extend_from_slice(&p1);
+        // Buff2Offset = p1.len() + 2 (so that after the decoder's `-2`
+        // adjustment, `coeff_offset_bytes == p1.len()` and partition 2
+        // starts at `range_coder_offset + p1.len()`).
+        let buff2 = (p1.len() as u32 + 2).min(0xFFFF);
+        out[buff2_hi_idx] = ((buff2 >> 8) & 0xFF) as u8;
+        out[buff2_lo_idx] = (buff2 & 0xFF) as u8;
+        out.extend_from_slice(&p2);
         Ok(out)
     }
 
@@ -619,13 +641,16 @@ impl Vp6Encoder {
             return Err(Error::invalid("VP6 encode: plane buffers too small"));
         }
 
-        // --- Fixed inter header ------------------------------------------
-        // Same layout as `encode_skip_frame`: frame_mode=1, qp, sep_coeff=0,
-        // 2-byte coeff-offset (adjusted = 0), then the bool-coded body.
+        // --- Fixed inter header (MultiStream=1, two partitions) ---------
+        // VP6 spec §5: SIMPLE_PROFILE encoders emit DCT tokens in a
+        // separate partition. ffmpeg's vp6f decoder enforces this on
+        // inter frames; see comment in `encode_skip_frame`.
         let mut out = Vec::<u8>::with_capacity(16 + mb_width * mb_height * 8);
-        out.push(0x80 | ((self.qp << 1) & 0x7E));
+        out.push(0x80 | ((self.qp << 1) & 0x7E) | 0x01);
         out.push(0);
-        out.push(2);
+        out.push(0);
+        let buff2_hi_idx = out.len() - 2;
+        let buff2_lo_idx = out.len() - 1;
 
         let mut enc = RangeEncoder::new();
         // golden_frame_flag = 0; use_huffman = 0.
@@ -726,6 +751,9 @@ impl Vp6Encoder {
         // as the decoder primes `s->mb_type` before the per-MB loop.
         let mut prev_type = tables::Vp56Mb::InterNoVecPf;
 
+        // Partition 2: per-MB DCT coefficients only.
+        let mut enc2 = RangeEncoder::new();
+
         for mb_row in 0..mb_height {
             for mb_col in 0..mb_width {
                 // -- 1. Motion-search this MB against the previous frame.
@@ -761,8 +789,7 @@ impl Vp6Encoder {
                     tables::Vp56Mb::InterDeltaPf
                 };
 
-                // -- 4. Emit MB-type. The decoder first reads a "stay on
-                // prev_type" prob; if 0 it walks the PMBT tree.
+                // -- 4. Emit MB-type into partition 1.
                 let stay_prob = model.mb_type[ctx][prev_type as usize][0];
                 if new_type == prev_type {
                     enc.put_prob(stay_prob, 1);
@@ -771,11 +798,8 @@ impl Vp6Encoder {
                     encode_pmbt_tree(&mut enc, &model.mb_type[ctx][prev_type as usize], new_type);
                 }
 
-                // -- 5. Emit MV delta if this MB carries an MV.
+                // -- 5. Emit MV delta into partition 1 if this MB has one.
                 let stored_mv = if new_type == tables::Vp56Mb::InterDeltaPf {
-                    // The decoder's `parse_vector_adjustment` starts from
-                    // `candidate0` if `vector_candidate_pos < 2`, else from
-                    // (0, 0). We mirror that and emit per-component deltas.
                     let base = if vector_candidate_pos < 2 {
                         candidate0
                     } else {
@@ -789,7 +813,7 @@ impl Vp6Encoder {
                 } else {
                     Mv::default()
                 };
-                let _ = candidate1; // unused when nb_pred ≤ 1 in this scope
+                let _ = candidate1;
 
                 // -- 6. Update per-MB cache for downstream predictors.
                 mb_info[mb_row * mb_width + mb_col] = EncMbInfo {
@@ -798,20 +822,25 @@ impl Vp6Encoder {
                 };
                 prev_type = new_type;
 
-                // -- 7. Zero-residual coefficient stream for all 6 blocks
-                // (same shortcut as encode_skip_frame).
+                // -- 7. Zero-residual coefficient stream into partition 2.
                 for b in 0..6usize {
                     let pt = if b > 3 { 1 } else { 0 };
                     let dc_ctx = 0usize;
-                    enc.put_prob(model.coeff_dcct[pt][dc_ctx][0], 0);
-                    enc.put_prob(model.coeff_ract[pt][0][0][0], 0);
-                    enc.put_prob(model.coeff_ract[pt][0][0][1], 0);
+                    enc2.put_prob(model.coeff_dcct[pt][dc_ctx][0], 0);
+                    enc2.put_prob(model.coeff_ract[pt][0][0][0], 0);
+                    enc2.put_prob(model.coeff_ract[pt][0][0][1], 0);
                 }
             }
         }
         let _ = (new_u, new_v, prev_u, prev_v); // chroma planes unused for ME
 
-        out.extend_from_slice(&enc.finish());
+        let p1 = enc.finish();
+        let p2 = enc2.finish();
+        out.extend_from_slice(&p1);
+        let buff2 = (p1.len() as u32 + 2).min(0xFFFF);
+        out[buff2_hi_idx] = ((buff2 >> 8) & 0xFF) as u8;
+        out[buff2_lo_idx] = (buff2 & 0xFF) as u8;
+        out.extend_from_slice(&p2);
         Ok(out)
     }
 
