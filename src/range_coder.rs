@@ -388,6 +388,122 @@ mod tests {
         }
     }
 
+    /// Stress test for the bool encoder: emit many puts of varying
+    /// probabilities then decode them all, ensuring perfect round-trip.
+    /// This pattern matches what the inter-frame encoder produces.
+    #[test]
+    fn roundtrip_picture_header_then_per_mb() {
+        let mut enc = RangeEncoder::new();
+        // Mimic the picture-header section of encode_inter_frame.
+        enc.put_bit(0);
+        enc.put_bit(0); // golden + huffman flags
+        for _ in 0..3 {
+            enc.put_prob(174, 0);
+            enc.put_prob(254, 0);
+        }
+        for _ in 0..4 {
+            enc.put_prob(237, 0);
+        }
+        for _ in 0..14 {
+            enc.put_prob(225, 0);
+        }
+        for _ in 0..16 {
+            enc.put_prob(244, 0);
+        }
+        for _ in 0..22 {
+            enc.put_prob(146, 0);
+        }
+        enc.put_bit(0);
+        for _ in 0..28 {
+            enc.put_prob(219, 0);
+        }
+        for _ in 0..396 {
+            enc.put_prob(227, 0);
+        }
+        // mb(0,0): stay=1
+        enc.put_prob(10, 1);
+        for _ in 0..6 {
+            enc.put_prob(140, 0);
+            enc.put_prob(220, 0);
+            enc.put_prob(220, 0);
+        }
+        // mb(0,1): stay=0, then PMBT walk to InterDeltaPf using the
+        // ACTUAL probs the encoder uses (the failing case).
+        enc.put_prob(10, 0);
+        enc.put_prob(157, 0);
+        enc.put_prob(255, 0);
+        enc.put_prob(1, 1);
+        let bytes = enc.finish();
+        eprintln!("encoded {} bytes", bytes.len());
+        let mut dec = RangeCoder::new(&bytes).unwrap();
+        assert_eq!(dec.get_bit(), 0);
+        assert_eq!(dec.get_bit(), 0);
+        for _ in 0..3 {
+            assert_eq!(dec.get_prob(174), 0);
+            assert_eq!(dec.get_prob(254), 0);
+        }
+        for _ in 0..4 {
+            assert_eq!(dec.get_prob(237), 0);
+        }
+        for _ in 0..14 {
+            assert_eq!(dec.get_prob(225), 0);
+        }
+        for _ in 0..16 {
+            assert_eq!(dec.get_prob(244), 0);
+        }
+        for _ in 0..22 {
+            assert_eq!(dec.get_prob(146), 0);
+        }
+        assert_eq!(dec.get_bit(), 0);
+        for _ in 0..28 {
+            assert_eq!(dec.get_prob(219), 0);
+        }
+        for _ in 0..396 {
+            assert_eq!(dec.get_prob(227), 0);
+        }
+        assert_eq!(dec.get_prob(10), 1);
+        for _ in 0..6 {
+            assert_eq!(dec.get_prob(140), 0);
+            assert_eq!(dec.get_prob(220), 0);
+            assert_eq!(dec.get_prob(220), 0);
+        }
+        assert_eq!(dec.get_prob(10), 0);
+        assert_eq!(dec.get_prob(157), 0);
+        assert_eq!(dec.get_prob(255), 0);
+        assert_eq!(dec.get_prob(1), 1);
+    }
+
+    #[test]
+    fn roundtrip_extreme_prob_after_burst() {
+        // Reproducer of the desync seen in the inter-frame encoder:
+        // a long burst of probs followed by a high-then-low extreme
+        // sequence (255, 1) with bit=1 at the rare (prob=1) symbol.
+        let mut enc = RangeEncoder::new();
+        // Burst that sets up the bool-coder state seen before the failing point.
+        enc.put_prob(10, 1);
+        for _ in 0..6 {
+            enc.put_prob(140, 0);
+            enc.put_prob(220, 0);
+            enc.put_prob(220, 0);
+        }
+        enc.put_prob(10, 0);
+        enc.put_prob(157, 0);
+        enc.put_prob(255, 0);
+        enc.put_prob(1, 1);
+        let bytes = enc.finish();
+        let mut dec = RangeCoder::new(&bytes).unwrap();
+        assert_eq!(dec.get_prob(10), 1);
+        for _ in 0..6 {
+            assert_eq!(dec.get_prob(140), 0);
+            assert_eq!(dec.get_prob(220), 0);
+            assert_eq!(dec.get_prob(220), 0);
+        }
+        assert_eq!(dec.get_prob(10), 0);
+        assert_eq!(dec.get_prob(157), 0);
+        assert_eq!(dec.get_prob(255), 0);
+        assert_eq!(dec.get_prob(1), 1);
+    }
+
     #[test]
     fn raw_bits_roundtrip_16_bits() {
         let value: u32 = 0xBEEF;

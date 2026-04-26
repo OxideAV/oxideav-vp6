@@ -388,10 +388,7 @@ fn skip_frame_identity_reproduces_previous_frame() {
     // Skip frame should decode to the same dimensions + planes as the
     // preceding keyframe: the decoder copies the previous frame with no
     // residual, matching what our scaffold encoder asked for.
-    assert_eq!(
-        skip_frame.planes[0].stride,
-        key_frame.planes[0].stride
-    );
+    assert_eq!(skip_frame.planes[0].stride, key_frame.planes[0].stride);
     assert_eq!(
         skip_frame.planes[0].data.len(),
         key_frame.planes[0].data.len()
@@ -402,6 +399,221 @@ fn skip_frame_identity_reproduces_previous_frame() {
             "skip plane {plane} should mirror keyframe plane"
         );
     }
+}
+
+/// MV encode — encode a keyframe of a checker-style luma pattern, then
+/// translate the pattern horizontally by 4 pixels and encode that as a
+/// P-frame against the keyframe. The decoder applies the encoded MV to
+/// the previous frame: the result should be very close to the shifted
+/// source (the MC is integer-pel, so reconstruction is exact within
+/// the MV search window's reach for non-edge MBs).
+#[test]
+fn inter_frame_horizontal_shift_uses_mv() {
+    // Use enough rows/cols so the search has room and the MC reads
+    // entirely inside the previous frame.
+    let (w, h) = (64usize, 32usize);
+    // Build a vertical-stripes Y plane (high-contrast horizontal AC).
+    let mut y0 = vec![0u8; w * h];
+    for row in 0..h {
+        for col in 0..w {
+            // 8-pixel-period stripes (period intentionally not equal to
+            // the MB size so the shift produces a measurably different
+            // plane vs. the original).
+            y0[row * w + col] = if (col / 8) % 2 == 0 { 50 } else { 200 };
+        }
+    }
+    // Frame 1: shift the stripes 4 px to the right.
+    let shift = 4i32;
+    let mut y1 = vec![0u8; w * h];
+    for row in 0..h {
+        for col in 0..w as i32 {
+            let src_col = (col - shift).clamp(0, w as i32 - 1) as usize;
+            y1[row * w + col as usize] = y0[row * w + src_col];
+        }
+    }
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    let mut enc = Vp6Encoder::new(16);
+    let key = enc.encode_keyframe(&y0, &u, &v, w, h).expect("keyframe");
+
+    // Pre-decode the keyframe through our own decoder so the encoder's
+    // MV search runs against the same reconstruction the decoder will
+    // see (small drift from quantisation otherwise picks the wrong MV).
+    let params = CodecParameters::video(CodecId::new("vp6f"));
+    let mut dec = Vp6Decoder::new(params);
+    let mut key_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(key));
+    key_pkt.pts = Some(0);
+    key_pkt.flags.keyframe = true;
+    dec.send_packet(&key_pkt).expect("send keyframe");
+    let key_frame = match dec.receive_frame().expect("receive keyframe") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video frame, got {other:?}"),
+    };
+    let recon_y = key_frame.planes[0].data.clone();
+    let recon_u = key_frame.planes[1].data.clone();
+    let recon_v = key_frame.planes[2].data.clone();
+
+    // Now encode the inter frame. Using the reconstructed previous
+    // frame (not the source) makes ME pick MVs that match what the
+    // decoder will see.
+    let inter = enc
+        .encode_inter_frame(&recon_y, &recon_u, &recon_v, &y1, &u, &v, w, h, 8)
+        .expect("encode inter");
+
+    let mut inter_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(inter));
+    inter_pkt.pts = Some(1);
+    dec.send_packet(&inter_pkt).expect("send inter");
+    let inter_frame = match dec.receive_frame().expect("receive inter") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video frame, got {other:?}"),
+    };
+    let dy = &inter_frame.planes[0].data;
+
+    // A pure-skip P-frame decodes to recon_y. We expect MV emission to
+    // do strictly better than that — the per-MB MV should align the
+    // shifted stripes back so the inter reconstruction matches y1
+    // closely on the interior MBs (edge MBs may stay zero-MV when the
+    // search window doesn't reach a better candidate).
+    let psnr_skip = plane_psnr(&y1, &recon_y);
+    let psnr_inter = plane_psnr(&y1, dy);
+    eprintln!("skip-PSNR vs y1 = {psnr_skip:.2} dB, inter-PSNR vs y1 = {psnr_inter:.2} dB");
+    assert!(
+        psnr_inter > psnr_skip + 3.0,
+        "MV-encoded inter frame should improve on skip baseline by ≥3 dB \
+         (skip={psnr_skip:.2}, inter={psnr_inter:.2})"
+    );
+}
+
+/// MV encode: ffmpeg interop. Encode a key + inter pair, mux into FLV,
+/// decode via ffmpeg, and verify the resulting Y plane has reasonable
+/// PSNR against the shifted source.
+///
+/// Currently opt-in via `OXIDEAV_VP6_FFMPEG_INTER=1` because the
+/// inter-frame bitstream layer (probability-model update pass) still
+/// diverges from what ffmpeg's vp6f decoder accepts — same caveat as
+/// the existing `encode_skip_frame` scaffold notes. Our own decoder
+/// round-trips the inter frame cleanly (see
+/// `inter_frame_horizontal_shift_uses_mv`).
+#[test]
+fn ffmpeg_decodes_inter_frame_with_mv() {
+    use std::process::Command;
+    if std::env::var("OXIDEAV_VP6_FFMPEG_INTER").is_err() {
+        eprintln!(
+            "ffmpeg inter-frame interop opt-in: set \
+             OXIDEAV_VP6_FFMPEG_INTER=1 to run"
+        );
+        return;
+    }
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("ffmpeg not available — skipping");
+        return;
+    }
+
+    let (w, h) = (64usize, 32usize);
+    let mut y0 = vec![0u8; w * h];
+    for row in 0..h {
+        for col in 0..w {
+            y0[row * w + col] = if (col / 8) % 2 == 0 { 50 } else { 200 };
+        }
+    }
+    let shift = 4i32;
+    let mut y1 = vec![0u8; w * h];
+    for row in 0..h {
+        for col in 0..w as i32 {
+            let src_col = (col - shift).clamp(0, w as i32 - 1) as usize;
+            y1[row * w + col as usize] = y0[row * w + src_col];
+        }
+    }
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    let mut enc = Vp6Encoder::new(16);
+    let key = enc.encode_keyframe(&y0, &u, &v, w, h).expect("keyframe");
+    // Decode locally so MV search picks the same MVs the decoder sees.
+    let (recon_y, recon_u, recon_v, _, _) = decode_first_frame(key.clone());
+    let inter = enc
+        .encode_inter_frame(&recon_y, &recon_u, &recon_v, &y1, &u, &v, w, h, 8)
+        .expect("encode inter");
+
+    // Mux key + inter into a 2-tag FLV stream. FLV layout per the
+    // Adobe spec: 9-byte signature/header, 4-byte PreviousTagSize0=0,
+    // then a sequence of (Tag, PreviousTagSize) pairs.
+    let mut flv = Vec::new();
+    flv.extend_from_slice(b"FLV");
+    flv.push(0x01);
+    flv.push(0x01);
+    flv.extend_from_slice(&9u32.to_be_bytes());
+    flv.extend_from_slice(&0u32.to_be_bytes()); // PreviousTagSize0
+
+    let push_tag = |flv: &mut Vec<u8>, frame: &[u8], pts: u32, is_key: bool| -> u32 {
+        let video_payload_len = (1 + 1 + frame.len()) as u32;
+        flv.push(9); // tag type: video
+        flv.extend_from_slice(&video_payload_len.to_be_bytes()[1..]);
+        let ts = pts;
+        flv.push(((ts >> 16) & 0xff) as u8);
+        flv.push(((ts >> 8) & 0xff) as u8);
+        flv.push((ts & 0xff) as u8);
+        flv.push(((ts >> 24) & 0xff) as u8); // ts extended
+        flv.extend_from_slice(&[0, 0, 0]);
+        let frame_type_codec = if is_key { 0x14 } else { 0x24 };
+        flv.push(frame_type_codec);
+        flv.push(0x00);
+        flv.extend_from_slice(frame);
+        let tag_size = 11 + video_payload_len;
+        flv.extend_from_slice(&tag_size.to_be_bytes());
+        tag_size
+    };
+    let _ = push_tag(&mut flv, &key, 0, true);
+    let _ = push_tag(&mut flv, &inter, 33, false);
+
+    let stamp = std::process::id();
+    let flv_path = std::env::temp_dir().join(format!("oxideav_vp6_mv_{stamp}.flv"));
+    let yuv_path = std::env::temp_dir().join(format!("oxideav_vp6_mv_{stamp}.yuv"));
+    std::fs::write(&flv_path, &flv).unwrap();
+    eprintln!("FLV written to {flv_path:?}, len={}", flv.len());
+    let status = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "flv",
+            "-i",
+        ])
+        .arg(&flv_path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to decode 2-tag FLV");
+    let raw = std::fs::read(&yuv_path).unwrap();
+    let frame_size = w * h + 2 * (w / 2) * (h / 2);
+    assert!(
+        raw.len() >= 2 * frame_size,
+        "expected 2 frames, got {}",
+        raw.len()
+    );
+    // Second frame's Y plane.
+    let off = frame_size;
+    let ff_y = &raw[off..off + w * h];
+
+    let psnr_inter = plane_psnr(&y1, ff_y);
+    eprintln!("ffmpeg PSNR vs shifted source: {psnr_inter:.2} dB");
+    assert!(
+        psnr_inter >= 25.0,
+        "ffmpeg should decode our P-frame and reproduce the shift well: {psnr_inter:.2} dB"
+    );
+
+    // Keep the FLV around for ffprobe inspection on test failure.
+    let _ = std::fs::remove_file(yuv_path);
+    let _ = (recon_u, recon_v); // chroma reused only for MV search input
 }
 
 #[test]
