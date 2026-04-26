@@ -12,6 +12,27 @@
 //! acceptance of inter frames is still pending — the inter-frame
 //! probability-model layer diverges from what ffmpeg expects.
 //!
+//! Round-18 audit (recorded so the next round doesn't repeat steps):
+//!
+//! * `tests/dump_inter.rs` (run with `VP6_DUMP_INTER=1`) writes a 2-tag
+//!   FLV (key + skip) to `/tmp/oxideav_vp6_dump.flv`, hex-dumps both
+//!   packets, traces the first ~10 bool-coded symbols of the skip
+//!   packet through our decoder, and confirms our decoder accepts.
+//! * Reproduced in r18: ffmpeg accepts the FLV container + the
+//!   keyframe (`Stream #0:0 ... vp6f, yuv420p, 64x32`) and rejects the
+//!   inter packet with "Error submitting packet to decoder: Invalid
+//!   data found when processing input". Our decoder accepts the same
+//!   bytes round-trip, so the bool stream is internally consistent.
+//! * Field-by-field re-audit against `vp6_format.pdf` Tables 1-3 / 8 /
+//!   22-24 / 31-35: byte-0 layout, Buff2Offset (R(16) when
+//!   SIMPLE_PROFILE), `B(174)` / `B(254)` mb-type-update flags,
+//!   `B(VP6_*_PCT[..][..])` coeff-update flags, scan-update bit,
+//!   and run-prob updates all line up bit-for-bit between our encoder
+//!   and the ffmpeg-validated decoder. The divergence point is past
+//!   the picture-header section — likely in either the mb-type tree
+//!   walk per MB or the `coeff_dccv` / `coeff_ract` carry-through into
+//!   inter frames (key=false branch in `parse_coeff_models`).
+//!
 //! Scope:
 //!
 //! * Sub-version 0 (simple profile), `filter_header = 0`, interlaced=0.
