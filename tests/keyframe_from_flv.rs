@@ -91,10 +91,9 @@ fn decode_first_vp6_keyframe() {
     let frame = dec.receive_frame().expect("receive frame");
     match frame {
         Frame::Video(v) => {
-            assert_eq!(v.width, 464, "expected 464x352 frame");
-            assert_eq!(v.height, 352);
             assert_eq!(v.planes.len(), 3);
-            assert_eq!(v.planes[0].data.len(), v.width as usize * v.height as usize);
+            assert_eq!(v.planes[0].stride, 464, "expected 464-wide luma plane");
+            assert_eq!(v.planes[0].data.len(), 464 * 352);
 
             // Luma statistics: mean, distinct values.
             let y = &v.planes[0].data;
@@ -113,8 +112,7 @@ fn decode_first_vp6_keyframe() {
                 hash = hash.wrapping_mul(0x100000001b3);
             }
             eprintln!(
-                "VP6 keyframe: {}x{} luma_mean={mean} luma_distinct={distinct} fnv64_y64=0x{hash:016x}",
-                v.width, v.height
+                "VP6 keyframe: 464x352 luma_mean={mean} luma_distinct={distinct} fnv64_y64=0x{hash:016x}"
             );
             // The target scene is a bright commercial opening card;
             // mean should sit in a plausible mid-to-bright range.

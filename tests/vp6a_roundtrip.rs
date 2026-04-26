@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 
 use oxideav_core::Decoder;
-use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_vp6::Vp6Decoder;
 
 fn sample_path() -> Option<PathBuf> {
@@ -117,18 +117,17 @@ fn vp6a_synthetic_roundtrip() {
     let frame = dec.receive_frame().expect("receive frame");
     match frame {
         Frame::Video(v) => {
-            assert_eq!(v.format, PixelFormat::Yuva420P);
             assert_eq!(v.planes.len(), 4, "YUVA has 4 planes");
-            // The alpha plane should have the same dimensions as luma.
-            assert_eq!(v.planes[3].data.len(), v.width as usize * v.height as usize);
+            // The alpha plane should match the luma plane geometry.
+            assert_eq!(v.planes[3].stride, v.planes[0].stride);
+            assert_eq!(v.planes[3].data.len(), v.planes[0].data.len());
             // Alpha should contain actual decoded pixels — not all zero
             // — since we fed a real VP6F keyframe into the alpha stream.
             let alpha_sum: u64 = v.planes[3].data.iter().map(|&b| b as u64).sum();
             assert!(alpha_sum > 0, "alpha plane was all-zero");
             eprintln!(
-                "vp6a synthetic: {}x{} alpha mean={}",
-                v.width,
-                v.height,
+                "vp6a synthetic: stride={} alpha mean={}",
+                v.planes[3].stride,
                 alpha_sum / v.planes[3].data.len() as u64
             );
         }

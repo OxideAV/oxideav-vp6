@@ -11,8 +11,7 @@ use std::collections::VecDeque;
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
-    VideoPlane,
+    CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase, VideoFrame, VideoPlane,
 };
 
 use crate::frame_header::{FrameHeader, FrameKind};
@@ -411,11 +410,7 @@ impl Vp6Decoder {
                 ));
             }
             let frame = VideoFrame {
-                format: PixelFormat::Yuva420P,
-                width: width as u32,
-                height: height as u32,
                 pts: self.pending_pts,
-                time_base: self.pending_tb,
                 planes: vec![
                     VideoPlane {
                         stride: y_stride,
@@ -438,11 +433,7 @@ impl Vp6Decoder {
             Ok(frame)
         } else {
             let frame = VideoFrame {
-                format: PixelFormat::Yuv420P,
-                width: width as u32,
-                height: height as u32,
                 pts: self.pending_pts,
-                time_base: self.pending_tb,
                 planes: vec![
                     VideoPlane {
                         stride: y_stride,

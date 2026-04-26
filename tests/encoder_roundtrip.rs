@@ -29,8 +29,8 @@ fn decode_first_frame(bytes: Vec<u8>) -> (Vec<u8>, Vec<u8>, Vec<u8>, usize, usiz
     let Frame::Video(vf) = dec.receive_frame().expect("decode receive_frame") else {
         panic!("expected VideoFrame");
     };
-    let width = vf.width as usize;
-    let height = vf.height as usize;
+    let width = vf.planes[0].stride;
+    let height = vf.planes[0].data.len() / width;
     let y = vf.planes[0].data.clone();
     let u = vf.planes[1].data.clone();
     let v = vf.planes[2].data.clone();
@@ -388,8 +388,14 @@ fn skip_frame_identity_reproduces_previous_frame() {
     // Skip frame should decode to the same dimensions + planes as the
     // preceding keyframe: the decoder copies the previous frame with no
     // residual, matching what our scaffold encoder asked for.
-    assert_eq!(skip_frame.width, key_frame.width);
-    assert_eq!(skip_frame.height, key_frame.height);
+    assert_eq!(
+        skip_frame.planes[0].stride,
+        key_frame.planes[0].stride
+    );
+    assert_eq!(
+        skip_frame.planes[0].data.len(),
+        key_frame.planes[0].data.len()
+    );
     for plane in 0..3usize {
         assert_eq!(
             skip_frame.planes[plane].data, key_frame.planes[plane].data,
