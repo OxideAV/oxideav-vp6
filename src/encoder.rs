@@ -12,26 +12,44 @@
 //! acceptance of inter frames is still pending — the inter-frame
 //! probability-model layer diverges from what ffmpeg expects.
 //!
-//! Round-18 audit (recorded so the next round doesn't repeat steps):
+//! Round-19 audit (recorded so the next round doesn't repeat steps):
 //!
 //! * `tests/dump_inter.rs` (run with `VP6_DUMP_INTER=1`) writes a 2-tag
 //!   FLV (key + skip) to `/tmp/oxideav_vp6_dump.flv`, hex-dumps both
 //!   packets, traces the first ~10 bool-coded symbols of the skip
 //!   packet through our decoder, and confirms our decoder accepts.
-//! * Reproduced in r18: ffmpeg accepts the FLV container + the
-//!   keyframe (`Stream #0:0 ... vp6f, yuv420p, 64x32`) and rejects the
-//!   inter packet with "Error submitting packet to decoder: Invalid
-//!   data found when processing input". Our decoder accepts the same
-//!   bytes round-trip, so the bool stream is internally consistent.
-//! * Field-by-field re-audit against `vp6_format.pdf` Tables 1-3 / 8 /
-//!   22-24 / 31-35: byte-0 layout, Buff2Offset (R(16) when
-//!   SIMPLE_PROFILE), `B(174)` / `B(254)` mb-type-update flags,
-//!   `B(VP6_*_PCT[..][..])` coeff-update flags, scan-update bit,
-//!   and run-prob updates all line up bit-for-bit between our encoder
-//!   and the ffmpeg-validated decoder. The divergence point is past
-//!   the picture-header section — likely in either the mb-type tree
-//!   walk per MB or the `coeff_dccv` / `coeff_ract` carry-through into
-//!   inter frames (key=false branch in `parse_coeff_models`).
+//! * **Bug fixed**: `Buff2Offset` (VP6 spec Tables 2 & 3, R(16) raw
+//!   field) was being emitted with a `+2` fudge factor on the encoder
+//!   side and parsed with a matching `-2` on the decoder side. The
+//!   spec defines the value as the literal frame-buffer byte offset of
+//!   partition 2, no fudge. Both encoder and decoder now use that
+//!   convention; the keyframe path translates raw → rac-relative by
+//!   subtracting `range_coder_offset` (the bool-coder priming point),
+//!   matching the spec exactly. Inter frames now expose a
+//!   `tests/dump_inter.rs::inter_buff2_offset_is_spec_compliant` guard.
+//! * Reproduced in r18 and confirmed in r19 post-fix: ffmpeg accepts
+//!   the FLV container + the keyframe but still rejects the inter
+//!   packet ("Invalid data found when processing input"). The Buff2
+//!   field is now spec-compliant (verified by manually parsing the dump
+//!   in /tmp/oxideav_vp6_dump.flv), so the residual divergence is past
+//!   the partition-layout layer.
+//! * Suspect list narrowed for r20:
+//!   - `DEF_MB_TYPES_STATS` table pair ordering vs spec page 30
+//!     `VP6_BaselineXmittedProbs`. Spec lists `(probSame, probDiff)`;
+//!     our table flattens to `(probDiff, probSame)`. The mismatch is
+//!     internally self-consistent (encoder + decoder use the same
+//!     reversed pairs) so own-decoder round-trips, but the resulting
+//!     `mb_type[ctx][prev][0]` "stay-same" probabilities differ from
+//!     spec — see `rebuild_mb_type_probs` for the formula. r20 should
+//!     swap each pair in `DEF_MB_TYPES_STATS` and verify against a
+//!     real ffmpeg-encoded VP6F sample (none currently checked into
+//!     the tree; `OXIDEAV_FLV_SAMPLE=…` honoured by
+//!     `tests/keyframe_from_flv.rs` if a sample becomes available).
+//!   - Failing the table swap, the next suspect is the per-MB block
+//!     coefficient state machine — specifically the 3-bit "all zero"
+//!     shortcut path in `encode_skip_frame` may not match the
+//!     decoder's `parse_coeff` exit conditions when `coeff_idx` rolls
+//!     past the first AC bin.
 //!
 //! Scope:
 //!
@@ -394,14 +412,15 @@ impl Vp6Encoder {
         let mb_height = self.mb_height as usize;
 
         // --- Fixed header (inter layout) ---------------------------------
-        // byte 0: frame_mode=1 (top bit), 6-bit QP, separated_coeff=1.
-        // VP6 spec §5: SIMPLE_PROFILE encoders MUST use two partitions
-        // (MultiStream=1), DCT tokens in the second partition. ffmpeg's
-        // vp6f decoder enforces this on inter frames even when our
-        // keyframe (MultiStream=0) slips through. r19: encode the
-        // picture-header bool stream into partition 1 and the per-MB
-        // prediction + coefficient streams into partition 2; Buff2Offset
-        // points at the start of partition 2.
+        // byte 0: frame_mode=1 (top bit), 6-bit QP, MultiStream/separated_coeff=1.
+        //
+        // VP6 spec Tables 1 & 3: byte 0 carries FrameType R(1) +
+        // DctQMask R(6) + MultiStream R(1). When MultiStream==1 OR
+        // SIMPLE_PROFILE==1, Buff2Offset R(16) follows directly as 2
+        // raw bytes giving the frame-buffer offset of partition 2.
+        // Our keyframes use sub_version=0 (SIMPLE_PROFILE) with
+        // filter_header=0, so the inter parse on the decoder side
+        // always reads Buff2Offset — emit it.
         let mut out = Vec::<u8>::with_capacity(16 + mb_width * mb_height * 2);
         out.push(0x80 | ((self.qp << 1) & 0x7E) | 0x01); // MultiStream=1
                                                          // Buff2Offset placeholder; overwritten once partition 1 is sized.
@@ -558,16 +577,15 @@ impl Vp6Encoder {
         }
 
         // Mux: header (3 bytes) + partition1 + partition2.
-        // Buff2Offset is from the start of the buffer to partition2;
-        // FrameHeader::parse_inter subtracts 2 (the on-wire convention is
-        // `buff2_byte_offset = field_value - 2 + range_coder_offset`).
+        //
+        // Buff2Offset is the spec-defined raw byte offset from the start
+        // of the frame buffer to the start of partition 2 (VP6 spec §9 /
+        // Table 3). Partition 2 starts at `header_size (3) + p1.len()`,
+        // so the wire value is exactly that number — no fudge factor.
         let p1 = enc.finish();
         let p2 = enc2.finish();
         out.extend_from_slice(&p1);
-        // Buff2Offset = p1.len() + 2 (so that after the decoder's `-2`
-        // adjustment, `coeff_offset_bytes == p1.len()` and partition 2
-        // starts at `range_coder_offset + p1.len()`).
-        let buff2 = (p1.len() as u32 + 2).min(0xFFFF);
+        let buff2 = ((3 + p1.len()) as u32).min(0xFFFF);
         out[buff2_hi_idx] = ((buff2 >> 8) & 0xFF) as u8;
         out[buff2_lo_idx] = (buff2 & 0xFF) as u8;
         out.extend_from_slice(&p2);
@@ -837,7 +855,9 @@ impl Vp6Encoder {
         let p1 = enc.finish();
         let p2 = enc2.finish();
         out.extend_from_slice(&p1);
-        let buff2 = (p1.len() as u32 + 2).min(0xFFFF);
+        // Spec-defined raw byte offset to partition 2 — see comment in
+        // `encode_skip_frame` for the rationale.
+        let buff2 = ((3 + p1.len()) as u32).min(0xFFFF);
         out[buff2_hi_idx] = ((buff2 >> 8) & 0xFF) as u8;
         out[buff2_lo_idx] = (buff2 & 0xFF) as u8;
         out.extend_from_slice(&p2);

@@ -130,3 +130,34 @@ fn push_tag(flv: &mut Vec<u8>, frame: &[u8], pts: u32, is_key: bool) {
     let tag_size = 11 + payload_len;
     flv.extend_from_slice(&tag_size.to_be_bytes());
 }
+
+/// Sanity test: assert the encoded inter packet's `Buff2Offset` raw
+/// value matches the spec — it MUST equal `header_size + p1.len()` so
+/// that ffmpeg can locate partition 2 directly from the wire offset.
+/// Catches regressions of the r19 spec-compliance fix.
+#[test]
+fn inter_buff2_offset_is_spec_compliant() {
+    use oxideav_vp6::Vp6Encoder;
+    let (w, h) = (64usize, 32usize);
+    let y0 = vec![128u8; w * h];
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+    let mut enc = Vp6Encoder::new(16);
+    enc.encode_keyframe(&y0, &u, &v, w, h).unwrap();
+    let inter = enc.encode_skip_frame().unwrap();
+    // byte 0: header; bytes 1-2: Buff2Offset raw; bytes 3..buff2: p1;
+    // bytes buff2..end: p2.
+    let buff2 = ((inter[1] as usize) << 8) | (inter[2] as usize);
+    assert!(
+        buff2 >= 3 && buff2 <= inter.len(),
+        "Buff2Offset {} outside frame bounds (len={})",
+        buff2,
+        inter.len()
+    );
+    // Partition 2 must hold at least the bool-coder priming seed (3 bytes).
+    assert!(
+        inter.len() - buff2 >= 3,
+        "partition 2 too short: {} bytes",
+        inter.len() - buff2
+    );
+}

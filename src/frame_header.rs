@@ -76,7 +76,7 @@ impl FrameHeader {
         let sub_version;
         let simple_profile;
         let filter_header;
-        let coeff_offset_bytes;
+        let mut coeff_offset_bytes;
         let range_coder_offset;
 
         if matches!(kind, FrameKind::Key) {
@@ -89,13 +89,21 @@ impl FrameHeader {
             simple_profile = sub_version == 0;
 
             // Slide window if separated-coeff or filter-header absent.
+            // VP6 spec Table 2: Buff2Offset R(16) is present when
+            // (MultiStream == 1) || (SIMPLE_PROFILE == 1) — the field
+            // gives the raw frame-buffer offset of partition 2. We
+            // convert to a rac-relative offset by subtracting the bool-
+            // coder priming offset below.
             let mut cursor = 2usize;
             if separated_coeff || filter_header == 0 {
                 if buf.len() < cursor + 2 {
                     return Err(Error::invalid("VP6: missing keyframe coeff offset"));
                 }
-                coeff_offset_bytes = (((buf[cursor] as i32) << 8) | (buf[cursor + 1] as i32)) - 2;
+                let raw = ((buf[cursor] as i32) << 8) | (buf[cursor + 1] as i32);
                 cursor += 2;
+                // We'll fix-up with the final cursor (= range_coder_offset)
+                // after the dim-byte read below.
+                coeff_offset_bytes = raw;
             } else {
                 coeff_offset_bytes = 0;
             }
@@ -112,6 +120,14 @@ impl FrameHeader {
                 return Err(Error::invalid("VP6: zero frame dimensions"));
             }
             range_coder_offset = cursor + 4;
+            // Translate raw Buff2Offset → rac-relative.
+            // Single-partition keyframes have a meaningless raw value
+            // (MultiStream == 0); clamp to 0 in that case so downstream
+            // single-partition handling kicks in.
+            if separated_coeff || filter_header == 0 {
+                let adj = coeff_offset_bytes - range_coder_offset as i32;
+                coeff_offset_bytes = if adj > 0 { adj } else { 0 };
+            }
         } else {
             return Err(Error::invalid(
                 "VP6: inter frame requires parse_inter (needs cached filter_header)",
@@ -154,16 +170,24 @@ impl FrameHeader {
         let separated_coeff = (b0 & 0x01) != 0;
 
         let mut cursor = 1usize;
-        let coeff_offset_bytes;
-        if separated_coeff || filter_header == 0 {
+        let coeff_offset_bytes = if separated_coeff || filter_header == 0 {
             if buf.len() < cursor + 2 {
                 return Err(Error::invalid("VP6: missing inter coeff offset"));
             }
-            coeff_offset_bytes = (((buf[cursor] as i32) << 8) | (buf[cursor + 1] as i32)) - 2;
+            // Spec Table 3: Buff2Offset is the raw byte offset from the
+            // start of the frame buffer to partition 2. Convert to a
+            // rac-relative offset by subtracting `range_coder_offset`.
+            let raw = ((buf[cursor] as i32) << 8) | (buf[cursor + 1] as i32);
             cursor += 2;
+            let adj = raw - cursor as i32;
+            if adj > 0 {
+                adj
+            } else {
+                0
+            }
         } else {
-            coeff_offset_bytes = 0;
-        }
+            0
+        };
         let range_coder_offset = cursor;
         if buf.len() < range_coder_offset + 1 {
             return Err(Error::invalid("VP6: missing range-coder payload"));

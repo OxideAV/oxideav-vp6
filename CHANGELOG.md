@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- VP6 Buff2Offset (spec Tables 2 & 3) emitted/parsed without the
+  legacy +/-2 fudge so the on-wire value matches the literal frame-
+  buffer byte offset to partition 2. Inter packets now have a spec-
+  compliant partition layout. (r19 audit; ffmpeg still rejects the
+  inter packet body — see `src/encoder.rs` for the residual suspect
+  list.)
+
+### Added
+
+- `tests/ffmpeg_interop.rs`: external-ffmpeg interop guards
+  (`ffmpeg_accepts_keyframe`, `ffmpeg_decodes_keyframe_in_two_tag_stream`).
+  Skipped silently when ffmpeg isn't on PATH.
+- `tests/dump_inter.rs::inter_buff2_offset_is_spec_compliant`: catches
+  regressions of the Buff2Offset field semantics.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-vp6/compare/v0.0.3...v0.0.4) - 2026-04-25
 
 ### Other

@@ -94,7 +94,8 @@ bicubic interpolator + `vpx_rac.h` for the bool coder).
 
 ### Test coverage
 
-The crate ships 30 library unit tests plus 4 integration tests:
+The crate ships 39 library unit tests plus 18 integration tests
+across 6 files (57 tests total):
 
 - **Unit tests** for the range coder round-trip, the IDCT (DC-only flat
   block, add-zero identity), the loop filter bounding-values table and
@@ -115,6 +116,14 @@ The crate ships 30 library unit tests plus 4 integration tests:
   it into the alpha partition, decodes it, and verifies a 4-plane
   YUVA frame with non-zero alpha pixels. No real vp6a FLV fixture is
   shipped in the tree; if you have one, set `OXIDEAV_FLV_SAMPLE`.
+- `tests/ffmpeg_interop.rs` — external-ffmpeg interop guards. Skipped
+  silently when `ffmpeg` isn't on `PATH`. Asserts our keyframe is
+  decoded by ffmpeg and tracks the (currently-failing) inter-frame
+  acceptance state (decode count == 1 keyframe + 1 rejected inter).
+- `tests/dump_inter.rs` — opt-in `VP6_DUMP_INTER=1` diagnostic that
+  writes a 2-tag FLV to `/tmp/oxideav_vp6_dump.flv` for ffmpeg-side
+  manual inspection, plus a `inter_buff2_offset_is_spec_compliant`
+  guard that pins the spec layout of the partition-offset field.
 
 ## Quick use
 
