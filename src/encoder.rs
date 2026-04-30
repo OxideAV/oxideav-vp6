@@ -33,23 +33,47 @@
 //!   field is now spec-compliant (verified by manually parsing the dump
 //!   in /tmp/oxideav_vp6_dump.flv), so the residual divergence is past
 //!   the partition-layout layer.
-//! * Suspect list narrowed for r20:
-//!   - `DEF_MB_TYPES_STATS` table pair ordering vs spec page 30
-//!     `VP6_BaselineXmittedProbs`. Spec lists `(probSame, probDiff)`;
-//!     our table flattens to `(probDiff, probSame)`. The mismatch is
-//!     internally self-consistent (encoder + decoder use the same
-//!     reversed pairs) so own-decoder round-trips, but the resulting
-//!     `mb_type[ctx][prev][0]` "stay-same" probabilities differ from
-//!     spec — see `rebuild_mb_type_probs` for the formula. r20 should
-//!     swap each pair in `DEF_MB_TYPES_STATS` and verify against a
-//!     real ffmpeg-encoded VP6F sample (none currently checked into
-//!     the tree; `OXIDEAV_FLV_SAMPLE=…` honoured by
-//!     `tests/keyframe_from_flv.rs` if a sample becomes available).
-//!   - Failing the table swap, the next suspect is the per-MB block
-//!     coefficient state machine — specifically the 3-bit "all zero"
-//!     shortcut path in `encode_skip_frame` may not match the
-//!     decoder's `parse_coeff` exit conditions when `coeff_idx` rolls
-//!     past the first AC bin.
+//!
+//! Round-20 audit (delta — completed; ffmpeg interop still pending):
+//!
+//! * **Bug fixed**: `DEF_MB_TYPES_STATS` pair order. Per spec page 30
+//!   `VP6_BaselineXmittedProbs[3][20]` and page 29 Table 6 (second-
+//!   dimension semantics), each row flattens as
+//!   `(probSame_t, probDiff_t)` for `t` in `0..10`. Our table stored
+//!   the pairs swapped; `rebuild_mb_type_probs` (which mirrors spec
+//!   page 35's `probModeSame` formula `255 - 255 * pX[k][i*2] / (1 +
+//!   pX[k][i*2] + pX[k][i*2+1])`) was therefore computing values with
+//!   stay-rate semantics where the spec yields switch-rate semantics.
+//!   `PRE_DEF_MB_TYPE_STATS` was already in spec order so the two
+//!   tables also disagreed with each other on a SetNewBaselineProbs
+//!   reset; the swap brings DEF in line with both spec page 30 and
+//!   the existing PRE_DEF layout. Pinned by
+//!   `tables::tests::def_mb_types_stats_matches_spec_baseline`.
+//! * **Behaviour**: own-codec round-trips still pass (the encoder +
+//!   decoder both consume the new layout consistently). FFmpeg
+//!   continues to reject the inter packet (1 frame decoded, 1 decode
+//!   error); the spec-compliance fix is necessary but not sufficient
+//!   on its own. The `tests/keyframe_from_flv.rs::decode_first_20_frames`
+//!   guard still passes after the swap because the embedded
+//!   FFmpeg-encoded sample issues SetNewBaselineProbs updates that
+//!   overwrite the baseline before any per-MB decode reads it, so the
+//!   layout disagreement at the baseline never surfaces in that test.
+//! * Suspect list narrowed for r21:
+//!   - The per-MB block coefficient state machine — specifically the
+//!     3-bit "all zero" shortcut path in `encode_skip_frame` may not
+//!     match the decoder's `parse_coeff` exit conditions when
+//!     `coeff_idx` rolls past the first AC bin. (This was the "next
+//!     suspect" line carried over from r19.)
+//!   - `vector_predictors` (decoder.rs) returns `nb_pred + 1` which
+//!     maps `(0 cands -> ctx 1, 1 cand -> ctx 2, 2 cands -> ctx 0)`.
+//!     Per spec page 28 Table 5 the canonical mapping is `(0 -> ctx
+//!     2, 1 -> ctx 1, 2 -> ctx 0)`. The encoder side hard-codes
+//!     `ctx = 1` for the skip frame to match the (currently wrong)
+//!     decoder return value, so the codec is internally consistent
+//!     but disagrees with ffmpeg. Fix is `ctx = 2 - nb_pred` on both
+//!     sides — but doing it alone in r20 didn't change ffmpeg's
+//!     verdict (still 1 frame), so r21 should pursue a combined fix
+//!     with the coefficient-shortcut audit above.
 //!
 //! Scope:
 //!

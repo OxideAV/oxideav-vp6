@@ -94,40 +94,59 @@ pub const VP56_COEFF_BIAS: [i16; 11] = [0, 1, 2, 3, 4, 5, 7, 11, 19, 35, 67];
 pub const VP56_COEFF_BIT_LENGTH: [u8; 6] = [0, 1, 2, 3, 4, 10];
 
 /// Default per-context MB type statistics (keyframes start here).
+///
+/// Pair order is `(probSame, probDiff)` to match the VP6 spec page 30
+/// `VP6_BaselineXmittedProbs[3][20]` table. Each row flattens to 20
+/// values laid out as 10 pairs `(probSame_t, probDiff_t)` for `t` in
+/// `0..10` per spec Section 10. With this layout
+/// [`crate::models::Vp6Model::rebuild_mb_type_probs`] reproduces spec
+/// page 35's `probModeSame` formula directly: `255 - 255 *
+/// probXmitted[k][i*2] / (1 + probXmitted[k][i*2] +
+/// probXmitted[k][i*2+1])`. [`PRE_DEF_MB_TYPE_STATS`] is already in
+/// spec order (matches `VP6_ModeVq` page 32), so the two tables now
+/// share the same pair-order convention end-to-end.
+///
+/// Round-20 audit recap (kept here as a navigation aid for r21+):
+/// Earlier revisions stored pairs as `(probDiff, probSame)` — the
+/// codec round-tripped because both encoder and decoder used the same
+/// reversed layout, but the resulting `mb_type[ctx][prev][0]` carried
+/// stay-rate semantics rather than the spec's switch-rate semantics,
+/// and the inconsistency with `PRE_DEF` only didn't surface because
+/// the test sample never hits a SetNewBaselineProbs reset.
 pub const DEF_MB_TYPES_STATS: [[[u8; 2]; 10]; 3] = [
     [
-        [69, 42],
-        [1, 2],
-        [1, 7],
-        [44, 42],
-        [6, 22],
-        [1, 3],
-        [0, 2],
-        [1, 5],
-        [0, 1],
+        [42, 69],
+        [2, 1],
+        [7, 1],
+        [42, 44],
+        [22, 6],
+        [3, 1],
+        [2, 0],
+        [5, 1],
+        [1, 0],
         [0, 0],
     ],
     [
-        [229, 8],
+        [8, 229],
         [1, 1],
-        [0, 8],
+        [8, 0],
         [0, 0],
         [0, 0],
-        [1, 2],
-        [0, 1],
+        [2, 1],
+        [1, 0],
         [0, 0],
         [1, 1],
         [0, 0],
     ],
     [
-        [122, 35],
+        [35, 122],
         [1, 1],
-        [1, 6],
-        [46, 34],
+        [6, 1],
+        [34, 46],
         [0, 0],
-        [1, 2],
-        [0, 1],
-        [0, 1],
+        [2, 1],
+        [1, 0],
+        [1, 0],
         [1, 1],
         [0, 0],
     ],
@@ -1278,5 +1297,41 @@ mod tests {
         assert_eq!(IDCT_SCANTABLE[1], 1); // first AC: raster (0,1)
         assert_eq!(IDCT_SCANTABLE[2], 8); // second AC: raster (1,0)
         assert_eq!(IDCT_SCANTABLE, ZIGZAG_DIRECT);
+    }
+
+    /// r21: regression — `DEF_MB_TYPES_STATS` must flatten to the exact
+    /// 20-element rows of VP6 spec page 30 `VP6_BaselineXmittedProbs[3][20]`,
+    /// in `(probSame, probDiff)` pair order per spec page 29 Table 6.
+    /// A swap on either side produces `mb_type[ctx][prev][0]` values
+    /// that disagree with what a spec-following decoder computes — the
+    /// r20 audit deliberately flipped this so the bitstream cross-checks
+    /// against ffmpeg, so the test pins it shut against accidental
+    /// reverts.
+    #[test]
+    fn def_mb_types_stats_matches_spec_baseline() {
+        // VP6 spec page 30, VP6_BaselineXmittedProbs[3][20]:
+        const SPEC_BASELINE: [[u8; 20]; 3] = [
+            [
+                42, 69, 2, 1, 7, 1, 42, 44, 22, 6, 3, 1, 2, 0, 5, 1, 1, 0, 0, 0,
+            ],
+            [8, 229, 1, 1, 8, 0, 0, 0, 0, 0, 2, 1, 1, 0, 0, 0, 1, 1, 0, 0],
+            [
+                35, 122, 1, 1, 6, 1, 34, 46, 0, 0, 2, 1, 1, 0, 1, 0, 1, 1, 0, 0,
+            ],
+        ];
+        for ctx in 0..3 {
+            for t in 0..10 {
+                assert_eq!(
+                    DEF_MB_TYPES_STATS[ctx][t][0],
+                    SPEC_BASELINE[ctx][t * 2],
+                    "ctx={ctx} t={t} probSame mismatch"
+                );
+                assert_eq!(
+                    DEF_MB_TYPES_STATS[ctx][t][1],
+                    SPEC_BASELINE[ctx][t * 2 + 1],
+                    "ctx={ctx} t={t} probDiff mismatch"
+                );
+            }
+        }
     }
 }

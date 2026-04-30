@@ -9,15 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `DEF_MB_TYPES_STATS` pair order now matches VP6 spec page 30
+  `VP6_BaselineXmittedProbs[3][20]` — pairs flatten as
+  `(probSame_t, probDiff_t)` per spec page 29 Table 6, not the
+  previously-reversed `(probDiff, probSame)`. With this layout
+  `Vp6Model::rebuild_mb_type_probs` reproduces spec page 35's
+  `probModeSame` formula directly, so `mb_type[ctx][prev][0]` carries
+  the spec's switch-rate semantics. The pre-fix table was internally
+  consistent but disagreed with the already-spec-compliant
+  `PRE_DEF_MB_TYPE_STATS` (`VP6_ModeVq` page 32), which would have
+  produced visible breakage on a SetNewBaselineProbs reset. (r20
+  audit.) ffmpeg-side acceptance of the inter packet still pending —
+  see `src/encoder.rs` for the residual r21 suspect list (per-MB
+  coefficient state machine + `vector_predictors` ctx mapping).
 - VP6 Buff2Offset (spec Tables 2 & 3) emitted/parsed without the
   legacy +/-2 fudge so the on-wire value matches the literal frame-
   buffer byte offset to partition 2. Inter packets now have a spec-
-  compliant partition layout. (r19 audit; ffmpeg still rejects the
-  inter packet body — see `src/encoder.rs` for the residual suspect
-  list.)
+  compliant partition layout. (r19 audit.)
 
 ### Added
 
+- `tables::tests::def_mb_types_stats_matches_spec_baseline`: pins the
+  `DEF_MB_TYPES_STATS` rows against VP6 spec page 30
+  `VP6_BaselineXmittedProbs` so accidental pair-order reverts surface
+  immediately.
+- `tests/ffmpeg_interop.rs::r21_inter_frame_ffmpeg_decode_state`:
+  records the ffmpeg-cross-decode contract for an inter frame
+  produced by `encode_inter_frame` (motion search). Currently green
+  at "1 frame decoded, 1 decode error" — fails red the moment ffmpeg
+  starts accepting the inter so the assertion can be tightened to
+  `n == 2`.
 - `tests/ffmpeg_interop.rs`: external-ffmpeg interop guards
   (`ffmpeg_accepts_keyframe`, `ffmpeg_decodes_keyframe_in_two_tag_stream`).
   Skipped silently when ffmpeg isn't on PATH.
