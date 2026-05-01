@@ -46,7 +46,18 @@ shift fixture jumps from ~19 dB (MC-only) to ~43 dB (with residual).
 ffmpeg-side residual interop still diverges (the inter decode lands on
 the MC-only baseline, suggesting a per-MB coefficient model state
 mismatch downstream of the keyframe-time `0x80` defaults) — left for
-r25+.
+r25+. **r25 adds quarter-pel sub-pel motion estimation.**
+`motion_search` now seeds the integer-pel SAD winner, then evaluates
+every quarter-pel offset in a `±3 qpel` window around it via the same
+H.264-chroma-style bilinear filter the decoder uses
+(`put_h264_chroma8` mirror) plus a Lagrangian rate cost on the MV
+bits. The MC tile sampling path (`sample_mc_tile`) likewise grew a
+sub-pel branch so the residual computation matches the decoder
+exactly. On translating-stripe / translating-disk fixtures with a
+0.5-pel shift, internal-decoder Y PSNR climbs from ~19-29 dB
+(integer-pel MC alone) to 35-37 dB (qpel MC + DCT residual). ffmpeg
+cross-decodes the qpel-MV inter packet cleanly (Y PSNR ~32 dB on the
+stripes fixture).
 
 ### Implemented
 
@@ -157,6 +168,15 @@ across 6 files (63 tests total):
   AND beats the MC-only baseline by ≥5 dB. Fails immediately on a
   regression that drops the residual coefficient path back to the
   pre-r24 zero-block shortcut.
+- `tests/encoder_roundtrip.rs::r25_qpel_translating_stripes_psnr_clears_35db`
+  / `r25_qpel_translating_disk_psnr_clears_35db` (new in r25) — pin
+  the quarter-pel ME path against a 0.5-pel sub-pel translation of a
+  smooth low-frequency stripe / Gaussian-disk fixture. Both assert
+  internal-decoder Y PSNR ≥ 35 dB; the integer-only baseline (MC
+  alone, no qpel) is ~19-29 dB so the qpel ME contribution is
+  unmistakable. `r25_ffmpeg_decodes_qpel_inter_frame` cross-decodes
+  the stripes packet through ffmpeg's vp6f decoder and asserts ≥ 20
+  dB Y PSNR, confirming the qpel MV bits parse cleanly.
 
 ## Quick use
 

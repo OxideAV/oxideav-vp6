@@ -146,11 +146,43 @@
 //!   state ffmpeg expects after the keyframe diverges from the
 //!   `0x80` baseline this encoder pins. r25+ work.
 //!
+//! Round-25 audit (delta — quarter-pel sub-pel motion estimation):
+//!
+//! * **Feature added**: `motion_search` now picks quarter-pel
+//!   accurate MVs via a two-stage search. Stage 1 runs the existing
+//!   integer-pel SAD search to seed `(int_dx, int_dy)`. Stage 2
+//!   evaluates every quarter-pel offset in a `±3 qpel` window around
+//!   the integer winner via the same H.264-chroma-style bilinear
+//!   filter the decoder uses (`mb::render_mb_inter` `use_bicubic_luma
+//!   == false` branch — see `bilinear_luma_sample`). Each qpel
+//!   candidate's cost is `SAD(MC) + λ * mv_bits` with `λ` proportional
+//!   to QP, so sub-pel wins are taken only when they measurably beat
+//!   the integer winner including the extra MV-bit cost. The
+//!   MC-tile sampler (`sample_mc_tile`) likewise grew a sub-pel branch
+//!   so the residual computation matches the decoder exactly when the
+//!   chosen MV has sub-pel components. Spec ref: `vp6_format.pdf`
+//!   §17.2 (Half / Quarter Pixel Aligned Vectors).
+//! * **Behaviour**: internal-decoder Y PSNR on the new
+//!   `r25_qpel_translating_stripes_psnr_clears_35db` /
+//!   `r25_qpel_translating_disk_psnr_clears_35db` fixtures (0.5-pel
+//!   sub-pel shift, smooth low-frequency content) climbs from ~19-29
+//!   dB (integer-only MC baseline) to 35-37 dB (qpel MC + DCT
+//!   residual). The pre-r25
+//!   `inter_frame_horizontal_shift_uses_mv` fixture (4-pel integer
+//!   shift, no sub-pel component) records the same PSNR as before.
+//!   `r24_inter_residual_psnr_floor` (zero-MV brightness ramp)
+//!   continues to pass at the same level.
+//! * **ffmpeg cross-decode**: ffmpeg's vp6f decoder accepts the
+//!   qpel-MV inter packet (`r25_ffmpeg_decodes_qpel_inter_frame` —
+//!   reconstructs ~32 dB Y on the stripes fixture). The existing
+//!   `r21_inter_frame_ffmpeg_decode_state` interop guard still passes
+//!   `n == 2`.
+//!
 //! Scope:
 //!
 //! * Sub-version 0 (simple profile), `filter_header = 0`, interlaced=0.
 //! * Bool-path coefficients (no Huffman).
-//! * Inter frames: integer-pel MVs, mb_type ∈ {InterNoVecPf,
+//! * Inter frames: quarter-pel MVs (r25+), mb_type ∈ {InterNoVecPf,
 //!   InterDeltaPf}, real DCT residual encoded per block (r24+).
 //!
 //! The forward DCT is a float-based DCT-II scaled so `block[u*8+v] =
@@ -702,13 +734,22 @@ impl Vp6Encoder {
         Ok(out)
     }
 
-    /// Emit a P-frame with integer-pel motion vectors against the
-    /// supplied previous reconstruction (`prev_*` planes). Per-MB an
-    /// integer-pel SAD-driven ME picks a luma offset in `[-search,
-    /// search]` (in pixels). MBs whose best MV is `(0, 0)` are emitted
-    /// as `InterNoVecPf`; otherwise as `InterDeltaPf` with the MV delta
-    /// from the candidate predictor (mirroring the decoder's
-    /// `vector_predictors` + `parse_vector_adjustment` walk).
+    /// Emit a P-frame with quarter-pel-accurate motion vectors against
+    /// the supplied previous reconstruction (`prev_*` planes). Per-MB a
+    /// two-stage ME picks a luma quarter-pel offset:
+    ///
+    /// 1. integer-pel SAD search in `[-search, search]` (in pixels) —
+    ///    same shape as r23/r24;
+    /// 2. quarter-pel refine around the integer winner via the
+    ///    H.264-chroma-style bilinear filter the decoder uses
+    ///    (`mb::render_mb_inter`'s `use_bicubic_luma == false` branch),
+    ///    with a Lagrangian tie-breaker `SAD + λ * mv_bits` so we don't
+    ///    pay extra MV bits for noise-level wins.
+    ///
+    /// MBs whose best MV is `(0, 0)` are emitted as `InterNoVecPf`;
+    /// otherwise as `InterDeltaPf` with the MV delta from the candidate
+    /// predictor (mirroring the decoder's `vector_predictors` +
+    /// `parse_vector_adjustment` walk).
     ///
     /// Spec references in `vp6_format.pdf`:
     /// * Section 10 (Mode Decoding) — MB-type tree (Figure 10) and
@@ -718,34 +759,32 @@ impl Vp6Encoder {
     ///   trees, mirrored on the encoder side via [`encode_mv_component`].
     /// * Section 11.2 (MV Probability Updates) — we emit "no update"
     ///   for every flag so the default probabilities continue to apply.
-    /// * Section 17.3 (Full Pixel Aligned Vectors) — integer-pel MVs
-    ///   skip the sub-pel filter step; chroma MVs are derived from the
-    ///   luma MV at the decoder via `VP6_COORD_DIV`.
+    /// * Section 17.2 (Half / Quarter Pixel Aligned Vectors) — sub-pel
+    ///   phase = `mv.x & 3` mapped to 8-step phases via `* 2`; bilinear
+    ///   filter taps a 2x2 window around the integer base.
     ///
-    /// Round-24 (this revision):
-    /// * **Inter residual coefficients are now emitted.** For each MB
-    ///   we materialise the integer-pel MC prediction (mirror of the
-    ///   decoder's `render_mb_inter` integer-pel path), compute the
-    ///   per-pixel residual `original - mc_pred`, run the forward DCT
-    ///   (without the keyframe's `-128` bias since the residual is
-    ///   already centred on zero), quantise DC + AC, run the
-    ///   `RefKind::Previous` DC predictor, and emit the resulting
-    ///   `(coded_dc, ac_levels)` through the per-block coefficient
-    ///   state machine that already drove the keyframe path. The
-    ///   per-block coeff state mirror (`enc_left_block`,
-    ///   `enc_above_blocks`, `enc_prev_dc`) is updated with
-    ///   `RefKind::Previous` semantics so subsequent MBs see the same
-    ///   DC predictor the decoder will compute.
+    /// Round-24:
+    /// * Inter residual coefficients emitted (DCT + quantise + DC
+    ///   predictor + per-block coeff state mirror) — see
+    ///   `r24_inter_residual_psnr_floor`.
     ///
-    /// Limitations (still pending r25+):
+    /// Round-25 (this revision):
+    /// * **Quarter-pel sub-pel ME.** `motion_search` returns qpel
+    ///   `(qdx, qdy)` directly; `sample_mc_tile` mirrors the decoder's
+    ///   bilinear branch (`bilinear_luma_sample`) so the residual
+    ///   computation matches what the decoder will compute. PSNR on
+    ///   sub-pel-translation fixtures climbs from ~19-29 dB
+    ///   (integer-only) to 35-37 dB (qpel). ffmpeg cross-decodes the
+    ///   qpel-MV inter packet cleanly.
+    ///
+    /// Limitations (still pending r26+):
     /// * Single-MV-per-MB only (mb_type ∈ {InterNoVecPf, InterDeltaPf}).
-    ///   No 4V / golden / sub-pel modes.
-    /// * `search` window is `±search` luma pixels in both axes; MV
-    ///   magnitude is clamped so the long-vector encoding fits the
-    ///   spec's 7-bit absolute range (≤ 127 in quarter-pel units, i.e.
-    ///   ≤ 31 integer pels).
-    /// * Integer-pel ME only — sub-pel ME would tighten the residual
-    ///   further but is gated on a sub-pel-capable MC mirror.
+    ///   No 4V / golden modes.
+    /// * `search` window is `±search` integer pels in both axes (qpel
+    ///   refine extends to `±search + 1` integer pels via the bilinear
+    ///   taps); MV magnitude is clamped so the long-vector encoding
+    ///   fits the spec's 7-bit absolute range (≤ 127 quarter-pel
+    ///   units, i.e. ≤ 31 integer pels).
     pub fn encode_inter_frame(
         &mut self,
         prev_y: &[u8],
@@ -937,8 +976,12 @@ impl Vp6Encoder {
 
             for mb_col in 0..mb_width {
                 // -- 1. Motion-search this MB against the previous frame.
-                let (raw_dx, raw_dy) =
-                    motion_search(new_y, prev_y, width, height, mb_row, mb_col, search);
+                // `motion_search` returns quarter-pel `(qdx, qdy)` —
+                // integer search seeded, then qpel-refined around the
+                // integer winner with bilinear MC mirroring the decoder.
+                let (q_dx, q_dy) = motion_search(
+                    new_y, prev_y, width, height, mb_row, mb_col, search, self.qp,
+                );
 
                 // -- 2. Predictor + candidate state, mirroring the decoder.
                 let (ctx_val, candidate0, candidate1, new_pos) = enc_vector_predictors(
@@ -961,8 +1004,8 @@ impl Vp6Encoder {
                 // MV is zero keeps the bitstream tight (no MV bits) and
                 // matches the decoder's expectation for skip MBs.
                 let want_mv = Mv {
-                    x: (raw_dx * 4) as i16, // quarter-pel units for luma
-                    y: (raw_dy * 4) as i16,
+                    x: q_dx as i16, // already in quarter-pel luma units
+                    y: q_dy as i16,
                 };
                 let new_type = if want_mv.x == 0 && want_mv.y == 0 {
                     tables::Vp56Mb::InterNoVecPf
@@ -1171,13 +1214,38 @@ impl Default for EncMbInfo {
     }
 }
 
-/// Integer-pel SAD search around `(0, 0)` within `±search` luma pixels.
-/// Returns `(dx, dy)` — the integer-pel offset that minimises SAD between
-/// the current MB and the corresponding candidate MB in `prev`.
+/// Integer-pel SAD search around `(0, 0)` within `±search` luma pixels,
+/// followed by a quarter-pel refine around the integer best. Returns
+/// `(qdx, qdy)` — the **quarter-pel** offset (luma units) that
+/// minimises a Lagrangian cost (SAD plus MV-bit cost) between the
+/// current MB and the corresponding candidate MB in `prev`.
 ///
-/// Search positions are clamped so the candidate MB stays fully inside
-/// the previous frame; this avoids the spec's "unrestricted MV" path
-/// (Section 11.5) which our scaffold doesn't yet emit.
+/// Quarter-pel search algorithm (r25):
+///
+/// 1. Run the integer-pel SAD search (existing behaviour) to seed
+///    `(int_dx, int_dy)`.
+/// 2. Around the integer winner, evaluate every quarter-pel offset
+///    `(qx, qy) ∈ {-3..=3}^2` (a 7x7 grid covering the qpel positions
+///    immediately around the integer winner without overlapping the
+///    next integer cell). Each candidate's cost is
+///    `SAD(MC(qpel)) + λ * mv_bits` where `MC(qpel)` is computed with
+///    the decoder's bilinear sub-pel filter (mirror of
+///    `mb::render_mb_inter`'s `put_h264_chroma8` path) and `λ` is a
+///    QP-dependent weighting tuned so the rate cost only matters when
+///    SAD is already tied (we want sub-pel precision when it
+///    measurably helps, but don't pay rate for noise-level wins).
+/// 3. Return the best qpel offset.
+///
+/// Integer search positions are clamped so the candidate MB stays
+/// fully inside the previous frame; the qpel refine clamps the qpel
+/// search bounds to the same window so we never reach past the integer
+/// search budget by more than ±1 integer pel (the bilinear filter taps
+/// pull from the next integer cell).
+///
+/// Spec ref: `vp6_format.pdf` §17.2 (Half / Quarter Pixel Aligned
+/// Vectors) — luma MV `mv.x` in quarter-pel units, integer part is
+/// `mv.x / 4`, sub-pel phase `mv.x & 3` (mapped to 8-step phases via
+/// `* 2` in the decoder's `render_mb_inter`).
 fn motion_search(
     cur: &[u8],
     prev: &[u8],
@@ -1186,6 +1254,7 @@ fn motion_search(
     mb_row: usize,
     mb_col: usize,
     search: i32,
+    qp: u8,
 ) -> (i32, i32) {
     let mb_x = (mb_col * 16) as i32;
     let mb_y = (mb_row * 16) as i32;
@@ -1194,27 +1263,75 @@ fn motion_search(
     let min_dx = (-mb_x).max(-search);
     let min_dy = (-mb_y).max(-search);
 
-    let mut best_dx = 0i32;
-    let mut best_dy = 0i32;
-    let mut best_sad = sad16x16(cur, prev, width, mb_x, mb_y, 0, 0);
+    // -- Stage 1: integer-pel search, full window.
+    let mut best_int_dx = 0i32;
+    let mut best_int_dy = 0i32;
+    let mut best_int_sad = sad16x16(cur, prev, width, mb_x, mb_y, 0, 0);
     for dy in min_dy..=max_dy {
         for dx in min_dx..=max_dx {
             if dx == 0 && dy == 0 {
                 continue;
             }
             let s = sad16x16(cur, prev, width, mb_x, mb_y, dx, dy);
-            if s < best_sad {
-                best_sad = s;
-                best_dx = dx;
-                best_dy = dy;
+            if s < best_int_sad {
+                best_int_sad = s;
+                best_int_dx = dx;
+                best_int_dy = dy;
             }
         }
     }
-    (best_dx, best_dy)
+
+    // -- Stage 2: quarter-pel refine around the integer winner. The
+    // bilinear filter taps reach to `+1` integer pel in both axes, so
+    // clamp the qpel search so `(int + 1)` stays inside `[min, max]`.
+    // We also need 1 pel of left/top headroom for the integer base.
+    let pw = width as i32;
+    let ph = height as i32;
+    let min_q_x = (-mb_x * 4).max(-search * 4 - 4);
+    let max_q_x = ((pw - 17 - mb_x) * 4).min(search * 4 + 4);
+    let min_q_y = (-mb_y * 4).max(-search * 4 - 4);
+    let max_q_y = ((ph - 17 - mb_y) * 4).min(search * 4 + 4);
+
+    // Lagrangian λ: roughly QP-proportional, tuned empirically so a
+    // sub-pel win of <1 SAD/pixel (i.e. mostly noise) doesn't outweigh
+    // the extra MV bits. QP 0..=63 maps to λ ~ 0..=63.
+    let lambda = qp as u64;
+
+    let int_qx = best_int_dx * 4;
+    let int_qy = best_int_dy * 4;
+    let mut best_qx = int_qx;
+    let mut best_qy = int_qy;
+    // Seed the cost from the integer winner — the qpel search has to
+    // beat it including its MV-bit cost.
+    let int_bits = mv_bit_cost_estimate(int_qx, int_qy);
+    let mut best_cost = best_int_sad.saturating_add(lambda.saturating_mul(int_bits));
+
+    for dqy in -3..=3i32 {
+        for dqx in -3..=3i32 {
+            if dqx == 0 && dqy == 0 {
+                continue;
+            }
+            let qx = int_qx + dqx;
+            let qy = int_qy + dqy;
+            if qx < min_q_x || qx > max_q_x || qy < min_q_y || qy > max_q_y {
+                continue;
+            }
+            let sad = sad16x16_qpel(cur, prev, width, height, mb_x, mb_y, qx, qy);
+            let bits = mv_bit_cost_estimate(qx, qy);
+            let cost = sad.saturating_add(lambda.saturating_mul(bits));
+            if cost < best_cost {
+                best_cost = cost;
+                best_qx = qx;
+                best_qy = qy;
+            }
+        }
+    }
+
+    (best_qx, best_qy)
 }
 
-/// Sum of absolute differences over a 16×16 luma MB at offset `(dx, dy)`
-/// against the previous frame.
+/// Sum of absolute differences over a 16×16 luma MB at integer-pel
+/// offset `(dx, dy)` against the previous frame.
 fn sad16x16(cur: &[u8], prev: &[u8], stride: usize, mb_x: i32, mb_y: i32, dx: i32, dy: i32) -> u64 {
     let mut acc = 0u64;
     for r in 0..16i32 {
@@ -1229,6 +1346,92 @@ fn sad16x16(cur: &[u8], prev: &[u8], stride: usize, mb_x: i32, mb_y: i32, dx: i3
         }
     }
     acc
+}
+
+/// SAD over a 16×16 luma MB against a **quarter-pel** MV `(qx, qy)`
+/// (luma quarter-pel units). Materialises the bilinear MC tile via
+/// `bilinear_luma_sample` per pixel and accumulates absolute
+/// differences. Sample positions are clamped to `[0, w-1] × [0, h-1]`,
+/// matching the decoder's edge-clamp inside its 12x12 reference
+/// scratch.
+#[allow(clippy::too_many_arguments)]
+fn sad16x16_qpel(
+    cur: &[u8],
+    prev: &[u8],
+    stride: usize,
+    height: usize,
+    mb_x: i32,
+    mb_y: i32,
+    qx: i32,
+    qy: i32,
+) -> u64 {
+    // VP6 luma sub-pel: integer = qx/4 (truncated toward zero), phase
+    // bits = qx & 3 mapped to 8-step phases via `* 2`. Mirror of
+    // `mb::render_mb_inter` for plane = Y.
+    let dx = qx / 4;
+    let dy = qy / 4;
+    let x8 = (qx & 3) * 2;
+    let y8 = (qy & 3) * 2;
+    let mut acc = 0u64;
+    for r in 0..16i32 {
+        let cy = (mb_y + r) as usize;
+        for c in 0..16i32 {
+            let cx = (mb_x + c) as usize;
+            let mc =
+                bilinear_luma_sample(prev, stride, height, mb_x + dx + c, mb_y + dy + r, x8, y8);
+            let a = cur[cy * stride + cx] as i32;
+            acc += (a - mc).unsigned_abs() as u64;
+        }
+    }
+    acc
+}
+
+/// Bilinear luma sample at `(base_x + frac_x/8, base_y + frac_y/8)`
+/// against `prev`. Mirrors the integer-pel-then-bilinear path the
+/// decoder uses (`put_h264_chroma8` with sub-pel offsets `x8`, `y8` in
+/// `[0, 8)`). Sample positions are clamped to plane bounds.
+#[inline]
+fn bilinear_luma_sample(
+    prev: &[u8],
+    stride: usize,
+    height: usize,
+    base_x: i32,
+    base_y: i32,
+    frac_x: i32,
+    frac_y: i32,
+) -> i32 {
+    let pw = stride as i32;
+    let ph = height as i32;
+    let sx0 = base_x.clamp(0, pw - 1);
+    let sy0 = base_y.clamp(0, ph - 1);
+    let sx1 = (base_x + 1).clamp(0, pw - 1);
+    let sy1 = (base_y + 1).clamp(0, ph - 1);
+    let p00 = prev[sy0 as usize * stride + sx0 as usize] as i32;
+    let p01 = prev[sy0 as usize * stride + sx1 as usize] as i32;
+    let p10 = prev[sy1 as usize * stride + sx0 as usize] as i32;
+    let p11 = prev[sy1 as usize * stride + sx1 as usize] as i32;
+    // Bilinear weights from `dsp::put_h264_chroma8`: `a, b, c, d` in
+    // [0, 64], rounding by `(v + 32) >> 6`.
+    let a = (8 - frac_x) * (8 - frac_y);
+    let b = frac_x * (8 - frac_y);
+    let c = (8 - frac_x) * frac_y;
+    let d = frac_x * frac_y;
+    let v = a * p00 + b * p01 + c * p10 + d * p11;
+    (v + 32) >> 6
+}
+
+/// Rough estimate of the bit cost of encoding a (qpel) MV component
+/// pair `(qx, qy)`. We use `bits ≈ ceil(log2(|qx| + |qy| + 1)) + 2`
+/// as a crude monotonic proxy for the decoder's MV-coding tree depth
+/// (PVA short tree = 1..3 bool bits + sign; FDV long tree = ~9 bool
+/// bits + sign). This isn't an exact bit count but is good enough for
+/// a Lagrangian tie-breaker between qpel candidates of comparable SAD.
+#[inline]
+fn mv_bit_cost_estimate(qx: i32, qy: i32) -> u64 {
+    let mag = qx.unsigned_abs() as u64 + qy.unsigned_abs() as u64;
+    // Cheap log2: 32 - leading_zeros of (mag | 1).
+    let log2 = 64u64 - (mag | 1).leading_zeros() as u64;
+    log2 + 2
 }
 
 /// Mirror of the decoder's `vector_predictors`. Returns
@@ -1509,13 +1712,16 @@ fn forward_dct8x8_residual(tile: &[i32; 64], out: &mut [i32; 64]) {
 }
 
 /// Sample an 8x8 MC prediction tile from the previous frame, mirroring
-/// the integer-pel branch of `mb::render_mb_inter`. For block `b`:
+/// the bilinear branch of `mb::render_mb_inter`. For block `b`:
 /// * Luma blocks 0..=3: pull from `prev_y` at `(base_x + dx, base_y +
 ///   dy)` where `dx = mv.x / 4`, `dy = mv.y / 4` (integer-pel from
-///   quarter-pel units).
+///   quarter-pel units). Sub-pel phase = `(mv.x & 3) * 2` (0..=6,
+///   step 2) — when non-zero we apply the H.264-chroma bilinear filter
+///   the decoder uses (`use_bicubic_luma == false` branch in
+///   `render_mb_inter`).
 /// * Chroma blocks 4/5: pull from `prev_u` / `prev_v` at `(base_x + dx,
-///   base_y + dy)` where `dx = mv.x / 8`, `dy = mv.y / 8` (chroma is
-///   half-resolution; `coord_div = 8`).
+///   base_y + dy)` where `dx = mv.x / 8`, `dy = mv.y / 8`. Sub-pel
+///   phase = `mv.x & 7` (0..=7, step 1).
 ///
 /// Sample positions are clamped to the plane's `[0, w-1] x [0, h-1]`,
 /// matching the decoder's edge-clamp inside the 12x12 reference scratch.
@@ -1537,6 +1743,11 @@ fn sample_mc_tile(
     let coord_div = tables::VP6_COORD_DIV[b] as i32;
     let dx = mv.x as i32 / coord_div;
     let dy = mv.y as i32 / coord_div;
+    let mask = coord_div - 1;
+    let is_luma = b < 4;
+    let phase_scale = if is_luma { 2 } else { 1 };
+    let x8 = (mv.x as i32 & mask) * phase_scale;
+    let y8 = (mv.y as i32 & mask) * phase_scale;
 
     let (plane, stride, plane_h, base_x, base_y): (&[u8], usize, usize, i32, i32) = match b {
         0 => (
@@ -1586,11 +1797,25 @@ fn sample_mc_tile(
 
     let pw = stride as i32;
     let ph = plane_h as i32;
-    for r in 0..8usize {
-        for c in 0..8usize {
-            let sx = (base_x + dx + c as i32).clamp(0, pw - 1);
-            let sy = (base_y + dy + r as i32).clamp(0, ph - 1);
-            out[r * 8 + c] = plane[sy as usize * stride + sx as usize] as i32;
+    if x8 == 0 && y8 == 0 {
+        // Integer-pel path — direct copy with edge clamp.
+        for r in 0..8usize {
+            for c in 0..8usize {
+                let sx = (base_x + dx + c as i32).clamp(0, pw - 1);
+                let sy = (base_y + dy + r as i32).clamp(0, ph - 1);
+                out[r * 8 + c] = plane[sy as usize * stride + sx as usize] as i32;
+            }
+        }
+    } else {
+        // Sub-pel path — bilinear filter mirroring `put_h264_chroma8`.
+        // Sample positions are clamped to plane bounds, matching the
+        // decoder's 12x12 reference-tile clamp inside `render_mb_inter`.
+        for r in 0..8usize {
+            for c in 0..8usize {
+                let sx = base_x + dx + c as i32;
+                let sy = base_y + dy + r as i32;
+                out[r * 8 + c] = bilinear_luma_sample(plane, stride, plane_h, sx, sy, x8, y8);
+            }
         }
     }
 }

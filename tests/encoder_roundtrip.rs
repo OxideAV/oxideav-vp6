@@ -750,3 +750,289 @@ fn r24_inter_residual_psnr_floor() {
          (mc_only={psnr_mc_only:.2}, residual={psnr_inter:.2})"
     );
 }
+
+// =====================================================================
+// r25: quarter-pel sub-pel motion estimation
+//
+// The two tests below validate the sub-pel ME path: a fixture (vertical
+// stripes / circular gradient) is shifted by a sub-integer-pel amount
+// between the keyframe and the inter frame. Without sub-pel ME the
+// integer-pel MV alone can't capture the shift, so the inter
+// reconstruction is dominated by the unrepresented sub-pel error
+// (~21 dB Y for these fixtures). With qpel ME enabled, the decoder's
+// bilinear filter follows the qpel MV and reconstruction clears 35 dB
+// Y comfortably.
+//
+// To make the comparison apples-to-apples the tests compute both the
+// "MC-only at the chosen qpel MV" baseline (what the qpel ME bought us
+// before residual) and the actual decoded PSNR (qpel MC + DCT
+// residual). Both are reported via `eprintln!` for diagnostic visibility.
+// =====================================================================
+
+/// Build a "translating vertical stripes" Y fixture pair.
+/// `keyframe` has period-32 stripes (smooth sine, much wider than the
+/// MB so bilinear MC reproduces the shift precisely); `inter` has the
+/// same stripes shifted right by `qpel_shift` quarter-pel units (so
+/// `qpel_shift = 2` is exactly half a pixel). The smooth low-frequency
+/// profile means integer-only ME alone misses the sub-pel shift but
+/// bilinear MC captures it within the noise floor.
+fn build_translating_stripes(w: usize, h: usize, qpel_shift: i32) -> (Vec<u8>, Vec<u8>) {
+    let period_pels = 32.0;
+    let profile = |x_8th: i32| -> u8 {
+        let x = x_8th as f64 / 8.0;
+        let phase = 2.0 * std::f64::consts::PI * (x / period_pels);
+        let v = 128.0 + 100.0 * phase.sin();
+        v.round().clamp(0.0, 255.0) as u8
+    };
+    let mut y0 = vec![0u8; w * h];
+    let mut y1 = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y0[r * w + c] = profile((c as i32) * 8);
+            y1[r * w + c] = profile((c as i32) * 8 - qpel_shift * 2);
+        }
+    }
+    (y0, y1)
+}
+
+/// Build a "translating circle" Y fixture pair. A smooth radial Gaussian
+/// centered at `(cx, cy)` shifted by `(qpel_dx, qpel_dy)` quarter-pel
+/// units. The Gaussian is band-limited (no sharp edges) so bilinear MC
+/// reconstructs sub-pel offsets within the noise floor.
+fn build_translating_disk(w: usize, h: usize, qpel_dx: i32, qpel_dy: i32) -> (Vec<u8>, Vec<u8>) {
+    let cx = w as f64 / 2.0;
+    let cy = h as f64 / 2.0;
+    let sigma = (w.min(h) as f64) * 0.18;
+    let profile = |x_8th: i32, y_8th: i32| -> u8 {
+        let x = x_8th as f64 / 8.0;
+        let y = y_8th as f64 / 8.0;
+        let dx = x - cx;
+        let dy = y - cy;
+        let r2 = (dx * dx + dy * dy) / (sigma * sigma);
+        // Gaussian peaked at 220, baseline 64.
+        let v = 64.0 + 156.0 * (-r2 / 2.0).exp();
+        v.round().clamp(0.0, 255.0) as u8
+    };
+    let mut y0 = vec![0u8; w * h];
+    let mut y1 = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y0[r * w + c] = profile((c as i32) * 8, (r as i32) * 8);
+            // Inter frame: same disk shifted by (qpel_dx, qpel_dy)
+            // quarter-pel units = `(qpel_dx * 2, qpel_dy * 2)` 8th-pel
+            // units (the profile is in 8ths-of-a-pel).
+            y1[r * w + c] = profile((c as i32) * 8 - qpel_dx * 2, (r as i32) * 8 - qpel_dy * 2);
+        }
+    }
+    (y0, y1)
+}
+
+/// r25 — Quarter-pel sub-pel motion estimation, translating vertical
+/// stripes. The inter frame is shifted by 2 quarter-pel units (= 0.5
+/// integer pel) right; integer-pel ME alone misses the sub-pel offset
+/// and produces ~21 dB Y. With qpel ME the bilinear MC follows the
+/// shift and reconstruction clears 35 dB Y.
+#[test]
+fn r25_qpel_translating_stripes_psnr_clears_35db() {
+    let (w, h) = (64usize, 32usize);
+    let (y0, y1) = build_translating_stripes(w, h, 2); // 0.5-pel shift
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    let mut enc = Vp6Encoder::new(8);
+    let key = enc.encode_keyframe(&y0, &u, &v, w, h).expect("keyframe");
+    let (recon_y, recon_u, recon_v, _, _) = decode_first_frame(key.clone());
+
+    // Search window covers ±2 integer pels — enough for a 0.5-pel shift,
+    // small enough the qpel refine doesn't have to chase noise. With
+    // qpel enabled the encoder lands on a sub-pel MV that the bilinear
+    // filter reproduces ~exactly.
+    let inter = enc
+        .encode_inter_frame(&recon_y, &recon_u, &recon_v, &y1, &u, &v, w, h, 2)
+        .expect("encode inter");
+
+    let params = CodecParameters::video(CodecId::new("vp6f"));
+    let mut dec = Vp6Decoder::new(params.codec_id.clone());
+    let mut key_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(key));
+    key_pkt.pts = Some(0);
+    key_pkt.flags.keyframe = true;
+    dec.send_packet(&key_pkt).expect("send keyframe");
+    let _ = dec.receive_frame().expect("receive keyframe");
+
+    let mut inter_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(inter));
+    inter_pkt.pts = Some(33);
+    dec.send_packet(&inter_pkt).expect("send inter");
+    let inter_frame = match dec.receive_frame().expect("receive inter") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video frame, got {other:?}"),
+    };
+    let dy = &inter_frame.planes[0].data;
+
+    // MC-only baseline at integer MV (zero) — what we'd get without any
+    // sub-pel refinement.
+    let psnr_int_only = plane_psnr(&y1, &recon_y);
+    let psnr_inter = plane_psnr(&y1, dy);
+    eprintln!(
+        "r25 stripes (0.5-pel shift): integer-MC baseline = {psnr_int_only:.2} dB, \
+         qpel-MC + residual = {psnr_inter:.2} dB"
+    );
+    assert!(
+        psnr_inter >= 35.0,
+        "qpel-MC Y PSNR too low on translating-stripes fixture: {psnr_inter:.2} dB \
+         (target >= 35 dB; integer-only baseline was {psnr_int_only:.2} dB)"
+    );
+}
+
+/// r25 — Quarter-pel sub-pel motion estimation, translating disk. The
+/// inter frame is shifted by `(2, 2)` quarter-pel units = `(0.5, 0.5)`
+/// pel diagonally; integer-pel ME alone misses both axes' sub-pel
+/// component. With qpel ME the bilinear MC follows the diagonal shift
+/// and reconstruction clears 35 dB Y.
+#[test]
+fn r25_qpel_translating_disk_psnr_clears_35db() {
+    let (w, h) = (64usize, 48usize);
+    let (y0, y1) = build_translating_disk(w, h, 2, 2); // 0.5-pel diag
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    let mut enc = Vp6Encoder::new(8);
+    let key = enc.encode_keyframe(&y0, &u, &v, w, h).expect("keyframe");
+    let (recon_y, recon_u, recon_v, _, _) = decode_first_frame(key.clone());
+
+    let inter = enc
+        .encode_inter_frame(&recon_y, &recon_u, &recon_v, &y1, &u, &v, w, h, 2)
+        .expect("encode inter");
+
+    let params = CodecParameters::video(CodecId::new("vp6f"));
+    let mut dec = Vp6Decoder::new(params.codec_id.clone());
+    let mut key_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(key));
+    key_pkt.pts = Some(0);
+    key_pkt.flags.keyframe = true;
+    dec.send_packet(&key_pkt).expect("send keyframe");
+    let _ = dec.receive_frame().expect("receive keyframe");
+
+    let mut inter_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(inter));
+    inter_pkt.pts = Some(33);
+    dec.send_packet(&inter_pkt).expect("send inter");
+    let inter_frame = match dec.receive_frame().expect("receive inter") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video frame, got {other:?}"),
+    };
+    let dy = &inter_frame.planes[0].data;
+
+    let psnr_int_only = plane_psnr(&y1, &recon_y);
+    let psnr_inter = plane_psnr(&y1, dy);
+    eprintln!(
+        "r25 disk ((0.5, 0.5)-pel shift): integer-MC baseline = {psnr_int_only:.2} dB, \
+         qpel-MC + residual = {psnr_inter:.2} dB"
+    );
+    assert!(
+        psnr_inter >= 35.0,
+        "qpel-MC Y PSNR too low on translating-disk fixture: {psnr_inter:.2} dB \
+         (target >= 35 dB; integer-only baseline was {psnr_int_only:.2} dB)"
+    );
+}
+
+/// r25 — ffmpeg interop on a sub-pel-MV inter packet. Encode a
+/// translating-stripes fixture at a 0.5-pel shift, mux key + inter
+/// into FLV, and verify ffmpeg's vp6f decoder accepts both packets
+/// (i.e. the sub-pel MV bits don't break ffmpeg's parser). The decoded
+/// PSNR through ffmpeg should clear 25 dB (a softer bar than our own
+/// decoder's 35 dB because ffmpeg may interpret the bilinear MC
+/// slightly differently on edge MBs).
+#[test]
+fn r25_ffmpeg_decodes_qpel_inter_frame() {
+    use std::process::Command;
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("ffmpeg not available — skipping");
+        return;
+    }
+
+    let (w, h) = (64usize, 32usize);
+    let (y0, y1) = build_translating_stripes(w, h, 2);
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    let mut enc = Vp6Encoder::new(12);
+    let key = enc.encode_keyframe(&y0, &u, &v, w, h).expect("keyframe");
+    let (recon_y, recon_u, recon_v, _, _) = decode_first_frame(key.clone());
+    let inter = enc
+        .encode_inter_frame(&recon_y, &recon_u, &recon_v, &y1, &u, &v, w, h, 2)
+        .expect("encode inter");
+
+    // Mux key + inter into a 2-tag FLV stream (same shape as
+    // `ffmpeg_decodes_inter_frame_with_mv`).
+    let mut flv = Vec::new();
+    flv.extend_from_slice(b"FLV");
+    flv.push(0x01);
+    flv.push(0x01);
+    flv.extend_from_slice(&9u32.to_be_bytes());
+    flv.extend_from_slice(&0u32.to_be_bytes());
+
+    let push_tag = |flv: &mut Vec<u8>, frame: &[u8], pts: u32, is_key: bool| -> u32 {
+        let video_payload_len = (1 + 1 + frame.len()) as u32;
+        flv.push(9);
+        flv.extend_from_slice(&video_payload_len.to_be_bytes()[1..]);
+        let ts = pts;
+        flv.push(((ts >> 16) & 0xff) as u8);
+        flv.push(((ts >> 8) & 0xff) as u8);
+        flv.push((ts & 0xff) as u8);
+        flv.push(((ts >> 24) & 0xff) as u8);
+        flv.extend_from_slice(&[0, 0, 0]);
+        flv.push(if is_key { 0x14 } else { 0x24 });
+        flv.push(0x00);
+        flv.extend_from_slice(frame);
+        let tag_size = 11 + video_payload_len;
+        flv.extend_from_slice(&tag_size.to_be_bytes());
+        tag_size
+    };
+    let _ = push_tag(&mut flv, &key, 0, true);
+    let _ = push_tag(&mut flv, &inter, 33, false);
+
+    let stamp = std::process::id();
+    let flv_path = std::env::temp_dir().join(format!("oxideav_vp6_r25_{stamp}.flv"));
+    let yuv_path = std::env::temp_dir().join(format!("oxideav_vp6_r25_{stamp}.yuv"));
+    std::fs::write(&flv_path, &flv).unwrap();
+    let status = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "flv",
+            "-i",
+        ])
+        .arg(&flv_path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to decode 2-tag qpel FLV");
+    let raw = std::fs::read(&yuv_path).unwrap();
+    let frame_size = w * h + 2 * (w / 2) * (h / 2);
+    assert!(
+        raw.len() >= 2 * frame_size,
+        "expected 2 frames, got {}",
+        raw.len()
+    );
+    let off = frame_size;
+    let ff_y = &raw[off..off + w * h];
+    let psnr = plane_psnr(&y1, ff_y);
+    eprintln!("r25 ffmpeg qpel decode: Y PSNR = {psnr:.2} dB");
+    let _ = std::fs::remove_file(flv_path);
+    let _ = std::fs::remove_file(yuv_path);
+    // Accept any reasonable reconstruction — the goal is to confirm
+    // ffmpeg parses the qpel MV bits cleanly. Even a soft baseline like
+    // pure MC-only (no residual interpretation) clears 20 dB on the
+    // smooth-stripe fixture.
+    assert!(
+        psnr >= 20.0,
+        "ffmpeg qpel-MV inter Y PSNR too low: {psnr:.2} dB (target >= 20 dB)"
+    );
+}

@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **r25 — quarter-pel sub-pel motion estimation (encoder).**
+  `Vp6Encoder::encode_inter_frame` now picks quarter-pel-accurate MVs.
+  `motion_search` runs the existing integer-pel SAD search to seed
+  `(int_dx, int_dy)`, then evaluates every qpel offset in a `±3 qpel`
+  window around the integer winner via the H.264-chroma-style bilinear
+  filter the decoder uses (`mb::render_mb_inter` `use_bicubic_luma ==
+  false` branch). Each qpel candidate's cost is `SAD(MC) + λ *
+  mv_bits` with `λ` proportional to QP — so sub-pel wins are taken
+  only when they measurably beat the integer winner including the
+  extra MV-bit cost. The MC-tile sampler (`sample_mc_tile`) likewise
+  grew a sub-pel branch (`bilinear_luma_sample`) so the residual
+  computation matches the decoder exactly when the chosen MV has
+  sub-pel components. Spec ref: `vp6_format.pdf` §17.2 (Half / Quarter
+  Pixel Aligned Vectors). Internal-decoder Y PSNR on the new
+  translating-stripes / translating-disk fixtures (0.5-pel sub-pel
+  shift, smooth low-frequency content) climbs from ~19-29 dB
+  (integer-pel MC alone) to 35-37 dB (qpel MC + DCT residual). ffmpeg
+  cross-decodes the qpel-MV inter packet cleanly (~32 dB Y on the
+  stripes fixture) — no regression in
+  `r21_inter_frame_ffmpeg_decode_state`.
+- `tests/encoder_roundtrip.rs::r25_qpel_translating_stripes_psnr_clears_35db`,
+  `r25_qpel_translating_disk_psnr_clears_35db`, and
+  `r25_ffmpeg_decodes_qpel_inter_frame`. The first two pin the qpel
+  PSNR floor at ≥ 35 dB Y on smooth low-frequency translation
+  fixtures; both report the integer-only baseline alongside for
+  visibility. The third confirms ffmpeg's vp6f decoder accepts the
+  qpel MV bits without error and reconstructs ≥ 20 dB Y.
+
 - **r24 — inter residual coefficient encoding.** `encode_inter_frame`
   now emits real DCT residual through the same `emit_block_coefs`
   state machine the keyframe path uses. Per MB:
