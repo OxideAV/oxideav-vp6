@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **r24 — inter residual coefficient encoding.** `encode_inter_frame`
+  now emits real DCT residual through the same `emit_block_coefs`
+  state machine the keyframe path uses. Per MB:
+  1. integer-pel motion search picks the best MV (unchanged from r23);
+  2. `sample_mc_tile` materialises the MC prediction tile (mirror of
+     `mb::render_mb_inter`'s integer-pel branch);
+  3. per-pixel residual = `original - mc_pred`;
+  4. `forward_dct8x8_residual` (new — same scaling as the keyframe
+     `forward_dct8x8` but without the `-128` pixel bias since the
+     residual is already centred on zero) → 64 frequency-domain
+     coefficients;
+  5. quantise DC + AC against `dequant_dc` / `dequant_ac` (`<< 2`
+     scaled);
+  6. apply the `RefKind::Previous` DC predictor (mirroring
+     `mb::add_predictors_dc(scratch, RefKind::Previous)`) and emit
+     `coded_dc = new_dc - predictor`;
+  7. update the per-block DC mirror (`enc_left_block`,
+     `enc_above_blocks`, `enc_prev_dc[plane][1]`) with the
+     reconstruction the decoder will land on, so subsequent MBs see
+     the same predictor.
+  Internal-decoder Y PSNR on the new
+  `r24_inter_residual_psnr_floor` fixture (flat keyframe + per-MB
+  brightness shift) jumps from ~19 dB (MC-only baseline, the pre-r24
+  ceiling) to ~43 dB (with residual). The existing
+  `inter_frame_horizontal_shift_uses_mv` (where MC alone covers most
+  of the change) records 40+ dB unchanged — the residual encoder
+  doesn't hurt MV-friendly content. ffmpeg-side residual interop
+  remains pending: ffmpeg accepts the bitstream end-to-end (no decode
+  errors, both packets `n == 2`) but produces the MC-only baseline,
+  suggesting a per-MB coefficient model state divergence downstream
+  of the keyframe-time `0x80` defaults — left for r25+.
+- `tests/encoder_roundtrip.rs::r24_inter_residual_psnr_floor`: pins
+  the residual encoding floor at ≥30 dB Y PSNR AND ≥5 dB above the
+  MC-only baseline. A regression that re-introduces the pre-r24
+  3-bool zero-block shortcut trips the test immediately because the
+  brightness-shift fixture is unrepresentable by MC alone.
+
 ### Fixed
 
 - **r23 — ffmpeg inter-frame interop UNBLOCKED.** `Vp6Encoder::new` /

@@ -35,6 +35,18 @@ inter-frame interop**: encoder default `sub_version` is now 6
 (`Vp3VersionNo = VP6.0` per spec Table 2), was 0 — the spec-forbidden
 zero was lenient on ffmpeg's keyframe path but mis-routed the inter
 parser, surfacing as the long-running "Invalid data" inter error.
+**r24 wires real inter residual coefficients**: `encode_inter_frame`
+now materialises the integer-pel MC prediction, computes the per-pixel
+residual against the source, runs the forward DCT (residual mode — no
+`-128` bias), quantises DC + AC, runs the `RefKind::Previous` DC
+predictor mirror, and emits the result through the same
+`emit_block_coefs` state machine that already drove the keyframe
+path. Internal-decoder PSNR on a flat-baseline + per-MB brightness-
+shift fixture jumps from ~19 dB (MC-only) to ~43 dB (with residual).
+ffmpeg-side residual interop still diverges (the inter decode lands on
+the MC-only baseline, suggesting a per-MB coefficient model state
+mismatch downstream of the keyframe-time `0x80` defaults) — left for
+r25+.
 
 ### Implemented
 
@@ -103,8 +115,8 @@ parser, surfacing as the long-running "Invalid data" inter error.
 
 ### Test coverage
 
-The crate ships 41 library unit tests plus 21 integration tests
-across 6 files (62 tests total):
+The crate ships 41 library unit tests plus 22 integration tests
+across 6 files (63 tests total):
 
 - **Unit tests** for the range coder round-trip, the IDCT (DC-only flat
   block, add-zero identity), the loop filter bounding-values table and
@@ -138,6 +150,13 @@ across 6 files (62 tests total):
   writes a 2-tag FLV to `/tmp/oxideav_vp6_dump.flv` for ffmpeg-side
   manual inspection, plus a `inter_buff2_offset_is_spec_compliant`
   guard that pins the spec layout of the partition-offset field.
+- `tests/encoder_roundtrip.rs::r24_inter_residual_psnr_floor` (new in
+  r24) — encodes a flat keyframe + per-MB brightness-shift inter
+  through `encode_inter_frame`, decodes the 2-tag stream through the
+  in-tree decoder, and asserts the inter-frame Y PSNR clears 30 dB
+  AND beats the MC-only baseline by ≥5 dB. Fails immediately on a
+  regression that drops the residual coefficient path back to the
+  pre-r24 zero-block shortcut.
 
 ## Quick use
 

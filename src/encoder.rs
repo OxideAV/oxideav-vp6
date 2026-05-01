@@ -115,12 +115,43 @@
 //!   should check this field to ensure that it can decode the
 //!   bitstream", confirming the value is gated, not advisory.
 //!
+//! Round-24 audit (delta — inter residual coefficient encoding):
+//!
+//! * **Feature added**: `encode_inter_frame` emits real DCT residual
+//!   per block. Previously every block emitted the 3-bool "all zero"
+//!   shortcut, so reconstruction was the MC prediction alone (a hard
+//!   PSNR ceiling on any content the integer-pel MV couldn't capture).
+//!   The new path mirrors the decoder's `parse_coeff` +
+//!   `add_predictors_dc(.., RefKind::Previous)` chain on the encoder
+//!   side: build the integer-pel MC tile (`sample_mc_tile`), compute
+//!   the pixel residual, forward DCT (`forward_dct8x8_residual` —
+//!   same scaling as the keyframe DCT but without the `-128` bias
+//!   since the residual is already centred on zero), quantise, run
+//!   the DC predictor, and emit through the same `emit_block_coefs`
+//!   state machine the keyframe path uses. Per-block state
+//!   (`enc_left_block`, `enc_above_blocks`,
+//!   `enc_prev_dc[plane][Previous]`) is tracked alongside so
+//!   subsequent MBs see exactly the same predictor the decoder will
+//!   compute.
+//! * **Behaviour**: in-tree decoder Y PSNR on the new
+//!   `r24_inter_residual_psnr_floor` fixture (flat keyframe + per-MB
+//!   brightness shift) jumps from ~19 dB (MC-only baseline — the
+//!   pre-r24 ceiling) to ~43 dB (with residual). The
+//!   `inter_frame_horizontal_shift_uses_mv` fixture (MC-friendly
+//!   content where residual ≈ 0) records 40+ dB unchanged.
+//! * **ffmpeg cross-decode**: ffmpeg accepts both packets in the
+//!   key + inter stream (`r21_inter_frame_ffmpeg_decode_state` still
+//!   passes `n == 2`). Cross-decoded residual content however lands
+//!   on the MC-only baseline, suggesting the per-MB coefficient model
+//!   state ffmpeg expects after the keyframe diverges from the
+//!   `0x80` baseline this encoder pins. r25+ work.
+//!
 //! Scope:
 //!
 //! * Sub-version 0 (simple profile), `filter_header = 0`, interlaced=0.
 //! * Bool-path coefficients (no Huffman).
 //! * Inter frames: integer-pel MVs, mb_type ∈ {InterNoVecPf,
-//!   InterDeltaPf}, no coded residual.
+//!   InterDeltaPf}, real DCT residual encoded per block (r24+).
 //!
 //! The forward DCT is a float-based DCT-II scaled so `block[u*8+v] =
 //! F[u,v]` feeds through the decoder's two-stage IDCT back to the same
@@ -691,15 +722,30 @@ impl Vp6Encoder {
     ///   skip the sub-pel filter step; chroma MVs are derived from the
     ///   luma MV at the decoder via `VP6_COORD_DIV`.
     ///
-    /// Limitations (matching `encode_skip_frame`):
-    /// * No coded residual: every block emits the 3-bool zero-block
-    ///   shortcut, so reconstruction is the MC prediction alone.
+    /// Round-24 (this revision):
+    /// * **Inter residual coefficients are now emitted.** For each MB
+    ///   we materialise the integer-pel MC prediction (mirror of the
+    ///   decoder's `render_mb_inter` integer-pel path), compute the
+    ///   per-pixel residual `original - mc_pred`, run the forward DCT
+    ///   (without the keyframe's `-128` bias since the residual is
+    ///   already centred on zero), quantise DC + AC, run the
+    ///   `RefKind::Previous` DC predictor, and emit the resulting
+    ///   `(coded_dc, ac_levels)` through the per-block coefficient
+    ///   state machine that already drove the keyframe path. The
+    ///   per-block coeff state mirror (`enc_left_block`,
+    ///   `enc_above_blocks`, `enc_prev_dc`) is updated with
+    ///   `RefKind::Previous` semantics so subsequent MBs see the same
+    ///   DC predictor the decoder will compute.
+    ///
+    /// Limitations (still pending r25+):
     /// * Single-MV-per-MB only (mb_type ∈ {InterNoVecPf, InterDeltaPf}).
     ///   No 4V / golden / sub-pel modes.
     /// * `search` window is `±search` luma pixels in both axes; MV
     ///   magnitude is clamped so the long-vector encoding fits the
     ///   spec's 7-bit absolute range (≤ 127 in quarter-pel units, i.e.
     ///   ≤ 31 integer pels).
+    /// * Integer-pel ME only — sub-pel ME would tighten the residual
+    ///   further but is gated on a sub-pel-capable MC mirror.
     pub fn encode_inter_frame(
         &mut self,
         prev_y: &[u8],
@@ -848,10 +894,47 @@ impl Vp6Encoder {
         // as the decoder primes `s->mb_type` before the per-MB loop.
         let mut prev_type = tables::Vp56Mb::InterNoVecPf;
 
+        // -- Per-block DC-predictor mirror (matches `BlockScratch`'s
+        // `left_block` / `above_blocks` / `prev_dc` for inter frames).
+        // The decoder applies `add_predictors_dc(scratch, RefKind::Previous)`
+        // after `parse_coeff` for every InterDelta/InterNoVec MB, so the
+        // encoder must compute the same predictor (and update the same
+        // running state) before quantising `coded_dc = new_dc - predictor`.
+        let mut enc_left_block: [EncRefDc; 4] = [EncRefDc::default(); 4];
+        let mut enc_above_blocks: Vec<EncRefDc> = vec![EncRefDc::default(); 4 * mb_width + 6];
+        if 2 * mb_width + 2 < enc_above_blocks.len() {
+            enc_above_blocks[2 * mb_width + 2].ref_frame = RefKind::Current;
+        }
+        if 3 * mb_width + 4 < enc_above_blocks.len() {
+            enc_above_blocks[3 * mb_width + 4].ref_frame = RefKind::Current;
+        }
+        // `prev_dc[plane][ref_kind_index]` — luma=0, U=1, V=2; ref index
+        // matches `mb::ref_kind_index` (Current=0, Previous=1, Golden=2).
+        // Decoder seeds `prev_dc[1][Current]=128`, `prev_dc[2][Current]=128`
+        // — Previous defaults stay at 0.
+        let mut enc_prev_dc = [[0i16; 3]; 3];
+        enc_prev_dc[1][0] = 128;
+        enc_prev_dc[2][0] = 128;
+
+        let dequant_dc = (tables::VP56_DC_DEQUANT[self.qp as usize & 0x3F] as i32) << 2;
+        let dequant_ac = (tables::VP56_AC_DEQUANT[self.qp as usize & 0x3F] as i32) << 2;
+
         // Partition 2: per-MB DCT coefficients only.
         let mut enc2 = RangeEncoder::new();
 
         for mb_row in 0..mb_height {
+            // Reset per-row left-block context (decoder's `start_row`).
+            for b in &mut enc_left_block {
+                *b = EncRefDc::default();
+            }
+            let mut above_block_idx: [usize; 6] = [0; 6];
+            above_block_idx[0] = 1;
+            above_block_idx[1] = 2;
+            above_block_idx[2] = 1;
+            above_block_idx[3] = 2;
+            above_block_idx[4] = 2 * mb_width + 2 + 1;
+            above_block_idx[5] = 3 * mb_width + 4 + 1;
+
             for mb_col in 0..mb_width {
                 // -- 1. Motion-search this MB against the previous frame.
                 let (raw_dx, raw_dy) =
@@ -920,17 +1003,138 @@ impl Vp6Encoder {
                 };
                 prev_type = new_type;
 
-                // -- 7. Zero-residual coefficient stream into partition 2.
+                // -- 7. Per-block residual encoding into partition 2.
+                //
+                // For each of the 6 blocks: build the integer-pel MC
+                // prediction tile, compute the pixel residual, forward
+                // DCT (residual mode — no `-128` subtraction), quantise,
+                // run the RefKind::Previous DC predictor, and emit via
+                // the same `emit_block_coefs` state machine the keyframe
+                // path uses.
                 for b in 0..6usize {
                     let pt = if b > 3 { 1 } else { 0 };
-                    let dc_ctx = 0usize;
-                    enc2.put_prob(model.coeff_dcct[pt][dc_ctx][0], 0);
-                    enc2.put_prob(model.coeff_ract[pt][0][0][0], 0);
-                    enc2.put_prob(model.coeff_ract[pt][0][0][1], 0);
+                    let plane_idx = tables::B2P[b] as usize;
+
+                    // Coefficient context = sum of `not_null_dc` flags
+                    // from the (left, above) DC neighbours. Same lookup
+                    // as the keyframe path / decoder.
+                    let coeff_ctx = enc_left_block[tables::B6_TO_4[b] as usize].not_null_dc
+                        as usize
+                        + enc_above_blocks[above_block_idx[b]].not_null_dc as usize;
+
+                    // -- (a) Sample original pixels for this 8x8 block.
+                    let mut orig_tile = [0i32; 64];
+                    sample_block_tile(
+                        b,
+                        mb_row,
+                        mb_col,
+                        new_y,
+                        new_u,
+                        new_v,
+                        width,
+                        uv_stride,
+                        &mut orig_tile,
+                    );
+
+                    // -- (b) Materialise the integer-pel MC prediction.
+                    let mut mc_tile = [0i32; 64];
+                    sample_mc_tile(
+                        b,
+                        mb_row,
+                        mb_col,
+                        prev_y,
+                        prev_u,
+                        prev_v,
+                        width,
+                        uv_stride,
+                        height,
+                        uv_h,
+                        stored_mv,
+                        &mut mc_tile,
+                    );
+
+                    // -- (c) Pixel residual.
+                    let mut residual = [0i32; 64];
+                    for i in 0..64 {
+                        residual[i] = orig_tile[i] - mc_tile[i];
+                    }
+
+                    // -- (d) Forward DCT in residual mode (no -128 bias).
+                    let mut coefs = [0i32; 64];
+                    forward_dct8x8_residual(&residual, &mut coefs);
+
+                    // -- (e) Quantise DC.
+                    let new_dc = div_nearest(coefs[0], dequant_dc).clamp(-32768, 32767) as i16;
+
+                    // -- (f) Compute the decoder's predictor_dc for this
+                    // block under RefKind::Previous.
+                    let lb = enc_left_block[tables::B6_TO_4[b] as usize];
+                    let ab = enc_above_blocks[above_block_idx[b]];
+                    let mut count = 0i32;
+                    let mut pdc = 0i32;
+                    if lb.ref_frame == RefKind::Previous {
+                        pdc += lb.dc_coeff as i32;
+                        count += 1;
+                    }
+                    if ab.ref_frame == RefKind::Previous {
+                        pdc += ab.dc_coeff as i32;
+                        count += 1;
+                    }
+                    let predictor: i32 = match count {
+                        0 => enc_prev_dc[plane_idx][1] as i32, // 1 = Previous
+                        2 => pdc / 2,
+                        _ => pdc,
+                    };
+                    let coded_dc = (new_dc as i32 - predictor).clamp(-32768, 32767) as i16;
+
+                    // -- (g) Quantise AC coefficients in coeff_idx order.
+                    let mut ac_levels = [0i32; 64];
+                    for coeff_idx in 1..64usize {
+                        let pos = model.coeff_index_to_pos[coeff_idx] as usize;
+                        let perm = tables::IDCT_SCANTABLE[pos] as usize;
+                        ac_levels[coeff_idx] =
+                            div_nearest(coefs[perm], dequant_ac).clamp(-2047, 2047);
+                    }
+
+                    let last_nz = find_last_nonzero(&ac_levels);
+
+                    // -- (h) Emit the block coefficient stream.
+                    emit_block_coefs(
+                        &mut enc2, &model, pt, coeff_ctx, coded_dc, &ac_levels, last_nz,
+                    );
+
+                    // -- (i) Update per-block DC context with the
+                    // reconstruction the decoder will land on. The
+                    // decoder's `add_predictors_dc` stores `new_dc =
+                    // coded_dc + predictor` back into both
+                    // `left_block.dc_coeff` and `above_blocks[].dc_coeff`,
+                    // and into `prev_dc[plane][Previous]`.
+                    let new_dc_final = (coded_dc as i32 + predictor) as i16;
+                    let has_nonzero_dc = coded_dc != 0;
+                    let lb_idx = tables::B6_TO_4[b] as usize;
+                    enc_left_block[lb_idx] = EncRefDc {
+                        not_null_dc: has_nonzero_dc,
+                        ref_frame: RefKind::Previous,
+                        dc_coeff: new_dc_final,
+                    };
+                    enc_above_blocks[above_block_idx[b]] = EncRefDc {
+                        not_null_dc: has_nonzero_dc,
+                        ref_frame: RefKind::Previous,
+                        dc_coeff: new_dc_final,
+                    };
+                    enc_prev_dc[plane_idx][1] = new_dc_final;
+                }
+
+                // Advance per-MB above-block indices the same way
+                // `BlockScratch::advance_column` does.
+                for y in 0..4 {
+                    above_block_idx[y] += 2;
+                }
+                for uv in 4..6 {
+                    above_block_idx[uv] += 1;
                 }
             }
         }
-        let _ = (new_u, new_v, prev_u, prev_v); // chroma planes unused for ME
 
         let p1 = enc.finish();
         let p2 = enc2.finish();
@@ -1254,6 +1458,139 @@ fn forward_dct8x8(tile: &[i32; 64], out: &mut [i32; 64]) {
             let cu = if u == 0 { inv_sqrt2 } else { 1.0 };
             let cv = if v == 0 { inv_sqrt2 } else { 1.0 };
             out[u * 8 + v] = (s * cu * cv).round() as i32;
+        }
+    }
+}
+
+/// Forward DCT for residual encoding — same shape as
+/// [`forward_dct8x8`] but without the `-128` pixel bias. The MC
+/// prediction is already centred near the original pixel range, so the
+/// per-pixel residual is a small signed value around 0; subtracting 128
+/// (as the keyframe path does to undo the encoder's `+128` reconstruction
+/// bias) would skew the DCT input by an unrelated constant.
+fn forward_dct8x8_residual(tile: &[i32; 64], out: &mut [i32; 64]) {
+    let mut cos = [[0.0f64; 8]; 8];
+    for k in 0..8 {
+        for n in 0..8 {
+            let angle = ((2 * k + 1) * n) as f64 * std::f64::consts::PI / 16.0;
+            cos[k][n] = angle.cos();
+        }
+    }
+
+    let mut pm = [0.0f64; 64];
+    for i in 0..64 {
+        pm[i] = tile[i] as f64;
+    }
+
+    let inv_sqrt2 = 1.0f64 / std::f64::consts::SQRT_2;
+
+    let mut temp = [0.0f64; 64];
+    for r in 0..8 {
+        for u in 0..8 {
+            let mut s = 0.0f64;
+            for c in 0..8 {
+                s += pm[r * 8 + c] * cos[c][u];
+            }
+            temp[r * 8 + u] = s;
+        }
+    }
+
+    for u in 0..8 {
+        for v in 0..8 {
+            let mut s = 0.0f64;
+            for r in 0..8 {
+                s += temp[r * 8 + v] * cos[r][u];
+            }
+            let cu = if u == 0 { inv_sqrt2 } else { 1.0 };
+            let cv = if v == 0 { inv_sqrt2 } else { 1.0 };
+            out[u * 8 + v] = (s * cu * cv).round() as i32;
+        }
+    }
+}
+
+/// Sample an 8x8 MC prediction tile from the previous frame, mirroring
+/// the integer-pel branch of `mb::render_mb_inter`. For block `b`:
+/// * Luma blocks 0..=3: pull from `prev_y` at `(base_x + dx, base_y +
+///   dy)` where `dx = mv.x / 4`, `dy = mv.y / 4` (integer-pel from
+///   quarter-pel units).
+/// * Chroma blocks 4/5: pull from `prev_u` / `prev_v` at `(base_x + dx,
+///   base_y + dy)` where `dx = mv.x / 8`, `dy = mv.y / 8` (chroma is
+///   half-resolution; `coord_div = 8`).
+///
+/// Sample positions are clamped to the plane's `[0, w-1] x [0, h-1]`,
+/// matching the decoder's edge-clamp inside the 12x12 reference scratch.
+#[allow(clippy::too_many_arguments)]
+fn sample_mc_tile(
+    b: usize,
+    mb_row: usize,
+    mb_col: usize,
+    prev_y: &[u8],
+    prev_u: &[u8],
+    prev_v: &[u8],
+    y_stride: usize,
+    uv_stride: usize,
+    y_h: usize,
+    uv_h: usize,
+    mv: Mv,
+    out: &mut [i32; 64],
+) {
+    let coord_div = tables::VP6_COORD_DIV[b] as i32;
+    let dx = mv.x as i32 / coord_div;
+    let dy = mv.y as i32 / coord_div;
+
+    let (plane, stride, plane_h, base_x, base_y): (&[u8], usize, usize, i32, i32) = match b {
+        0 => (
+            prev_y,
+            y_stride,
+            y_h,
+            (mb_col * 16) as i32,
+            (mb_row * 16) as i32,
+        ),
+        1 => (
+            prev_y,
+            y_stride,
+            y_h,
+            (mb_col * 16 + 8) as i32,
+            (mb_row * 16) as i32,
+        ),
+        2 => (
+            prev_y,
+            y_stride,
+            y_h,
+            (mb_col * 16) as i32,
+            (mb_row * 16 + 8) as i32,
+        ),
+        3 => (
+            prev_y,
+            y_stride,
+            y_h,
+            (mb_col * 16 + 8) as i32,
+            (mb_row * 16 + 8) as i32,
+        ),
+        4 => (
+            prev_u,
+            uv_stride,
+            uv_h,
+            (mb_col * 8) as i32,
+            (mb_row * 8) as i32,
+        ),
+        5 => (
+            prev_v,
+            uv_stride,
+            uv_h,
+            (mb_col * 8) as i32,
+            (mb_row * 8) as i32,
+        ),
+        _ => unreachable!(),
+    };
+
+    let pw = stride as i32;
+    let ph = plane_h as i32;
+    for r in 0..8usize {
+        for c in 0..8usize {
+            let sx = (base_x + dx + c as i32).clamp(0, pw - 1);
+            let sy = (base_y + dy + r as i32).clamp(0, ph - 1);
+            out[r * 8 + c] = plane[sy as usize * stride + sx as usize] as i32;
         }
     }
 }

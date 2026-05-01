@@ -655,3 +655,98 @@ fn vertical_gradient_plane_mean_preserved() {
         }
     }
 }
+
+/// r24 — Inter residual coefficient encoding floor.
+///
+/// Encodes a flat keyframe, then encodes a SECOND frame with a
+/// brightness ramp added on top. The ME can't help (the prev frame is
+/// flat — every MB's best MV is `(0, 0)`), so MC alone reconstructs the
+/// flat baseline. With residual coefficients enabled (r24+), the
+/// encoder absorbs the per-block shift into the DCT residual and the
+/// reconstruction PSNR clears 30 dB; the pre-r24 path was bounded by
+/// the brightness-shift energy (MC-only baseline ~ 20.5 dB).
+///
+/// Why a flat keyframe? A flat reference frame guarantees ME picks
+/// `(0, 0)` for every MB (zero SAD across the search window), so the
+/// per-MB residual is exactly `y1 - 128` — directly testing the DCT +
+/// quantise + emit path without any MV-thrashing noise.
+#[test]
+fn r24_inter_residual_psnr_floor() {
+    let (w, h) = (32usize, 32usize);
+    // Keyframe: a flat 128-luma plane. Decoded as 128 everywhere.
+    let y0 = vec![128u8; w * h];
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v_plane = vec![128u8; (w / 2) * (h / 2)];
+
+    // Inter frame: same content + per-MB brightness shifts. Block shift
+    // varies across the frame so DC residual is non-trivial across
+    // multiple MBs (exercising the per-MB DC predictor mirror, not just
+    // the first one).
+    let mut y1 = vec![128u8; w * h];
+    for mb_row in 0..(h / 16) {
+        for mb_col in 0..(w / 16) {
+            let shift = 8 + ((mb_row * 7 + mb_col * 11) % 24) as u8 * 2;
+            for r in 0..16usize {
+                for c in 0..16usize {
+                    let i = (mb_row * 16 + r) * w + (mb_col * 16 + c);
+                    y1[i] = 128u8.saturating_add(shift);
+                }
+            }
+        }
+    }
+
+    let mut enc = Vp6Encoder::new(12); // tighter QP -> better residual fidelity
+    let key = enc
+        .encode_keyframe(&y0, &u, &v_plane, w, h)
+        .expect("keyframe");
+
+    // Decode the keyframe through our own decoder so the encoder's
+    // motion search runs against the same reconstruction the decoder
+    // will see.
+    let (recon_y, recon_u, recon_v, _, _) = decode_first_frame(key.clone());
+    let inter = enc
+        .encode_inter_frame(&recon_y, &recon_u, &recon_v, &y1, &u, &v_plane, w, h, 4)
+        .expect("encode inter");
+
+    // Decode the (key + inter) sequence through our decoder.
+    let params = CodecParameters::video(CodecId::new("vp6f"));
+    let mut dec = Vp6Decoder::new(params);
+    let mut key_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(key));
+    key_pkt.pts = Some(0);
+    key_pkt.flags.keyframe = true;
+    dec.send_packet(&key_pkt).expect("send keyframe");
+    let _ = dec.receive_frame().expect("receive keyframe");
+
+    let mut inter_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(inter));
+    inter_pkt.pts = Some(33);
+    dec.send_packet(&inter_pkt).expect("send inter");
+    let inter_frame = match dec.receive_frame().expect("receive inter") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video frame, got {other:?}"),
+    };
+    let dy = &inter_frame.planes[0].data;
+
+    // MC-only baseline (no residual): reconstructed Y == prev recon_y.
+    // MSE_baseline = E[(y1 - recon_y)^2] ≈ shift^2 in the steady state.
+    let psnr_mc_only = plane_psnr(&y1, &recon_y);
+    let psnr_inter = plane_psnr(&y1, dy);
+    eprintln!(
+        "r24: MC-only baseline PSNR = {psnr_mc_only:.2} dB, \
+         residual-coded PSNR = {psnr_inter:.2} dB"
+    );
+
+    // With residual encoding the PSNR should comfortably clear 30 dB.
+    // The pre-r24 path topped out around the MC-only baseline because
+    // the entire brightness delta had to live in the unrepresented
+    // residual.
+    assert!(
+        psnr_inter >= 30.0,
+        "Y PSNR with residual encoding too low: {psnr_inter:.2} dB \
+         (target >= 30 dB; MC-only baseline was {psnr_mc_only:.2} dB)"
+    );
+    assert!(
+        psnr_inter >= psnr_mc_only + 5.0,
+        "residual encoding should improve on MC-only baseline by ≥5 dB \
+         (mc_only={psnr_mc_only:.2}, residual={psnr_inter:.2})"
+    );
+}
