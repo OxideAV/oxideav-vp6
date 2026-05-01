@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **r23 — ffmpeg inter-frame interop UNBLOCKED.** `Vp6Encoder::new` /
+  `Vp6Encoder::default` now seed `sub_version = 6` (VP6.0 / Simple
+  Profile) instead of the pre-r23 `0`. VP6 spec §9 / Table 2 defines
+  byte 1 of the keyframe header as `Vp3VersionNo[5b] | VpProfile[2b] |
+  Reserved[1b]` with `Vp3VersionNo` REQUIRED to hold 6, 7, or 8 (the
+  spec page 25 description: "The decoder should check this field to
+  ensure that it can decode the bitstream"). The previous value of 0
+  was silently accepted by ffmpeg on the keyframe path but routed the
+  inter parser through a Vp6.<keyframe-only> code path that mishandled
+  subsequent frames — producing the long-standing "Invalid data found
+  when processing input" inter-frame error. Wire change: byte 1 of the
+  keyframe header is now `0x30` (was `0x00`); no other byte moves.
+  The fix unblocks `tests/ffmpeg_interop.rs::r21_inter_frame_*` and
+  `ffmpeg_decodes_keyframe_in_two_tag_stream`, both of which now
+  strictly assert ffmpeg decodes both packets (`n == 2`). The
+  `decode_first_20_frames` regression remains green because the
+  decoder's `sub_version` gates (`> 7` / `< 8` / `> 6` in
+  `rebuild_coeff_tables`) all behave identically for `sub_version = 6`
+  as they did for `sub_version = 0`.
 - `vector_predictors` (decoder) and `enc_vector_predictors` (encoder)
   now return the spec page 28 Table 5 mapping
   `(0 cands -> ctx 2, 1 cand -> ctx 1, 2+ cands -> ctx 0)`, i.e.
@@ -47,6 +66,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tests/ffmpeg_interop.rs::keyframe_vp3_version_no_is_spec_legal`:
+  pins byte 1 of the keyframe header to `Vp3VersionNo ∈ 6..=8`,
+  `VpProfile == 0` (Simple), `Reserved == 0`. A regression that
+  re-introduces the pre-r23 `sub_version = 0` default (which broke
+  ffmpeg inter-frame interop while passing every internal
+  round-trip test) trips this guard immediately. (r23 audit.)
 - `decoder::tests::vector_predictors_ctx_mapping_matches_spec`: pins
   the spec page 28 Table 5 mapping for `vector_predictors`. A
   regression to `nb_pred + 1` (the pre-r22 form) trips the test

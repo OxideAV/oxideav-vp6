@@ -8,9 +8,9 @@
 //! P-frames are emitted via [`Vp6Encoder::encode_skip_frame`] (identity
 //! copy of the previous frame) or [`Vp6Encoder::encode_inter_frame`]
 //! (integer-pel motion-vector search + `InterDeltaPf` mb-type emission;
-//! no coded residual). Both round-trip through our decoder; ffmpeg-side
-//! acceptance of inter frames is still pending — the inter-frame
-//! probability-model layer diverges from what ffmpeg expects.
+//! no coded residual). As of r23 ffmpeg's `vp6f` decoder accepts both
+//! inter paths end-to-end (`tests/ffmpeg_interop.rs::*` all pin
+//! `n == 2`).
 //!
 //! Round-19 audit (recorded so the next round doesn't repeat steps):
 //!
@@ -83,6 +83,37 @@
 //!   keyframe path but mis-route the inter parser; the per-MB
 //!   coefficient model state ffmpeg expects after the keyframe may
 //!   diverge from the `0x80` baseline our encoder pins).
+//!
+//! Round-23 audit (delta — INTEROP UNBLOCKED):
+//!
+//! * **Bug fixed**: `Vp6Encoder::default().sub_version` was 0, which
+//!   the encoder serialised into byte 1 of the keyframe header as
+//!   `0 << 3 = 0x00`. VP6 spec §9 / Table 2 (`IntraHeader`) defines
+//!   bits 7..3 of byte 1 as `Vp3VersionNo` R(5), required to hold the
+//!   value 6, 7, or 8 (VP6.0 / VP6.1 / VP6.2). The value 0 is
+//!   forbidden. ffmpeg's keyframe-decode path silently accepted the
+//!   illegal 0 (so our keyframe round-tripped pre-r23) but routed the
+//!   inter parser through a code path that mishandled subsequent
+//!   frames, surfacing as the long-running "Invalid data found when
+//!   processing input" inter-frame error. The fix is one byte:
+//!   default `sub_version` is now 6 (VP6.0 / Simple Profile), so byte
+//!   1 reads `6 << 3 = 0x30`. Pinned by
+//!   `tests/ffmpeg_interop.rs::keyframe_vp3_version_no_is_spec_legal`.
+//! * **Behaviour**: `tests/ffmpeg_interop.rs` flips green —
+//!   `r21_inter_frame_ffmpeg_decode_state` and
+//!   `ffmpeg_decodes_keyframe_in_two_tag_stream` both now strictly
+//!   assert `n == 2` (both keyframe + inter accepted by ffmpeg). The
+//!   `decode_first_20_frames` regression on the embedded FLV sample
+//!   continues to pass — the decoder's `sub_version` gates
+//!   (`> 7` / `< 8`) all behave the same for `sub_version = 6` as
+//!   they did for `sub_version = 0`. The on-wire byte count is
+//!   unchanged; only the value of byte 1 moves from `0x00` to `0x30`.
+//! * Spec cross-reference: page 23 Table 1 (Frame Header) lists the
+//!   8-byte keyframe-prelude shape; page 24 Table 2 (IntraHeader)
+//!   defines the 5-bit `Vp3VersionNo` and 2-bit `VpProfile` fields
+//!   that share byte 1; page 25 explicitly states "The decoder
+//!   should check this field to ensure that it can decode the
+//!   bitstream", confirming the value is gated, not advisory.
 //!
 //! Scope:
 //!
@@ -157,7 +188,19 @@ impl Default for Vp6Encoder {
     fn default() -> Self {
         Self {
             qp: 32,
-            sub_version: 0,
+            // VP6 spec Table 2: `Vp3VersionNo` is R(5) and is required to
+            // hold the values 6 (VP6.0), 7 (VP6.1) or 8 (VP6.2). The
+            // decoder explicitly checks this — the value 0 (the pre-r23
+            // default) is forbidden by spec. Round-trip-wise our own
+            // decoder accepts 0..=8, but ffmpeg's decoder routes the
+            // inter-frame parser through paths gated on `sub_version`
+            // (VP6.0 vs VP6.2 sub-pel filter selection) where a 0 lands
+            // on a Vp6.<keyframe-only> code path that mishandles
+            // subsequent inter frames. Default to 6 (VP6.0 / Simple
+            // Profile) so the keyframe header advertises a valid
+            // version. (See r23 audit notes in this module's head
+            // comment.)
+            sub_version: 6,
             mb_width: 0,
             mb_height: 0,
             have_keyframe: false,
@@ -166,11 +209,13 @@ impl Default for Vp6Encoder {
 }
 
 impl Vp6Encoder {
-    /// New encoder with a given QP (clamped to 0..=63).
+    /// New encoder with a given QP (clamped to 0..=63). Emits VP6.0
+    /// (`Vp3VersionNo = 6`) headers; see [`Self::default`] for why this
+    /// matters for ffmpeg-side interop.
     pub fn new(qp: u8) -> Self {
         Self {
             qp: qp.min(63),
-            sub_version: 0,
+            sub_version: 6,
             mb_width: 0,
             mb_height: 0,
             have_keyframe: false,
@@ -1519,7 +1564,9 @@ mod tests {
         let mut enc = Vp6Encoder::new(32);
         let bytes = enc.encode_keyframe(&y, &u, &v, w, h).unwrap();
         assert_eq!(bytes[0], 64);
-        assert_eq!(bytes[1], 0);
+        // r23: byte 1 carries Vp3VersionNo (R5) << 3. Default encoder
+        // emits VP6.0 (`Vp3VersionNo = 6`) so byte 1 = 6 << 3 = 0x30 (48).
+        assert_eq!(bytes[1], 48, "Vp3VersionNo (bits 7..3) must be 6 (VP6.0)");
         assert!(bytes.len() > 8);
     }
 

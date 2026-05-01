@@ -1,17 +1,14 @@
 //! ffmpeg-side interop check for the inter-frame encoder. Builds a
-//! minimal 2-tag FLV (key + skip) from our encoder, hands it to an
-//! external `ffmpeg` process, and asserts ffmpeg accepts the inter
-//! packet (i.e., decodes 2 frames, not 1 + an error).
+//! minimal 2-tag FLV (key + skip OR key + motion-search inter) from
+//! our encoder, hands it to an external `ffmpeg` process, and asserts
+//! ffmpeg accepts every packet (i.e., decodes 2 frames, no decode
+//! errors).
 //!
 //! Skipped silently when `ffmpeg` isn't on PATH so CI without it stays
-//! green. When `ffmpeg` IS available, this test currently still
-//! reports 1 decoded frame (ffmpeg rejects our inter packet) — see
-//! `src/encoder.rs` for the r19 audit notes. The test asserts the
-//! current state to surface regressions in either direction:
-//! - if we improve and ffmpeg starts accepting, the test will fail and
-//!   the assertion can be tightened to `decoded == 2`;
-//! - if we accidentally regress the keyframe path, the test will fail
-//!   because ffmpeg won't even decode the keyframe (`decoded == 0`).
+//! green. As of r23 both `ffmpeg_decodes_keyframe_in_two_tag_stream`
+//! and `r21_inter_frame_ffmpeg_decode_state` assert `n == 2`; the
+//! breakthrough was setting `Vp3VersionNo = 6` on the keyframe header
+//! (was emitting 0, which is forbidden by spec — see Table 2).
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -162,13 +159,13 @@ fn ffmpeg_accepts_keyframe() {
     );
 }
 
-/// Tracks the inter-frame interop state. The encoder is currently
-/// known to produce inter packets ffmpeg rejects (r19 audit) — but the
-/// keyframe in the same FLV decodes cleanly, so ffmpeg surfaces 1
-/// frame + 1 decode error. The assertion records that contract; if
-/// future work fixes inter decode, ffmpeg will return 2 frames and the
-/// assertion needs to be tightened to `>= 2`. Skipped when ffmpeg
-/// isn't on PATH.
+/// Tracks the inter-frame interop state. As of r23 (`Vp3VersionNo = 6`
+/// fix on the keyframe header), ffmpeg accepts both the keyframe AND
+/// the skip inter packet — `n == 2`. Pre-r23 this was `n == 1` (key
+/// accepted, inter rejected with "Invalid data found"). The
+/// per-frame upper-bound + per-frame lower-bound now both pin to 2
+/// so a regression in either direction (key OR inter) trips the test.
+/// Skipped when ffmpeg isn't on PATH.
 #[test]
 fn ffmpeg_decodes_keyframe_in_two_tag_stream() {
     if !ffmpeg_available() {
@@ -190,41 +187,29 @@ fn ffmpeg_decodes_keyframe_in_two_tag_stream() {
 
     let flv = build_flv(&key, &inter);
     let n = ffmpeg_decode_count(&flv);
-    // r19 known state: ffmpeg decodes the keyframe (1 frame) and
-    // rejects the inter (decode error). Asserting `>= 1` captures
-    // that — if r20 fixes inter interop, this should bump to 2 and the
-    // assertion can be tightened.
-    assert!(
-        n >= 1,
-        "ffmpeg should at minimum decode the keyframe (got {n})"
+    assert_eq!(
+        n, 2,
+        "ffmpeg should decode both keyframe + skip inter (got {n})"
     );
-    if n >= 2 {
-        eprintln!(
-            "ffmpeg now accepts the inter packet too ({n} frames) — \
-             tighten the assertion!"
-        );
-    }
 }
 
-/// r21 regression — pins the inter-frame ffmpeg-cross-decode state so
-/// future rounds can tighten the assertion to `== 2` once the
-/// remaining encoder-side bugs (per the r20 audit notes in
-/// `src/encoder.rs`) are fixed.
-///
-/// The r20 spec-compliance fix (`DEF_MB_TYPES_STATS` pair order) was
-/// necessary but not sufficient: ffmpeg still rejects our inter packet
-/// with "Invalid data found when processing input". This test runs
-/// ffmpeg against a 2-tag (key + inter) stream and records the current
-/// "1 frame decoded, 1 decode error" contract via `frame_count >= 1
-/// && < 2`. When inter interop is fixed the upper bound trips and the
-/// test fails loudly so the assertion can be flipped to `== 2`.
+/// r21 + r23 milestone — the motion-search inter packet must
+/// round-trip through ffmpeg's vp6f decoder. Pre-r23 ffmpeg rejected
+/// our inter packet ("Invalid data found when processing input") even
+/// though it accepted the keyframe; r23 traced this to byte 1 of the
+/// keyframe header (`Vp3VersionNo`, R(5)) being emitted as 0 instead
+/// of the spec-required 6/7/8. ffmpeg's keyframe path accepted the
+/// invalid version (silently routing through a Vp6.<keyframe-only>
+/// path) but the inter parser then mis-routed. Setting the encoder's
+/// default `sub_version` to 6 (VP6.0 / Simple Profile) fixes both
+/// paths — see the r23 audit notes in `src/encoder.rs`.
 ///
 /// This is structurally similar to
 /// `ffmpeg_decodes_keyframe_in_two_tag_stream` above but uses
 /// `encode_inter_frame` (motion search) rather than `encode_skip_frame`
 /// — both inter paths share the same picture-header model code, so a
-/// model-level fix should unblock both tests at once. Skipped when
-/// ffmpeg isn't on PATH.
+/// model-level fix unblocks both tests at once. Skipped when ffmpeg
+/// isn't on PATH.
 #[test]
 fn r21_inter_frame_ffmpeg_decode_state() {
     if !ffmpeg_available() {
@@ -262,18 +247,43 @@ fn r21_inter_frame_ffmpeg_decode_state() {
 
     let flv = build_flv(&key, &inter);
     let n = ffmpeg_decode_count(&flv);
-    // Current r20 state: keyframe accepted, inter rejected → n == 1.
-    // Lower bound guards regression of the keyframe path; upper bound
-    // flips the test red the moment inter interop starts working so we
-    // can tighten to `n == 2`.
-    assert!(
-        n >= 1,
-        "ffmpeg should at minimum decode the keyframe (got {n})"
+    // r23: both keyframe + motion-search inter must decode cleanly.
+    // Strict equality so a regression in either direction is caught.
+    assert_eq!(
+        n, 2,
+        "ffmpeg must accept both keyframe + motion-search inter (got {n})"
     );
-    if n >= 2 {
-        eprintln!(
-            "r21 milestone: ffmpeg now accepts the inter packet ({n} frames) — \
-             tighten r21_inter_frame_ffmpeg_decode_state to `assert_eq!(n, 2)`!"
-        );
-    }
+}
+
+/// r23 spec-compliance pin — VP6 spec §9 / Table 2 specifies that the
+/// keyframe header's `Vp3VersionNo` field (R(5), bits 7..3 of byte 1)
+/// must hold the value 6 (VP6.0), 7 (VP6.1), or 8 (VP6.2). The value
+/// 0 is forbidden, even though some lenient decoders (including
+/// ffmpeg's keyframe decode path pre-r23) would silently accept it.
+/// This guard pins the on-wire byte to the spec-legal range so any
+/// regression of `Vp6Encoder::default().sub_version` to 0 surfaces
+/// immediately — without it the inter packet's ffmpeg interop quietly
+/// breaks.
+#[test]
+fn keyframe_vp3_version_no_is_spec_legal() {
+    let (w, h) = (16usize, 16usize);
+    let y = vec![128u8; w * h];
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+    let mut enc = Vp6Encoder::new(32);
+    let key = enc.encode_keyframe(&y, &u, &v, w, h).expect("encode key");
+    let vp3_version_no = key[1] >> 3;
+    assert!(
+        (6..=8).contains(&vp3_version_no),
+        "Vp3VersionNo must be 6/7/8 per VP6 spec Table 2 (got {vp3_version_no}, byte1=0x{:02x})",
+        key[1]
+    );
+    // VpProfile (bits 2..1) should be 0 (Simple) for our scaffold.
+    let vp_profile = (key[1] >> 1) & 0x3;
+    assert_eq!(
+        vp_profile, 0,
+        "VpProfile must be 0 (Simple) for the scaffold (got {vp_profile})"
+    );
+    // Reserved bit 0 must be 0 per spec.
+    assert_eq!(key[1] & 1, 0, "Reserved bit (byte 1, bit 0) must be 0");
 }

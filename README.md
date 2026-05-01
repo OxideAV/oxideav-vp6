@@ -30,7 +30,11 @@ FFmpeg's reverse-engineered `libavcodec/vp56.c` + `libavcodec/vp6.c`
 bicubic interpolator + `vpx_rac.h` for the bool coder), but encoder
 audit rounds (r19+) lean on the spec directly. r22 lands the spec
 page 28 Table 5 ctx mapping for `vector_predictors` (`ctx = 2 -
-nb_pred`) on both decoder + encoder sides.
+nb_pred`) on both decoder + encoder sides. **r23 unblocks ffmpeg
+inter-frame interop**: encoder default `sub_version` is now 6
+(`Vp3VersionNo = VP6.0` per spec Table 2), was 0 — the spec-forbidden
+zero was lenient on ffmpeg's keyframe path but mis-routed the inter
+parser, surfacing as the long-running "Invalid data" inter error.
 
 ### Implemented
 
@@ -99,8 +103,8 @@ nb_pred`) on both decoder + encoder sides.
 
 ### Test coverage
 
-The crate ships 41 library unit tests plus 19 integration tests
-across 6 files (60 tests total):
+The crate ships 41 library unit tests plus 21 integration tests
+across 6 files (62 tests total):
 
 - **Unit tests** for the range coder round-trip, the IDCT (DC-only flat
   block, add-zero identity), the loop filter bounding-values table and
@@ -122,12 +126,14 @@ across 6 files (60 tests total):
   YUVA frame with non-zero alpha pixels. No real vp6a FLV fixture is
   shipped in the tree; if you have one, set `OXIDEAV_FLV_SAMPLE`.
 - `tests/ffmpeg_interop.rs` — external-ffmpeg interop guards. Skipped
-  silently when `ffmpeg` isn't on `PATH`. Asserts our keyframe is
-  decoded by ffmpeg and tracks the (currently-failing) inter-frame
-  acceptance state (decode count == 1 keyframe + 1 rejected inter).
-  `r21_inter_frame_ffmpeg_decode_state` pins the same contract for
-  the motion-search inter path so it flips red as soon as ffmpeg
-  starts accepting our inter packet.
+  silently when `ffmpeg` isn't on `PATH`. As of r23 every guard
+  asserts ffmpeg accepts both packets in a 2-tag (key + inter) stream
+  (`n == 2`), covering the keyframe path
+  (`ffmpeg_accepts_keyframe`), the skip-frame inter path
+  (`ffmpeg_decodes_keyframe_in_two_tag_stream`), the motion-search
+  inter path (`r21_inter_frame_ffmpeg_decode_state`), and the
+  spec-legal `Vp3VersionNo` byte
+  (`keyframe_vp3_version_no_is_spec_legal`).
 - `tests/dump_inter.rs` — opt-in `VP6_DUMP_INTER=1` diagnostic that
   writes a 2-tag FLV to `/tmp/oxideav_vp6_dump.flv` for ffmpeg-side
   manual inspection, plus a `inter_buff2_offset_is_spec_compliant`
