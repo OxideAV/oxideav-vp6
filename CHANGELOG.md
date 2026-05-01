@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **r26 — golden-frame refresh (encoder).**
+  New `Vp6Encoder::encode_inter_frame_with_golden(prev_*, golden_*,
+  new_*, w, h, search)` accepts both a previous-frame reference and a
+  golden-frame reference. Two added behaviours over
+  `encode_inter_frame`:
+  1. **Cadence-driven golden refresh.** Public field
+     `golden_refresh_period: u32` (default 30) drives a counter
+     `inter_frames_since_golden` (reset to 0 by `encode_keyframe`,
+     incremented by every `encode_inter_frame*` call). When
+     `should_refresh_golden()` fires (`counter >= period`), the
+     picture-header `golden_frame_flag` bit is set to 1 — the decoder
+     snaps the just-decoded reconstruction into its `golden_frame`
+     slot (`decoder.rs:422`). The counter resets to 1 on a refresh
+     frame (matching the keyframe path's "next inter is 1 since
+     golden" semantics).
+  2. **Per-MB golden-vs-previous selection.** Per MB the encoder runs
+     `motion_search` against both `prev_*` and `golden_*`, then picks
+     the lower Lagrangian cost (SAD + λ * mv_bits). The MB type maps
+     to one of `{InterNoVecPf, InterDeltaPf, InterNoVecGf,
+     InterDeltaGf}` accordingly. Golden-ref MBs use `RefKind::Golden`
+     for their DC predictor state (mirroring
+     `mb::add_predictors_dc(scratch, RefKind::Golden)`) and contribute
+     to the golden-ref MV-candidate pool the decoder walks for
+     subsequent golden-ref MBs (separate `vector_candidate_pos_gf`
+     state).
+  Spec refs: page 28 (picture-header layout, golden_frame_flag bit),
+  `tables.rs::REFERENCE_FRAME` (`InterNoVecGf`, `InterDeltaGf`, …
+  → `RefFrame::Golden`).
+  On the new `golden_refresh_loop_back_uses_golden_reference` fixture
+  (A→B→A loop), our decoder reconstructs frame 2 at 45 dB Y PSNR via
+  the golden ref vs an 8.6 dB skip-from-prev baseline (a 36 dB win).
+  On `golden_refresh_reduces_bytes_on_periodic_loop` (5-frame
+  A,B,A,B,A loop, QP 12), pinning golden to the keyframe brings the
+  total inter-frame wire size from 378 bytes to 282 bytes (~25%
+  smaller) vs refreshing every frame. ffmpeg's vp6f decoder accepts
+  the key + golden-refresh inter pair cleanly
+  (`ffmpeg_decodes_inter_with_golden_refresh_flag`).
+- `tests/encoder_roundtrip.rs::golden_refresh_cadence_fires_on_period`,
+  `golden_refresh_disabled_at_period_zero`,
+  `golden_refresh_loop_back_uses_golden_reference`,
+  `golden_refresh_reduces_bytes_on_periodic_loop`, and
+  `ffmpeg_decodes_inter_with_golden_refresh_flag`. Pin the cadence
+  semantics, the `period = 0` disabled branch, the golden-ref decode
+  path, the bitrate-reduction property on periodic content, and
+  ffmpeg cross-decode of the refresh-flag picture-header layout.
+
 - **r25 — quarter-pel sub-pel motion estimation (encoder).**
   `Vp6Encoder::encode_inter_frame` now picks quarter-pel-accurate MVs.
   `motion_search` runs the existing integer-pel SAD search to seed

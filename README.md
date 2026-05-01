@@ -57,7 +57,21 @@ exactly. On translating-stripe / translating-disk fixtures with a
 0.5-pel shift, internal-decoder Y PSNR climbs from ~19-29 dB
 (integer-pel MC alone) to 35-37 dB (qpel MC + DCT residual). ffmpeg
 cross-decodes the qpel-MV inter packet cleanly (Y PSNR ~32 dB on the
-stripes fixture).
+stripes fixture). **r26 wires golden-frame refresh + per-MB
+golden-vs-previous selection** via the new
+`Vp6Encoder::encode_inter_frame_with_golden(prev_*, golden_*, new_*,
+…)` method. Cadence-driven by `golden_refresh_period` (default 30):
+when fired, the picture-header `golden_frame_flag` bit is set so the
+decoder snaps the just-decoded frame into its `golden_frame` slot.
+Per MB the encoder runs `motion_search` against both refs and picks
+the lower Lagrangian cost (SAD + λ * mv_bits), emitting one of
+{`InterNoVecPf`, `InterDeltaPf`, `InterNoVecGf`, `InterDeltaGf`}
+accordingly. On a 5-frame A,B,A,B,A periodic loop (32x32, QP 12)
+pinning golden to the keyframe brings the inter-frame total wire size
+from 378 bytes to 282 bytes (~25% smaller) vs refreshing every frame
+— the loop-back A frames pick golden for every MB and emit
+near-zero residual. ffmpeg cross-decodes the key + golden-refresh
+inter pair cleanly.
 
 ### Implemented
 
@@ -114,6 +128,19 @@ stripes fixture).
 - **Reference-frame management**: tracks `prev_frame` and
   `golden_frame` planes inside the decoder. Keyframes overwrite both;
   inter frames refresh golden when the golden-frame flag is set.
+- **Encoder golden-frame refresh** (r26+):
+  `Vp6Encoder::encode_inter_frame_with_golden(prev_*, golden_*,
+  new_*, …)` accepts both refs and per-MB picks whichever beats the
+  other on a Lagrangian SAD cost. Cadence-driven by the public
+  `golden_refresh_period: u32` (default 30); when fired the
+  picture-header `golden_frame_flag` bit is set so the decoder snaps
+  the just-decoded frame into its `golden_frame` slot. MB types are
+  one of `{InterNoVecPf, InterDeltaPf, InterNoVecGf, InterDeltaGf}`
+  with separate prev / golden MV-candidate state, and the per-block
+  DC predictor mirror tracks `RefKind::Golden` alongside
+  `RefKind::Previous`. ffmpeg cross-decodes the refresh-flag inter
+  packet cleanly. Reduces wire size on periodic-structure content
+  (animation loop, slideshow) — see CHANGELOG / fixture results.
 
 ### Not yet implemented (deferrals)
 
@@ -126,8 +153,8 @@ stripes fixture).
 
 ### Test coverage
 
-The crate ships 41 library unit tests plus 22 integration tests
-across 6 files (63 tests total):
+The crate ships 41 library unit tests plus 36 integration tests
+across 7 files (77 tests total):
 
 - **Unit tests** for the range coder round-trip, the IDCT (DC-only flat
   block, add-zero identity), the loop filter bounding-values table and
@@ -177,6 +204,20 @@ across 6 files (63 tests total):
   unmistakable. `r25_ffmpeg_decodes_qpel_inter_frame` cross-decodes
   the stripes packet through ffmpeg's vp6f decoder and asserts ≥ 20
   dB Y PSNR, confirming the qpel MV bits parse cleanly.
+- `tests/encoder_roundtrip.rs::golden_refresh_*` (new in r26) — five
+  guards on the new `encode_inter_frame_with_golden` API:
+  `golden_refresh_cadence_fires_on_period` pins the counter
+  semantics; `golden_refresh_disabled_at_period_zero` covers the
+  `period = 0` disabled branch; `golden_refresh_loop_back_uses_
+  golden_reference` walks an A→B→A loop and asserts our decoder
+  reconstructs frame 2 at ≥ 25 dB Y PSNR (45 dB observed) vs an 8.6
+  dB skip-from-prev baseline; `golden_refresh_reduces_bytes_on_
+  periodic_loop` encodes a 5-frame A,B,A,B,A loop twice (chasing-
+  golden vs pinned-golden) and pins the pinned-golden total wire
+  size to ≤ 110% of chasing-golden (282 vs 378 bytes observed);
+  `ffmpeg_decodes_inter_with_golden_refresh_flag` cross-decodes a
+  key + golden-refresh inter pair through ffmpeg's vp6f decoder
+  (must accept both packets).
 
 ## Quick use
 

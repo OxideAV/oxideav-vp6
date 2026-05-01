@@ -236,6 +236,21 @@ pub struct Vp6Encoder {
     pub qp: u8,
     /// Use the `sub_version = 0` "simple profile" layout.
     pub sub_version: u8,
+    /// Period (in inter frames since the last golden refresh) at which
+    /// [`Vp6Encoder::encode_inter_frame_with_golden`] flips the
+    /// `golden_frame_flag` bit on the inter picture header. The decoder
+    /// then snaps the just-decoded reconstruction into its
+    /// `golden_frame` slot, so subsequent inter MBs that pick a golden
+    /// reference (`InterNoVecGf` / `InterDeltaGf` etc.) reference the
+    /// refreshed plane rather than the keyframe-time golden.
+    ///
+    /// `0` disables golden-refresh entirely (the encoder never sets the
+    /// flag and never emits golden-ref MBs). `30` is the default —
+    /// roughly one refresh per second at 30 fps, picked to give
+    /// slideshow / animation-loop content a "good" golden cadence
+    /// without paying the keyframe cost (a golden-refresh frame is
+    /// still a P-frame with bool-coded residual).
+    pub golden_refresh_period: u32,
     /// Dimensions (in MBs) from the last encoded keyframe. Needed so
     /// [`Vp6Encoder::encode_skip_frame`] can produce a well-formed
     /// inter-frame header without requiring callers to re-supply them.
@@ -245,6 +260,13 @@ pub struct Vp6Encoder {
     /// `encode_skip_frame` so callers can't emit an inter before a
     /// keyframe is established.
     have_keyframe: bool,
+    /// Inter frames emitted since the last golden refresh (or since
+    /// the keyframe — keyframes implicitly refresh the decoder's
+    /// golden slot per `decoder.rs` line 422). Incremented on every
+    /// `encode_inter_frame*` call; reset to 0 when
+    /// [`Self::should_refresh_golden`] returns true and the encoder
+    /// emits the `golden_frame_flag` bit.
+    inter_frames_since_golden: u32,
 }
 
 impl Default for Vp6Encoder {
@@ -264,9 +286,11 @@ impl Default for Vp6Encoder {
             // version. (See r23 audit notes in this module's head
             // comment.)
             sub_version: 6,
+            golden_refresh_period: 30,
             mb_width: 0,
             mb_height: 0,
             have_keyframe: false,
+            inter_frames_since_golden: 0,
         }
     }
 }
@@ -279,9 +303,11 @@ impl Vp6Encoder {
         Self {
             qp: qp.min(63),
             sub_version: 6,
+            golden_refresh_period: 30,
             mb_width: 0,
             mb_height: 0,
             have_keyframe: false,
+            inter_frames_since_golden: 0,
         }
     }
 
@@ -515,6 +541,11 @@ impl Vp6Encoder {
         self.mb_width = mb_width as u16;
         self.mb_height = mb_height as u16;
         self.have_keyframe = true;
+        // The decoder snaps the keyframe reconstruction into its
+        // `golden_frame` slot (see decoder.rs:422), so the cadence
+        // counter resets here too — the next inter frame is "0 inters
+        // since golden refresh" by definition.
+        self.inter_frames_since_golden = 0;
         Ok(out)
     }
 
@@ -731,6 +762,11 @@ impl Vp6Encoder {
         out[buff2_hi_idx] = ((buff2 >> 8) & 0xFF) as u8;
         out[buff2_lo_idx] = (buff2 & 0xFF) as u8;
         out.extend_from_slice(&p2);
+        // Skip frames carry no golden_frame_flag (the bit was emitted
+        // as 0 above). Bump the cadence counter so a downstream
+        // `encode_inter_frame_with_golden` call still measures the
+        // refresh interval correctly.
+        self.inter_frames_since_golden = self.inter_frames_since_golden.saturating_add(1);
         Ok(out)
     }
 
@@ -1188,12 +1224,506 @@ impl Vp6Encoder {
         out[buff2_hi_idx] = ((buff2 >> 8) & 0xFF) as u8;
         out[buff2_lo_idx] = (buff2 & 0xFF) as u8;
         out.extend_from_slice(&p2);
+        // Plain inter frames don't refresh golden — the
+        // `golden_frame_flag` bit in the picture header is emitted as 0
+        // above. Bump the cadence counter so a downstream
+        // `encode_inter_frame_with_golden` call still measures the
+        // refresh interval correctly.
+        self.inter_frames_since_golden = self.inter_frames_since_golden.saturating_add(1);
+        Ok(out)
+    }
+
+    /// Returns true when the next inter frame should set the
+    /// `golden_frame_flag` bit on the picture header (spec §10 / page
+    /// 28: inter-frame bool 1 immediately after the partition header).
+    /// The flag tells the decoder to overwrite its `golden_frame` slot
+    /// with the just-decoded reconstruction, so subsequent inter MBs
+    /// that pick a golden reference (`InterNoVecGf` / `InterDeltaGf`
+    /// /…) reference this updated plane rather than the keyframe-time
+    /// golden.
+    ///
+    /// Trigger: `golden_refresh_period > 0 &&
+    /// inter_frames_since_golden >= golden_refresh_period`.
+    pub fn should_refresh_golden(&self) -> bool {
+        self.golden_refresh_period > 0
+            && self.inter_frames_since_golden >= self.golden_refresh_period
+    }
+
+    /// Inter-frame encoder with explicit `golden_*` reference planes.
+    ///
+    /// Mirror of [`Self::encode_inter_frame`] with two added behaviours:
+    ///
+    /// 1. **Golden-frame refresh.** When [`Self::should_refresh_golden`]
+    ///    fires (cadence-driven by `golden_refresh_period`), the
+    ///    picture-header `golden_frame_flag` bit is set to 1. The
+    ///    decoder snaps the just-decoded frame into its `golden_frame`
+    ///    slot — see `decoder.rs:422` — so the next call's
+    ///    `golden_*` planes should reflect that updated reference. The
+    ///    cadence counter resets at the same time.
+    /// 2. **Per-MB golden-vs-previous selection.** For every MB the
+    ///    encoder runs a `motion_search` against both `prev_*` and
+    ///    `golden_*`, then picks the lower Lagrangian cost (SAD + λ *
+    ///    mv_bits). The MB type is then one of {`InterNoVecPf`,
+    ///    `InterDeltaPf`, `InterNoVecGf`, `InterDeltaGf`} accordingly.
+    ///    Golden-ref MBs use `RefKind::Golden` for their DC predictor
+    ///    state and contribute to the golden-ref MV-candidate pool the
+    ///    decoder walks for subsequent golden-ref MBs.
+    ///
+    /// Picking the same `prev_*` for both arguments and a refresh
+    /// period of 0 makes this method behave equivalently to
+    /// [`Self::encode_inter_frame`] (zero MBs will pick golden because
+    /// the SADs tie and the prev branch wins on the strict-less
+    /// comparison; the flag stays 0).
+    ///
+    /// Spec refs:
+    /// * Page 28 — picture-header layout, `golden_frame_flag` bit.
+    /// * `REFERENCE_FRAME` table in `tables.rs`: `InterNoVecGf`,
+    ///   `InterDeltaGf`, `InterV1Gf`, `InterV2Gf` all map to
+    ///   `RefFrame::Golden`. Only `InterNoVecGf` + `InterDeltaGf` are
+    ///   emitted by this encoder (single-MV-per-MB scope, same as
+    ///   [`Self::encode_inter_frame`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_inter_frame_with_golden(
+        &mut self,
+        prev_y: &[u8],
+        prev_u: &[u8],
+        prev_v: &[u8],
+        golden_y: &[u8],
+        golden_u: &[u8],
+        golden_v: &[u8],
+        new_y: &[u8],
+        new_u: &[u8],
+        new_v: &[u8],
+        width: usize,
+        height: usize,
+        search: i32,
+    ) -> Result<EncodedFrame> {
+        if !self.have_keyframe {
+            return Err(Error::invalid(
+                "VP6 encode: inter frame requires a preceding keyframe",
+            ));
+        }
+        let mb_width = self.mb_width as usize;
+        let mb_height = self.mb_height as usize;
+        if width != mb_width * 16 || height != mb_height * 16 {
+            return Err(Error::invalid(
+                "VP6 encode: inter-frame dims must match the preceding keyframe",
+            ));
+        }
+        let uv_stride = width / 2;
+        let uv_h = height / 2;
+        let need_y = width * height;
+        let need_uv = uv_stride * uv_h;
+        if prev_y.len() < need_y
+            || new_y.len() < need_y
+            || golden_y.len() < need_y
+            || prev_u.len() < need_uv
+            || prev_v.len() < need_uv
+            || golden_u.len() < need_uv
+            || golden_v.len() < need_uv
+            || new_u.len() < need_uv
+            || new_v.len() < need_uv
+        {
+            return Err(Error::invalid("VP6 encode: plane buffers too small"));
+        }
+
+        // Decide whether to flip the golden_frame_flag this frame.
+        let refresh_golden = self.should_refresh_golden();
+
+        // --- Fixed inter header (MultiStream=1, two partitions) ---------
+        let mut out = Vec::<u8>::with_capacity(16 + mb_width * mb_height * 8);
+        out.push(0x80 | ((self.qp << 1) & 0x7E) | 0x01);
+        out.push(0);
+        out.push(0);
+        let buff2_hi_idx = out.len() - 2;
+        let buff2_lo_idx = out.len() - 1;
+
+        let mut enc = RangeEncoder::new();
+        // golden_frame_flag — set when the cadence triggers. The
+        // decoder reads `rac.get_bit()` at decoder.rs:218; when the bit
+        // is 1, decoder.rs:422 overwrites the `golden_frame` slot with
+        // the just-decoded reconstruction.
+        enc.put_bit(if refresh_golden { 1 } else { 0 });
+        // use_huffman = 0.
+        enc.put_bit(0);
+
+        // --- All probability-model "update" pass blocks (no updates) ----
+        // Same shape as `encode_inter_frame`.
+        for _ctx in 0..3 {
+            enc.put_prob(174, 0);
+            enc.put_prob(254, 0);
+        }
+        for comp in 0..2 {
+            enc.put_prob(tables::VP6_SIG_DCT_PCT[comp][0], 0);
+            enc.put_prob(tables::VP6_SIG_DCT_PCT[comp][1], 0);
+        }
+        for comp in 0..2 {
+            for node in 0..7 {
+                enc.put_prob(tables::VP6_PDV_PCT[comp][node], 0);
+            }
+        }
+        for comp in 0..2 {
+            for node in 0..8 {
+                enc.put_prob(tables::VP6_FDV_PCT[comp][node], 0);
+            }
+        }
+        for pt in 0..2 {
+            for node in 0..11 {
+                enc.put_prob(tables::VP6_DCCV_PCT[pt][node], 0);
+            }
+        }
+        enc.put_bit(0);
+        for cg in 0..2 {
+            for node in 0..14 {
+                enc.put_prob(tables::VP6_RUNV_PCT[cg][node], 0);
+            }
+        }
+        for ct in 0..3 {
+            for pt in 0..2 {
+                for cg in 0..6 {
+                    for node in 0..11 {
+                        enc.put_prob(tables::VP6_RACT_PCT[ct][pt][cg][node], 0);
+                    }
+                }
+            }
+        }
+
+        // --- Build model + per-MB cache exactly as the decoder does. ----
+        let mut model = Vp6Model::default();
+        model.reset_defaults(false, self.sub_version);
+        for pt in 0..2 {
+            for node in 0..11 {
+                model.coeff_dccv[pt][node] = 0x80;
+            }
+        }
+        for ct in 0..3 {
+            for pt in 0..2 {
+                for cg in 0..6 {
+                    for node in 0..11 {
+                        model.coeff_ract[pt][ct][cg][node] = 0x80;
+                    }
+                }
+            }
+        }
+        for pt in 0..2 {
+            for ctx in 0..3 {
+                for node in 0..5 {
+                    let v = ((model.coeff_dccv[pt][node] as i32
+                        * tables::VP6_DCCV_LC[ctx][node][0]
+                        + 128)
+                        >> 8)
+                        + tables::VP6_DCCV_LC[ctx][node][1];
+                    model.coeff_dcct[pt][ctx][node] = v.clamp(1, 255) as u8;
+                }
+            }
+        }
+        model.rebuild_mb_type_probs();
+
+        let mut mb_info: Vec<EncMbInfo> = vec![EncMbInfo::default(); mb_width * mb_height];
+
+        let mut vector_candidate_pos_pf: i32 = 0;
+        let mut vector_candidate_pos_gf: i32 = 0;
+        let mut prev_type = tables::Vp56Mb::InterNoVecPf;
+
+        let mut enc_left_block: [EncRefDc; 4] = [EncRefDc::default(); 4];
+        let mut enc_above_blocks: Vec<EncRefDc> = vec![EncRefDc::default(); 4 * mb_width + 6];
+        if 2 * mb_width + 2 < enc_above_blocks.len() {
+            enc_above_blocks[2 * mb_width + 2].ref_frame = RefKind::Current;
+        }
+        if 3 * mb_width + 4 < enc_above_blocks.len() {
+            enc_above_blocks[3 * mb_width + 4].ref_frame = RefKind::Current;
+        }
+        let mut enc_prev_dc = [[0i16; 3]; 3];
+        enc_prev_dc[1][0] = 128;
+        enc_prev_dc[2][0] = 128;
+
+        let dequant_dc = (tables::VP56_DC_DEQUANT[self.qp as usize & 0x3F] as i32) << 2;
+        let dequant_ac = (tables::VP56_AC_DEQUANT[self.qp as usize & 0x3F] as i32) << 2;
+
+        // Partition 2: per-MB DCT coefficients only.
+        let mut enc2 = RangeEncoder::new();
+
+        for mb_row in 0..mb_height {
+            for b in &mut enc_left_block {
+                *b = EncRefDc::default();
+            }
+            let mut above_block_idx: [usize; 6] = [0; 6];
+            above_block_idx[0] = 1;
+            above_block_idx[1] = 2;
+            above_block_idx[2] = 1;
+            above_block_idx[3] = 2;
+            above_block_idx[4] = 2 * mb_width + 2 + 1;
+            above_block_idx[5] = 3 * mb_width + 4 + 1;
+
+            for mb_col in 0..mb_width {
+                // -- 1. Motion-search this MB against BOTH refs.
+                let (q_dx_pf, q_dy_pf) = motion_search(
+                    new_y, prev_y, width, height, mb_row, mb_col, search, self.qp,
+                );
+                let (q_dx_gf, q_dy_gf) = motion_search(
+                    new_y, golden_y, width, height, mb_row, mb_col, search, self.qp,
+                );
+
+                // -- 2. Lagrangian cost for each ref (final SAD at the
+                // chosen qpel offset + MV bits scaled by λ). The
+                // motion_search return already minimises this internally
+                // per ref; here we re-evaluate the final SAD so we can
+                // compare across refs apples-to-apples.
+                let mb_x = (mb_col * 16) as i32;
+                let mb_y = (mb_row * 16) as i32;
+                let lambda = self.qp as u64;
+                let pf_sad =
+                    sad16x16_qpel(new_y, prev_y, width, height, mb_x, mb_y, q_dx_pf, q_dy_pf);
+                let pf_bits = mv_bit_cost_estimate(q_dx_pf, q_dy_pf);
+                let pf_cost = pf_sad.saturating_add(lambda.saturating_mul(pf_bits));
+                let gf_sad =
+                    sad16x16_qpel(new_y, golden_y, width, height, mb_x, mb_y, q_dx_gf, q_dy_gf);
+                let gf_bits = mv_bit_cost_estimate(q_dx_gf, q_dy_gf);
+                let gf_cost = gf_sad.saturating_add(lambda.saturating_mul(gf_bits));
+
+                // Pick golden when it strictly beats prev — ties go to
+                // prev so we never pay the MB-type-tree extra bits for a
+                // noise-level "improvement". The PMBT tree puts
+                // `InterNoVecPf` at depth 1 and `InterNoVecGf` at depth
+                // ~3, so prev is intrinsically cheaper to encode.
+                let use_golden = gf_cost < pf_cost;
+                let (q_dx, q_dy) = if use_golden {
+                    (q_dx_gf, q_dy_gf)
+                } else {
+                    (q_dx_pf, q_dy_pf)
+                };
+                let ref_kind = if use_golden {
+                    RefKind::Golden
+                } else {
+                    RefKind::Previous
+                };
+
+                // -- 3. MV-candidate predictor for the chosen ref.
+                let want_ref_frame = if use_golden {
+                    tables::RefFrame::Golden
+                } else {
+                    tables::RefFrame::Previous
+                };
+                let initial_pos = if use_golden {
+                    vector_candidate_pos_gf
+                } else {
+                    vector_candidate_pos_pf
+                };
+                let (ctx_val, candidate0, candidate1, new_pos) = enc_vector_predictors(
+                    &mb_info,
+                    mb_width,
+                    mb_height,
+                    mb_row,
+                    mb_col,
+                    want_ref_frame,
+                    initial_pos,
+                );
+                if use_golden {
+                    vector_candidate_pos_gf = new_pos;
+                } else {
+                    vector_candidate_pos_pf = new_pos;
+                }
+                let ctx = ctx_val.clamp(0, 2) as usize;
+
+                // -- 4. Choose mb_type by ref kind + zero/non-zero MV.
+                let want_mv = Mv {
+                    x: q_dx as i16,
+                    y: q_dy as i16,
+                };
+                let new_type = match (use_golden, want_mv.x == 0 && want_mv.y == 0) {
+                    (false, true) => tables::Vp56Mb::InterNoVecPf,
+                    (false, false) => tables::Vp56Mb::InterDeltaPf,
+                    (true, true) => tables::Vp56Mb::InterNoVecGf,
+                    (true, false) => tables::Vp56Mb::InterDeltaGf,
+                };
+
+                // -- 5. Emit MB-type into partition 1 via PMBT tree walk.
+                let stay_prob = model.mb_type[ctx][prev_type as usize][0];
+                if new_type == prev_type {
+                    enc.put_prob(stay_prob, 1);
+                } else {
+                    enc.put_prob(stay_prob, 0);
+                    encode_pmbt_tree(&mut enc, &model.mb_type[ctx][prev_type as usize], new_type);
+                }
+
+                // -- 6. Emit MV delta into partition 1 if this MB has one.
+                let stored_mv = if matches!(
+                    new_type,
+                    tables::Vp56Mb::InterDeltaPf | tables::Vp56Mb::InterDeltaGf
+                ) {
+                    let candidate_pos = if use_golden {
+                        vector_candidate_pos_gf
+                    } else {
+                        vector_candidate_pos_pf
+                    };
+                    let base = if candidate_pos < 2 {
+                        candidate0
+                    } else {
+                        Mv::default()
+                    };
+                    let delta_x = want_mv.x as i32 - base.x as i32;
+                    let delta_y = want_mv.y as i32 - base.y as i32;
+                    encode_mv_component(&mut enc, &model, 0, delta_x);
+                    encode_mv_component(&mut enc, &model, 1, delta_y);
+                    want_mv
+                } else {
+                    Mv::default()
+                };
+                let _ = candidate1;
+
+                // -- 7. Update per-MB cache.
+                mb_info[mb_row * mb_width + mb_col] = EncMbInfo {
+                    mb_type: new_type,
+                    mv: stored_mv,
+                };
+                prev_type = new_type;
+
+                // -- 8. Residual encoding into partition 2.
+                let ref_dc_idx = match ref_kind {
+                    RefKind::Previous => 1usize,
+                    RefKind::Golden => 2usize,
+                    _ => 1usize,
+                };
+                for b in 0..6usize {
+                    let pt = if b > 3 { 1 } else { 0 };
+                    let plane_idx = tables::B2P[b] as usize;
+                    let coeff_ctx = enc_left_block[tables::B6_TO_4[b] as usize].not_null_dc
+                        as usize
+                        + enc_above_blocks[above_block_idx[b]].not_null_dc as usize;
+
+                    let mut orig_tile = [0i32; 64];
+                    sample_block_tile(
+                        b,
+                        mb_row,
+                        mb_col,
+                        new_y,
+                        new_u,
+                        new_v,
+                        width,
+                        uv_stride,
+                        &mut orig_tile,
+                    );
+
+                    // Sample from prev or golden depending on ref.
+                    let (rp_y, rp_u, rp_v): (&[u8], &[u8], &[u8]) = if use_golden {
+                        (golden_y, golden_u, golden_v)
+                    } else {
+                        (prev_y, prev_u, prev_v)
+                    };
+                    let mut mc_tile = [0i32; 64];
+                    sample_mc_tile(
+                        b,
+                        mb_row,
+                        mb_col,
+                        rp_y,
+                        rp_u,
+                        rp_v,
+                        width,
+                        uv_stride,
+                        height,
+                        uv_h,
+                        stored_mv,
+                        &mut mc_tile,
+                    );
+
+                    let mut residual = [0i32; 64];
+                    for i in 0..64 {
+                        residual[i] = orig_tile[i] - mc_tile[i];
+                    }
+
+                    let mut coefs = [0i32; 64];
+                    forward_dct8x8_residual(&residual, &mut coefs);
+
+                    let new_dc = div_nearest(coefs[0], dequant_dc).clamp(-32768, 32767) as i16;
+
+                    // DC predictor — neighbour contributes only when it
+                    // matches the current MB's ref kind.
+                    let lb = enc_left_block[tables::B6_TO_4[b] as usize];
+                    let ab = enc_above_blocks[above_block_idx[b]];
+                    let mut count = 0i32;
+                    let mut pdc = 0i32;
+                    if lb.ref_frame == ref_kind {
+                        pdc += lb.dc_coeff as i32;
+                        count += 1;
+                    }
+                    if ab.ref_frame == ref_kind {
+                        pdc += ab.dc_coeff as i32;
+                        count += 1;
+                    }
+                    let predictor: i32 = match count {
+                        0 => enc_prev_dc[plane_idx][ref_dc_idx] as i32,
+                        2 => pdc / 2,
+                        _ => pdc,
+                    };
+                    let coded_dc = (new_dc as i32 - predictor).clamp(-32768, 32767) as i16;
+
+                    let mut ac_levels = [0i32; 64];
+                    for coeff_idx in 1..64usize {
+                        let pos = model.coeff_index_to_pos[coeff_idx] as usize;
+                        let perm = tables::IDCT_SCANTABLE[pos] as usize;
+                        ac_levels[coeff_idx] =
+                            div_nearest(coefs[perm], dequant_ac).clamp(-2047, 2047);
+                    }
+                    let last_nz = find_last_nonzero(&ac_levels);
+
+                    emit_block_coefs(
+                        &mut enc2, &model, pt, coeff_ctx, coded_dc, &ac_levels, last_nz,
+                    );
+
+                    let new_dc_final = (coded_dc as i32 + predictor) as i16;
+                    let has_nonzero_dc = coded_dc != 0;
+                    let lb_idx = tables::B6_TO_4[b] as usize;
+                    enc_left_block[lb_idx] = EncRefDc {
+                        not_null_dc: has_nonzero_dc,
+                        ref_frame: ref_kind,
+                        dc_coeff: new_dc_final,
+                    };
+                    enc_above_blocks[above_block_idx[b]] = EncRefDc {
+                        not_null_dc: has_nonzero_dc,
+                        ref_frame: ref_kind,
+                        dc_coeff: new_dc_final,
+                    };
+                    enc_prev_dc[plane_idx][ref_dc_idx] = new_dc_final;
+                }
+
+                for y in 0..4 {
+                    above_block_idx[y] += 2;
+                }
+                for uv in 4..6 {
+                    above_block_idx[uv] += 1;
+                }
+            }
+        }
+
+        let p1 = enc.finish();
+        let p2 = enc2.finish();
+        out.extend_from_slice(&p1);
+        let buff2 = ((3 + p1.len()) as u32).min(0xFFFF);
+        out[buff2_hi_idx] = ((buff2 >> 8) & 0xFF) as u8;
+        out[buff2_lo_idx] = (buff2 & 0xFF) as u8;
+        out.extend_from_slice(&p2);
+
+        // Cadence bookkeeping. A refresh frame counts as the "0th" inter
+        // since the new golden, so the next frame is "1 since golden" —
+        // mirror the keyframe path's behaviour.
+        if refresh_golden {
+            self.inter_frames_since_golden = 1;
+        } else {
+            self.inter_frames_since_golden = self.inter_frames_since_golden.saturating_add(1);
+        }
         Ok(out)
     }
 
     /// Current encoder dims in macroblocks — exposed for tests + diagnostics.
     pub fn dims_mb(&self) -> (u16, u16) {
         (self.mb_width, self.mb_height)
+    }
+
+    /// Inter-frames-since-last-golden-refresh counter — exposed for
+    /// tests + diagnostics. Reset to 0 by `encode_keyframe` and to 1 by
+    /// the refresh path of `encode_inter_frame_with_golden`.
+    pub fn inter_frames_since_golden(&self) -> u32 {
+        self.inter_frames_since_golden
     }
 }
 
