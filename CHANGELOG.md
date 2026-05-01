@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `vector_predictors` (decoder) and `enc_vector_predictors` (encoder)
+  now return the spec page 28 Table 5 mapping
+  `(0 cands -> ctx 2, 1 cand -> ctx 1, 2+ cands -> ctx 0)`, i.e.
+  `ctx = 2 - nb_pred`, instead of the legacy `nb_pred + 1` form.
+  The skip-frame encoder's hard-coded `ctx = 1` was changed to
+  `ctx = 2` to match (all neighbours OOB / zero-MV → spec ctx 2,
+  "Neither Nearest nor Near MVs exists for this macroblock"). The
+  pre-r22 codec was internally consistent but `mb_type[ctx][...]`
+  picked the wrong row for a spec-following decoder. (r22 audit.)
+- Audit of the per-MB block coefficient state machine confirmed the
+  3-bit "all zero" shortcut path matches the decoder's `parse_coeff`
+  exit conditions: at `coeff_idx = 0` the decoder reads `m2_0` only
+  (DC has no EOB token by spec); at `coeff_idx = 1` with `ct = 0`
+  the shortcut `coeff_idx > 1 && ct == 0` is false (1 is not
+  strictly greater than 1), so the decoder reads `m2_0` then `m2_1`
+  (EOB) — exactly the encoder's three emissions. `VP6_COEFF_GROUPS[1]
+  = 0` so `cg = 0` for the AC pair, matching the encoder's index
+  choices. No code change needed; the path is spec-correct as-is.
 - `DEF_MB_TYPES_STATS` pair order now matches VP6 spec page 30
   `VP6_BaselineXmittedProbs[3][20]` — pairs flatten as
   `(probSame_t, probDiff_t)` per spec page 29 Table 6, not the
@@ -29,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `decoder::tests::vector_predictors_ctx_mapping_matches_spec`: pins
+  the spec page 28 Table 5 mapping for `vector_predictors`. A
+  regression to `nb_pred + 1` (the pre-r22 form) trips the test
+  because a top-left MB with all-OOB neighbours would yield ctx=1
+  instead of the spec-required ctx=2.
 - `tables::tests::def_mb_types_stats_matches_spec_baseline`: pins the
   `DEF_MB_TYPES_STATS` rows against VP6 spec page 30
   `VP6_BaselineXmittedProbs` so accidental pair-order reverts surface

@@ -58,22 +58,31 @@
 //!   FFmpeg-encoded sample issues SetNewBaselineProbs updates that
 //!   overwrite the baseline before any per-MB decode reads it, so the
 //!   layout disagreement at the baseline never surfaces in that test.
-//! * Suspect list narrowed for r21:
-//!   - The per-MB block coefficient state machine — specifically the
-//!     3-bit "all zero" shortcut path in `encode_skip_frame` may not
-//!     match the decoder's `parse_coeff` exit conditions when
-//!     `coeff_idx` rolls past the first AC bin. (This was the "next
-//!     suspect" line carried over from r19.)
-//!   - `vector_predictors` (decoder.rs) returns `nb_pred + 1` which
-//!     maps `(0 cands -> ctx 1, 1 cand -> ctx 2, 2 cands -> ctx 0)`.
-//!     Per spec page 28 Table 5 the canonical mapping is `(0 -> ctx
-//!     2, 1 -> ctx 1, 2 -> ctx 0)`. The encoder side hard-codes
-//!     `ctx = 1` for the skip frame to match the (currently wrong)
-//!     decoder return value, so the codec is internally consistent
-//!     but disagrees with ffmpeg. Fix is `ctx = 2 - nb_pred` on both
-//!     sides — but doing it alone in r20 didn't change ffmpeg's
-//!     verdict (still 1 frame), so r21 should pursue a combined fix
-//!     with the coefficient-shortcut audit above.
+//! * r22 update — the `vector_predictors` ctx mapping was switched to
+//!   the spec page 28 Table 5 form (`ctx = 2 - nb_pred`) on both
+//!   decoder + encoder sides. The skip-frame encoder's hard-coded
+//!   `ctx = 1` was changed to `ctx = 2` to match the new decoder
+//!   return (`nb_pred = 0` for all neighbours OOB / zero-MV).
+//!
+//!   Audit of the per-MB block coefficient state machine confirmed
+//!   the 3-bit "all zero" shortcut path matches `parse_coeff`'s exit
+//!   conditions: at `coeff_idx = 0` the decoder reads `m2_0` only
+//!   (DC has no EOB token by spec); at `coeff_idx = 1` with `ct = 0`
+//!   the shortcut `coeff_idx > 1 && ct == 0` is **false** (1 is not
+//!   strictly greater than 1), so the decoder reads `m2_0` then
+//!   `m2_1` (EOB) — exactly the encoder's three emissions.
+//!   `VP6_COEFF_GROUPS[1] = 0` so `cg = 0` for the AC pair, matching
+//!   the encoder's index choices.
+//!
+//!   ffmpeg outcome (r22): the inter packet remains rejected. r21
+//!   verified each candidate fix in isolation didn't move the needle;
+//!   r22 landed both together (ctx mapping fix + coeff shortcut audit)
+//!   and ffmpeg still reports "Invalid data found when processing
+//!   input" — so the residual issue lives somewhere else (candidates
+//!   for r23: keyframe `Vp3VersionNo = 0` may be lenient in ffmpeg's
+//!   keyframe path but mis-route the inter parser; the per-MB
+//!   coefficient model state ffmpeg expects after the keyframe may
+//!   diverge from the `0x80` baseline our encoder pins).
 //!
 //! Scope:
 //!
@@ -573,9 +582,10 @@ impl Vp6Encoder {
                 // -- Partition 1: prediction info (MB-type only — every
                 // MB stays on InterNoVecPf so no MV bits). All neighbour
                 // candidate slots are out-of-bounds / zero-MV, so the
-                // decoder's `vector_predictors` returns nb_pred=0 and the
-                // MB-type ctx is 1 throughout.
-                let ctx: usize = 1;
+                // decoder's `vector_predictors` returns nb_pred=0 →
+                // ctx = 2 - nb_pred = 2 (spec page 28 Table 5: "Neither
+                // Nearest nor Near MVs exists for this macroblock").
+                let ctx: usize = 2;
                 let prev_type = tables::Vp56Mb::InterNoVecPf as usize;
                 let prob = model.mb_type[ctx][prev_type][0];
                 enc.put_prob(prob, 1); // stay on InterNoVecPf
@@ -803,7 +813,7 @@ impl Vp6Encoder {
                     motion_search(new_y, prev_y, width, height, mb_row, mb_col, search);
 
                 // -- 2. Predictor + candidate state, mirroring the decoder.
-                let (nb_pred_plus1, candidate0, candidate1, new_pos) = enc_vector_predictors(
+                let (ctx_val, candidate0, candidate1, new_pos) = enc_vector_predictors(
                     &mb_info,
                     mb_width,
                     mb_height,
@@ -813,10 +823,11 @@ impl Vp6Encoder {
                     vector_candidate_pos,
                 );
                 vector_candidate_pos = new_pos;
-                // `enc_vector_predictors` already returns `nb_pred + 1`
-                // (mirrors the decoder's `vector_predictors`), so we use
-                // it directly as the MB-type context (0..=2).
-                let ctx = nb_pred_plus1.clamp(0, 2) as usize;
+                // `enc_vector_predictors` already returns the spec page
+                // 28 Table 5 ctx (`2 - nb_pred`, mirroring the decoder's
+                // `vector_predictors`), so we use it directly as the
+                // MB-type context (0..=2).
+                let ctx = ctx_val.clamp(0, 2) as usize;
 
                 // -- 3. Choose mb_type. Picking InterNoVecPf when the best
                 // MV is zero keeps the bitstream tight (no MV bits) and
@@ -972,8 +983,9 @@ fn sad16x16(cur: &[u8], prev: &[u8], stride: usize, mb_x: i32, mb_y: i32, dx: i3
 }
 
 /// Mirror of the decoder's `vector_predictors`. Returns
-/// `(nb_pred, candidate0, candidate1, new_pos)` where `nb_pred` is the
-/// "+1 nudged" candidate count the decoder feeds into the MB-type ctx.
+/// `(ctx, candidate0, candidate1, new_pos)` where `ctx` is the spec
+/// page 28 Table 5 mapping `(0 cands -> 2, 1 cand -> 1, 2+ cands -> 0)`,
+/// suitable for indexing `model.mb_type[ctx][...]` directly.
 fn enc_vector_predictors(
     mb_info: &[EncMbInfo],
     mb_width: usize,
@@ -1002,12 +1014,15 @@ fn enc_vector_predictors(
         cand[nb as usize] = mb.mv;
         nb += 1;
         if nb > 1 {
-            nb = -1;
+            // Third hit observed: matches spec "Nearest & Near MVs both
+            // exist" (ctx 0). Mirror the decoder's clamping.
+            nb = 2;
             break;
         }
         new_pos = pos as i32;
     }
-    (nb + 1, cand[0], cand[1], new_pos)
+    // Spec page 28 Table 5: 0 cands -> ctx 2, 1 cand -> ctx 1, 2+ -> ctx 0.
+    (2 - nb, cand[0], cand[1], new_pos)
 }
 
 /// Encode a single MB-type leaf via the [`crate::tables::PMBT_TREE`].

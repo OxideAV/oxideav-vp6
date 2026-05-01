@@ -22,10 +22,15 @@ oxideav-vp6 = "0.0"
 
 ## Status
 
-VP6 has no public specification — the authoritative reference is
+The authoritative reference is the On2 VP6 *Bitstream & Decoder
+Specification* (vendored in this workspace at
+`docs/video/vp6/vp6_format.pdf`); historically work also cross-checked
 FFmpeg's reverse-engineered `libavcodec/vp56.c` + `libavcodec/vp6.c`
 (+ `vp3dsp.c` for the IDCT / loop filter + `vp6dsp.c` for the 2D
-bicubic interpolator + `vpx_rac.h` for the bool coder).
+bicubic interpolator + `vpx_rac.h` for the bool coder), but encoder
+audit rounds (r19+) lean on the spec directly. r22 lands the spec
+page 28 Table 5 ctx mapping for `vector_predictors` (`ctx = 2 -
+nb_pred`) on both decoder + encoder sides.
 
 ### Implemented
 
@@ -94,8 +99,8 @@ bicubic interpolator + `vpx_rac.h` for the bool coder).
 
 ### Test coverage
 
-The crate ships 40 library unit tests plus 19 integration tests
-across 6 files (59 tests total):
+The crate ships 41 library unit tests plus 19 integration tests
+across 6 files (60 tests total):
 
 - **Unit tests** for the range coder round-trip, the IDCT (DC-only flat
   block, add-zero identity), the loop filter bounding-values table and

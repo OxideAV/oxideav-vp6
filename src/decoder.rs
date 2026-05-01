@@ -659,8 +659,15 @@ fn decode_4mv(rac: &mut RangeCoder<'_>, model: &Vp6Model, scratch: &mut BlockScr
 
 /// Port of `vp56_get_vectors_predictors`. Populates
 /// `scratch.vector_candidate[0..=1]` from neighbouring-MB MVs that
-/// match `ref_frame`. Returns the count — caller forwards this as the
-/// `ctx` into the MB-type model.
+/// match `ref_frame`. Returns the MB-type ctx (0..=2) per spec page 28
+/// Table 5: `(both Nearest+Near exist => ctx 0, only Nearest => ctx 1,
+/// neither => ctx 2)`.  In terms of `nb_pred` the canonical mapping is
+/// `ctx = 2 - nb_pred`.
+///
+/// `nb_pred` is the count of distinct non-(0,0) candidate MVs found
+/// while walking [`tables::VP56_CANDIDATE_PREDICTOR_POS`]; on the third
+/// hit we early-exit (treated as "both exist") so the value passed to
+/// the subtraction is clamped to `0..=2` already.
 fn vector_predictors(
     scratch: &mut BlockScratch,
     macroblocks: &[MacroblockInfo],
@@ -691,7 +698,10 @@ fn vector_predictors(
         candidates[nb_pred as usize] = mb.mv;
         nb_pred += 1;
         if nb_pred > 1 {
-            nb_pred = -1;
+            // Third hit observed: this matches spec "Nearest & Near MVs
+            // both exist" (ctx = 0). Encode that here as `nb_pred = 2`
+            // so the `2 - nb_pred` mapping below produces ctx 0.
+            nb_pred = 2;
             break;
         }
         scratch.vector_candidate_pos = pos as i32;
@@ -699,7 +709,8 @@ fn vector_predictors(
 
     scratch.vector_candidate[0] = candidates[0];
     scratch.vector_candidate[1] = candidates[1];
-    nb_pred + 1
+    // Spec page 28 Table 5: 0 cands -> ctx 2, 1 cand -> ctx 1, 2+ -> ctx 0.
+    2 - nb_pred
 }
 
 impl Decoder for Vp6Decoder {
@@ -758,6 +769,47 @@ mod tests {
         let pkt = Packet::new(0, TimeBase::new(1, 1000), data);
         let res = dec.send_packet(&pkt);
         assert!(matches!(res, Err(Error::InvalidData(_))), "{res:?}");
+    }
+
+    /// r22: pin `vector_predictors` to spec page 28 Table 5 mapping —
+    /// `(0 cands -> ctx 2, 1 cand -> ctx 1, 2+ cands -> ctx 0)`.
+    /// A regression of `nb_pred + 1` (the pre-r22 value) would surface
+    /// as ctx=1 for a top-left MB whose neighbours are all OOB / zero-MV,
+    /// disagreeing with ffmpeg's `mb_type[ctx][...]` indexing.
+    #[test]
+    fn vector_predictors_ctx_mapping_matches_spec() {
+        // Top-left MB in an empty 4x2 grid: every candidate position
+        // walks off-frame, so nb_pred stays 0 and the spec ctx is 2.
+        let mb_width = 4usize;
+        let mb_height = 2usize;
+        let mut scratch = mb::BlockScratch::new(mb_width);
+        let macroblocks = vec![MacroblockInfo::default(); mb_width * mb_height];
+        let ctx = vector_predictors(
+            &mut scratch,
+            &macroblocks,
+            mb_width,
+            0,
+            0,
+            tables::RefFrame::Previous,
+        );
+        assert_eq!(ctx, 2, "nb_pred=0 must map to ctx 2 (spec p.28 Table 5)");
+
+        // Seed a single non-(0,0) Previous-ref neighbour at (-1,0) so
+        // exactly one distinct candidate is found → ctx 1.
+        let mut macroblocks = vec![MacroblockInfo::default(); mb_width * mb_height];
+        macroblocks[0 * mb_width + 0] = MacroblockInfo {
+            mb_type: tables::Vp56Mb::InterDeltaPf,
+            mv: Mv { x: 4, y: 0 },
+        };
+        let ctx = vector_predictors(
+            &mut scratch,
+            &macroblocks,
+            mb_width,
+            1,
+            0,
+            tables::RefFrame::Previous,
+        );
+        assert_eq!(ctx, 1, "nb_pred=1 must map to ctx 1 (spec p.28 Table 5)");
     }
 
     #[test]
