@@ -161,16 +161,24 @@ across 6 files (63 tests total):
 ## Quick use
 
 ```rust
-use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
+use oxideav_core::{CodecId, Packet, TimeBase};
 use oxideav_codec::Decoder;
 
-let params = CodecParameters::video(CodecId::new("vp6f"));
-let mut dec = oxideav_vp6::Vp6Decoder::new(params);
+let mut dec = oxideav_vp6::Vp6Decoder::new(CodecId::new("vp6f"));
 let pkt = Packet::new(0u32, TimeBase::new(1, 1000), vec![/* coded frame */]);
 dec.send_packet(&pkt)?;
 let _frame = dec.receive_frame();
 # Ok::<(), oxideav_core::Error>(())
 ```
+
+For server / sandbox callers, use `Vp6Decoder::with_limits(codec_id, limits)`
+to thread an explicit `oxideav_core::DecoderLimits` through. The decoder
+honours `max_pixels_per_frame` (header-parse pixel cap),
+`max_arenas_in_flight` (arena-pool size; natural backpressure when full),
+and `max_alloc_bytes_per_frame` (per-arena byte cap, clamped to a VP6
+ceiling of 8 MiB). The `Decoder::receive_arena_frame` override returns
+true zero-copy frames whose plane bytes live inside the leased arena
+buffer.
 
 ## License
 

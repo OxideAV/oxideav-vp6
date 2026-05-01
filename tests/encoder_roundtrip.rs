@@ -23,7 +23,7 @@ fn packet_from_frame(bytes: Vec<u8>) -> Vec<u8> {
 
 fn decode_first_frame(bytes: Vec<u8>) -> (Vec<u8>, Vec<u8>, Vec<u8>, usize, usize) {
     let params = CodecParameters::video(CodecId::new("vp6f"));
-    let mut dec = Vp6Decoder::new(params);
+    let mut dec = Vp6Decoder::new(params.codec_id.clone());
     let pkt = Packet::new(0, TimeBase::new(1, 1000), packet_from_frame(bytes));
     dec.send_packet(&pkt).expect("decode send_packet");
     let Frame::Video(vf) = dec.receive_frame().expect("decode receive_frame") else {
@@ -366,7 +366,7 @@ fn skip_frame_identity_reproduces_previous_frame() {
     // Decode both packets through a single decoder so the skip frame's
     // inter-decode path picks up the keyframe's state.
     let params = CodecParameters::video(CodecId::new("vp6f"));
-    let mut dec = Vp6Decoder::new(params);
+    let mut dec = Vp6Decoder::new(params.codec_id.clone());
 
     let mut key_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(key));
     key_pkt.pts = Some(0);
@@ -441,7 +441,7 @@ fn inter_frame_horizontal_shift_uses_mv() {
     // MV search runs against the same reconstruction the decoder will
     // see (small drift from quantisation otherwise picks the wrong MV).
     let params = CodecParameters::video(CodecId::new("vp6f"));
-    let mut dec = Vp6Decoder::new(params);
+    let mut dec = Vp6Decoder::new(params.codec_id.clone());
     let mut key_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(key));
     key_pkt.pts = Some(0);
     key_pkt.flags.keyframe = true;
@@ -710,7 +710,7 @@ fn r24_inter_residual_psnr_floor() {
 
     // Decode the (key + inter) sequence through our decoder.
     let params = CodecParameters::video(CodecId::new("vp6f"));
-    let mut dec = Vp6Decoder::new(params);
+    let mut dec = Vp6Decoder::new(params.codec_id.clone());
     let mut key_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(key));
     key_pkt.pts = Some(0);
     key_pkt.flags.keyframe = true;

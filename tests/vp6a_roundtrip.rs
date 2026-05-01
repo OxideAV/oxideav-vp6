@@ -108,7 +108,7 @@ fn vp6a_synthetic_roundtrip() {
     pkt_data.extend_from_slice(&packet_body);
 
     let params = CodecParameters::video(CodecId::new("vp6a"));
-    let mut dec = Vp6Decoder::new(params);
+    let mut dec = Vp6Decoder::new(params.codec_id.clone());
     let mut pkt = Packet::new(0u32, TimeBase::new(1, 1000), pkt_data);
     pkt.pts = Some(0);
     pkt.flags.keyframe = true;

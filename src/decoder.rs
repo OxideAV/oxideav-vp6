@@ -6,15 +6,40 @@
 //!
 //! See FFmpeg's `vp56.c::ff_vp56_decode_frame` + `vp56_decode_mbs` for
 //! the reference control flow.
+//!
+//! ## DoS-protection — round 24+
+//!
+//! The decoder honours [`oxideav_core::DecoderLimits`]:
+//!
+//! - **Header-parse pixel cap.** [`Vp6Decoder::with_limits`] threads
+//!   [`DecoderLimits::max_pixels_per_frame`] into the keyframe path;
+//!   any keyframe whose declared `mb_width × mb_height × 256` exceeds
+//!   the cap is rejected with [`Error::ResourceExhausted`] *before*
+//!   any plane is allocated.
+//!
+//! - **Arena-backed planes (true zero-copy).** The decoder owns an
+//!   `Arc<arena::sync::ArenaPool>` sized at construction. The
+//!   per-decode pipeline is **lazy**: `send_packet` only queues raw
+//!   bytes; the actual pixel decode runs when `receive_frame` /
+//!   `receive_arena_frame` is called. The latter leases one arena from
+//!   the pool, allocates Y/U/V (and optional alpha) directly inside
+//!   it, and runs every MB-render kernel against those arena slices —
+//!   no intermediate `Vec<u8>` and no memcpy at the API boundary. The
+//!   reference frames kept for inter-MC are still heap-owned (one
+//!   internal memcpy per decode); they live longer than any single
+//!   arena lease.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
+use oxideav_core::arena::sync::{ArenaPool, FrameHeader, FrameInner};
+use oxideav_core::format::PixelFormat;
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase, VideoFrame, VideoPlane,
+    CodecId, DecoderLimits, Error, Frame, Packet, Result, TimeBase, VideoFrame, VideoPlane,
 };
 
-use crate::frame_header::{FrameHeader, FrameKind};
+use crate::frame_header::{FrameHeader as Vp6FrameHeader, FrameKind};
 use crate::mb::{self, BlockScratch, MacroblockInfo, Mv, RefKind};
 use crate::models::{self, Vp6Model};
 use crate::range_coder::RangeCoder;
@@ -85,11 +110,22 @@ impl Default for Vp6Stream {
     }
 }
 
-/// Output planes plus (width, height) from a single frame decode.
-type DecodedPlanes = (Vec<u8>, Vec<u8>, Vec<u8>, usize, usize);
+/// Per-decode geometry. Filled in by [`Vp6Stream::peek_dims`] before any
+/// arena allocation happens, so the arena byte count is known up front.
+#[derive(Clone, Copy, Debug)]
+struct DecodeDims {
+    /// Width in pixels (luma). Always `mb_width * 16`.
+    width: usize,
+    /// Height in pixels (luma). Always `mb_height * 16`.
+    height: usize,
+    /// Luma plane size in bytes.
+    y_bytes: usize,
+    /// Chroma (Cb / Cr) plane size in bytes.
+    c_bytes: usize,
+}
 
 impl Vp6Stream {
-    fn on_keyframe(&mut self, header: &FrameHeader) {
+    fn on_keyframe(&mut self, header: &Vp6FrameHeader) {
         self.mb_width = header.mb_width as usize;
         self.mb_height = header.mb_height as usize;
         self.sub_version = header.sub_version;
@@ -108,18 +144,59 @@ impl Vp6Stream {
         self.initialised = true;
     }
 
-    /// Decode a single VP6 frame's worth of bytes into three YUV planes
-    /// (luma stride = `width`, chroma stride = `width/2`). The alpha
-    /// stream calls this same routine — the `y` plane is the carrier
-    /// for the alpha sample data (chroma bands are produced but unused).
-    fn decode_frame(&mut self, data: &[u8]) -> Result<DecodedPlanes> {
+    /// Peek the dims this packet will produce **without** advancing any
+    /// stream state. Used by the arena path so it can compute the byte
+    /// count it needs from the pool before leasing.
+    fn peek_dims(&self, data: &[u8]) -> Result<DecodeDims> {
+        let is_key = !data.is_empty() && (data[0] & 0x80) == 0;
+        if is_key {
+            let hdr = Vp6FrameHeader::parse(data)?;
+            let width = hdr.mb_width as usize * 16;
+            let height = hdr.mb_height as usize * 16;
+            Ok(DecodeDims {
+                width,
+                height,
+                y_bytes: width * height,
+                c_bytes: (width / 2) * (height / 2),
+            })
+        } else if !self.initialised {
+            Err(Error::invalid("VP6: inter frame before keyframe"))
+        } else {
+            let width = self.mb_width * 16;
+            let height = self.mb_height * 16;
+            Ok(DecodeDims {
+                width,
+                height,
+                y_bytes: width * height,
+                c_bytes: (width / 2) * (height / 2),
+            })
+        }
+    }
+
+    /// Decode a single VP6 frame's worth of bytes directly into the
+    /// caller-supplied YUV plane slices (luma stride = `width`, chroma
+    /// stride = `width/2`). The alpha stream calls this same routine —
+    /// the `y_plane` slot carries the alpha sample data (chroma bands
+    /// are produced but unused).
+    ///
+    /// `y_plane`, `u_plane`, `v_plane` MUST have lengths
+    /// `width*height`, `(width/2)*(height/2)`, `(width/2)*(height/2)`
+    /// respectively, where (width, height) = the dims this packet
+    /// implies (querable via [`Self::peek_dims`]).
+    fn decode_frame_into(
+        &mut self,
+        data: &[u8],
+        y_plane: &mut [u8],
+        u_plane: &mut [u8],
+        v_plane: &mut [u8],
+    ) -> Result<DecodeDims> {
         let is_key = !data.is_empty() && (data[0] & 0x80) == 0;
         let header = if is_key {
-            FrameHeader::parse(data)?
+            Vp6FrameHeader::parse(data)?
         } else if !self.initialised {
             return Err(Error::invalid("VP6: inter frame before keyframe"));
         } else {
-            FrameHeader::parse_inter(data, self.filter_header, self.sub_version)?
+            Vp6FrameHeader::parse_inter(data, self.filter_header, self.sub_version)?
         };
         if matches!(header.kind, FrameKind::Key) {
             self.on_keyframe(&header);
@@ -213,9 +290,28 @@ impl Vp6Stream {
         let y_stride = width;
         let uv_stride = width / 2;
         let uv_h = height / 2;
-        let mut y_plane = vec![0u8; y_stride * height];
-        let mut u_plane = vec![128u8; uv_stride * uv_h];
-        let mut v_plane = vec![128u8; uv_stride * uv_h];
+
+        // Caller-supplied buffers must have been sized to the dims we
+        // implied via `peek_dims`. Sanity-check; this catches a
+        // mis-wired arena allocation rather than corrupting memory.
+        debug_assert_eq!(y_plane.len(), y_stride * height);
+        debug_assert_eq!(u_plane.len(), uv_stride * uv_h);
+        debug_assert_eq!(v_plane.len(), uv_stride * uv_h);
+
+        // Fresh start: VP6 paints every MB so seeding with 0 (Y) / 128
+        // (chroma) matches the prior `vec![]`-initialised behaviour.
+        // The arena buffer comes back uninitialised from the pool's
+        // bump allocator, so we must wipe it before any conditional
+        // skipped-MB path could read pre-existing bytes.
+        for px in y_plane.iter_mut() {
+            *px = 0;
+        }
+        for px in u_plane.iter_mut() {
+            *px = 128;
+        }
+        for px in v_plane.iter_mut() {
+            *px = 128;
+        }
 
         let plane_w = [width, width / 2, width / 2];
         let plane_h = [height, height / 2, height / 2];
@@ -259,11 +355,11 @@ impl Vp6Stream {
                     tables::Vp56Mb::Intra => {
                         mb::render_mb_intra(
                             &mut self.scratch,
-                            &mut y_plane,
+                            y_plane,
                             y_stride,
-                            &mut u_plane,
+                            u_plane,
                             uv_stride,
-                            &mut v_plane,
+                            v_plane,
                             uv_stride,
                             mb_row,
                             mb_col,
@@ -278,11 +374,11 @@ impl Vp6Stream {
                         if let Some(rp) = ref_planes {
                             mb::render_mb_inter(
                                 &mut self.scratch,
-                                &mut y_plane,
+                                y_plane,
                                 y_stride,
-                                &mut u_plane,
+                                u_plane,
                                 uv_stride,
-                                &mut v_plane,
+                                v_plane,
                                 uv_stride,
                                 &rp.y,
                                 &rp.u,
@@ -297,11 +393,11 @@ impl Vp6Stream {
                         } else {
                             mb::render_mb_intra(
                                 &mut self.scratch,
-                                &mut y_plane,
+                                y_plane,
                                 y_stride,
-                                &mut u_plane,
+                                u_plane,
                                 uv_stride,
-                                &mut v_plane,
+                                v_plane,
                                 uv_stride,
                                 mb_row,
                                 mb_col,
@@ -314,25 +410,57 @@ impl Vp6Stream {
             }
         }
 
+        // Update reference frames. The arena buffer that backs the
+        // output planes goes back to the pool when the caller drops
+        // the returned Frame, so we must memcpy here into a heap-owned
+        // RefPlanes that survives across packets.
         let output = RefPlanes {
-            y: y_plane.clone(),
-            u: u_plane.clone(),
-            v: v_plane.clone(),
+            y: y_plane.to_vec(),
+            u: u_plane.to_vec(),
+            v: v_plane.to_vec(),
         };
         if matches!(header.kind, FrameKind::Key) || golden_frame_flag {
             self.golden_frame = Some(output.clone());
         }
         self.prev_frame = Some(output);
 
-        Ok((y_plane, u_plane, v_plane, width, height))
+        Ok(DecodeDims {
+            width,
+            height,
+            y_bytes: y_stride * height,
+            c_bytes: uv_stride * uv_h,
+        })
     }
 }
 
+/// Per-codec ceiling for arena-backed plane allocations. VP6 in the
+/// wild rarely tops 1280×720 (HD); 8 MiB is enough for one I420 plane
+/// triple at that size (1280×720×1.5 = ~1.4 MiB) plus generous
+/// headroom for a 4-plane vp6a frame at up to ~1920×1080. Keeps
+/// `max_arenas_in_flight × cap_per_arena` sane even when the caller
+/// hands in a huge `max_alloc_bytes_per_frame`.
+pub const DEFAULT_VP6_ARENA_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Streaming VP6 decoder.
+///
+/// Construct via [`Vp6Decoder::new`] (default DoS limits) or
+/// [`Vp6Decoder::with_limits`] (explicit caps for server / sandbox
+/// callers). The `Decoder` trait's [`receive_arena_frame`] override
+/// returns true zero-copy frames whose plane bytes live inside the
+/// pool's arena buffer — see the module docs for the lazy-decode
+/// pipeline.
+///
+/// [`receive_arena_frame`]: Decoder::receive_arena_frame
 pub struct Vp6Decoder {
     codec_id: CodecId,
     variant: Vp6Variant,
-    queued: VecDeque<VideoFrame>,
+    /// Raw packet bytes awaiting decode. The decoder is **lazy**:
+    /// `send_packet` only enqueues; the actual decode runs from
+    /// `receive_frame` / `receive_arena_frame`. This keeps the arena
+    /// pool short-lived (one slot held only while a Frame clone exists)
+    /// and lets `receive_arena_frame` write pixels straight into the
+    /// arena with no intermediate `Vec<u8>`.
+    pending: VecDeque<(Vec<u8>, Option<i64>, TimeBase)>,
     pending_pts: Option<i64>,
     pending_tb: TimeBase,
     width: Option<u32>,
@@ -342,6 +470,18 @@ pub struct Vp6Decoder {
     stream: Vp6Stream,
     /// Secondary decode context used by `vp6a` for the alpha plane.
     alpha_stream: Vp6Stream,
+
+    /// DoS-protection caps threaded from the caller's
+    /// [`DecoderLimits`]. The header-parse path consults
+    /// `max_pixels_per_frame`; the pool below is sized from
+    /// `max_arenas_in_flight × min(max_alloc_bytes_per_frame,
+    /// DEFAULT_VP6_ARENA_BYTES)`.
+    limits: DecoderLimits,
+    /// Bounded buffer pool for arena-backed frames. When every slot
+    /// is checked out, [`ArenaPool::lease`] returns
+    /// [`Error::ResourceExhausted`] — natural backpressure for the
+    /// `receive_arena_frame` path.
+    arena_pool: Arc<ArenaPool>,
 }
 
 impl std::fmt::Debug for Vp6Decoder {
@@ -351,33 +491,67 @@ impl std::fmt::Debug for Vp6Decoder {
             .field("variant", &self.variant)
             .field("width", &self.width)
             .field("height", &self.height)
-            .field("queued", &self.queued.len())
+            .field("pending", &self.pending.len())
+            .field("limits", &self.limits)
             .finish()
     }
 }
 
 impl Vp6Decoder {
-    pub fn new(params: CodecParameters) -> Self {
-        let variant = Vp6Variant::from_codec_id(&params.codec_id);
+    /// Construct a decoder for the given codec id with default
+    /// [`DecoderLimits`]. Shorthand for
+    /// [`Vp6Decoder::with_limits(codec_id, DecoderLimits::default())`].
+    pub fn new(codec_id: CodecId) -> Self {
+        Self::with_limits(codec_id, DecoderLimits::default())
+    }
+
+    /// Construct a decoder with explicit DoS-protection caps. The
+    /// per-arena byte cap is `min(limits.max_alloc_bytes_per_frame,
+    /// DEFAULT_VP6_ARENA_BYTES)` — the caller's global cap is
+    /// honoured but never exceeds the VP6-specific ceiling, so the
+    /// pool's resident memory stays bounded even with a generous
+    /// global default.
+    pub fn with_limits(codec_id: CodecId, limits: DecoderLimits) -> Self {
+        let variant = Vp6Variant::from_codec_id(&codec_id);
+        let cap_per_arena = (limits
+            .max_alloc_bytes_per_frame
+            .min(DEFAULT_VP6_ARENA_BYTES)) as usize;
+        let pool = ArenaPool::with_alloc_count_cap(
+            limits.max_arenas_in_flight as usize,
+            cap_per_arena,
+            limits.max_alloc_count_per_frame,
+        );
         Self {
-            codec_id: params.codec_id,
+            codec_id,
             variant,
-            queued: VecDeque::new(),
+            pending: VecDeque::new(),
             pending_pts: None,
             pending_tb: TimeBase::new(1, 1000),
-            width: params.width,
-            height: params.height,
+            width: None,
+            height: None,
             stream: Vp6Stream::default(),
             alpha_stream: Vp6Stream::default(),
+            limits,
+            arena_pool: pool,
         }
     }
 
-    fn decode_bytes(&mut self, data: &[u8]) -> Result<VideoFrame> {
-        // vp6a prefix: 3-byte BE24 offset to the alpha partition. The
-        // bytes after the prefix up to that offset are the primary YUV
-        // bitstream; the remainder is a second, independently-coded
-        // VP6 bitstream carrying the alpha plane.
-        let (yuv_data, alpha_data) = if matches!(self.variant, Vp6Variant::FlvAlpha) {
+    /// Borrow the in-flight DoS limits for this decoder.
+    pub fn limits(&self) -> &DecoderLimits {
+        &self.limits
+    }
+
+    /// Borrow the arena pool. Tests probe pool state directly (e.g.
+    /// lease N+1 arenas to exercise [`Error::ResourceExhausted`]).
+    pub fn arena_pool(&self) -> &Arc<ArenaPool> {
+        &self.arena_pool
+    }
+
+    /// Split a packet payload into `(yuv_bytes, alpha_bytes_opt)` per
+    /// the vp6a 3-byte BE24 alpha-offset prefix. For vp6f the input
+    /// passes through untouched.
+    fn split_alpha<'a>(&self, data: &'a [u8]) -> Result<(&'a [u8], Option<&'a [u8]>)> {
+        if matches!(self.variant, Vp6Variant::FlvAlpha) {
             if data.len() < 3 {
                 return Err(Error::invalid(
                     "VP6 vp6a: packet too short for alpha offset",
@@ -389,68 +563,182 @@ impl Vp6Decoder {
             if alpha_offset > rest.len() {
                 return Err(Error::invalid("VP6 vp6a: alpha offset past end"));
             }
-            (&rest[..alpha_offset], Some(&rest[alpha_offset..]))
+            Ok((&rest[..alpha_offset], Some(&rest[alpha_offset..])))
         } else {
-            (data, None)
-        };
+            Ok((data, None))
+        }
+    }
 
-        let (y_plane, u_plane, v_plane, width, height) = self.stream.decode_frame(yuv_data)?;
-        self.width = Some(width as u32);
-        self.height = Some(height as u32);
-        let y_stride = width;
-        let uv_stride = width / 2;
-
-        if let Some(alpha_bytes) = alpha_data {
-            // The alpha stream is a standalone monochrome VP6. Its luma
-            // plane is the alpha sample data; chroma is discarded.
-            let (alpha_plane, _, _, aw, ah) = self.alpha_stream.decode_frame(alpha_bytes)?;
-            if aw != width || ah != height {
+    /// Parse just enough of the next pending packet's header to compute
+    /// the byte count its planes will need, and reject it early when
+    /// the declared dims exceed [`DecoderLimits::max_pixels_per_frame`].
+    fn check_pending_dims(&self, data: &[u8]) -> Result<(DecodeDims, Option<DecodeDims>)> {
+        let (yuv_bytes, alpha_bytes) = self.split_alpha(data)?;
+        let yuv_dims = self.stream.peek_dims(yuv_bytes)?;
+        let pixels = (yuv_dims.width as u64).saturating_mul(yuv_dims.height as u64);
+        if pixels > self.limits.max_pixels_per_frame {
+            return Err(Error::resource_exhausted(format!(
+                "VP6 frame {}x{} exceeds DecoderLimits.max_pixels_per_frame={}",
+                yuv_dims.width, yuv_dims.height, self.limits.max_pixels_per_frame
+            )));
+        }
+        let alpha_dims = if let Some(ab) = alpha_bytes {
+            let ad = self.alpha_stream.peek_dims(ab)?;
+            // Alpha dims must agree with YUV dims; surface the mismatch
+            // as InvalidData rather than ResourceExhausted.
+            if ad.width != yuv_dims.width || ad.height != yuv_dims.height {
                 return Err(Error::invalid(
                     "VP6 vp6a: alpha dimensions disagree with YUV",
                 ));
             }
-            let frame = VideoFrame {
-                pts: self.pending_pts,
-                planes: vec![
-                    VideoPlane {
-                        stride: y_stride,
-                        data: y_plane,
-                    },
-                    VideoPlane {
-                        stride: uv_stride,
-                        data: u_plane,
-                    },
-                    VideoPlane {
-                        stride: uv_stride,
-                        data: v_plane,
-                    },
-                    VideoPlane {
-                        stride: y_stride,
-                        data: alpha_plane,
-                    },
-                ],
-            };
-            Ok(frame)
+            Some(ad)
         } else {
-            let frame = VideoFrame {
-                pts: self.pending_pts,
-                planes: vec![
-                    VideoPlane {
-                        stride: y_stride,
-                        data: y_plane,
-                    },
-                    VideoPlane {
-                        stride: uv_stride,
-                        data: u_plane,
-                    },
-                    VideoPlane {
-                        stride: uv_stride,
-                        data: v_plane,
-                    },
-                ],
-            };
-            Ok(frame)
+            None
+        };
+        Ok((yuv_dims, alpha_dims))
+    }
+
+    /// Decode the next pending packet straight into the supplied arena
+    /// and return a `(arena::sync::Frame, pts)` pair. The arena is
+    /// leased internally; failure to lease surfaces as
+    /// [`Error::ResourceExhausted`].
+    fn decode_into_arena(&mut self) -> Result<oxideav_core::arena::sync::Frame> {
+        let (data, pts, _tb) = self
+            .pending
+            .pop_front()
+            .ok_or_else(|| Error::Other("VP6: no pending packet".into()))?;
+        // Header-parse + DoS check before leasing anything.
+        let (yuv_dims, alpha_dims) = self.check_pending_dims(&data)?;
+        // Total bytes we'll need from the arena, before lease.
+        let plane_bytes = yuv_dims
+            .y_bytes
+            .checked_add(yuv_dims.c_bytes)
+            .and_then(|n| n.checked_add(yuv_dims.c_bytes))
+            .ok_or_else(|| Error::resource_exhausted("VP6 frame size overflow".to_string()))?;
+        let total = if let Some(ad) = alpha_dims {
+            plane_bytes
+                .checked_add(ad.y_bytes)
+                .ok_or_else(|| Error::resource_exhausted("VP6+alpha size overflow".to_string()))?
+        } else {
+            plane_bytes
+        };
+        if total > self.arena_pool.cap_per_arena() {
+            return Err(Error::resource_exhausted(format!(
+                "VP6 frame {}x{} needs {} arena bytes (cap {})",
+                yuv_dims.width,
+                yuv_dims.height,
+                total,
+                self.arena_pool.cap_per_arena()
+            )));
         }
+
+        let arena = self.arena_pool.lease()?;
+
+        // Allocate the planes from the arena, recording their offsets
+        // for the FrameInner plane table. The bump allocator hands out
+        // contiguous regions; the offsets are exactly y_bytes, y+c,
+        // y+2c (and optionally y+2c+y for alpha).
+        let y_off = arena.used();
+        let y_buf = arena.alloc::<u8>(yuv_dims.y_bytes)?;
+        // SAFETY: we need to re-borrow these into independent &mut
+        // slices simultaneously (one Y, one U, one V) for the kernel
+        // call. Each `arena.alloc` returns a disjoint region, so the
+        // pointers are non-overlapping. We split via raw pointers and
+        // reconstitute mutable slices over distinct ranges.
+        let y_ptr = y_buf.as_mut_ptr();
+        let y_len = y_buf.len();
+
+        let u_off = arena.used();
+        let u_buf = arena.alloc::<u8>(yuv_dims.c_bytes)?;
+        let u_ptr = u_buf.as_mut_ptr();
+        let u_len = u_buf.len();
+
+        let v_off = arena.used();
+        let v_buf = arena.alloc::<u8>(yuv_dims.c_bytes)?;
+        let v_ptr = v_buf.as_mut_ptr();
+        let v_len = v_buf.len();
+
+        // Optional alpha plane (vp6a). Allocated up front so the offset
+        // is stable; the bytes are filled by a second decode_frame_into
+        // below.
+        let (alpha_off, alpha_len, alpha_ptr) = if let Some(ad) = alpha_dims {
+            let off = arena.used();
+            let buf = arena.alloc::<u8>(ad.y_bytes)?;
+            let ptr = buf.as_mut_ptr();
+            (Some(off), Some(buf.len()), Some(ptr))
+        } else {
+            (None, None, None)
+        };
+
+        // Re-split data now that the arena has the buffers it needs.
+        // `split_alpha` already validated this earlier; re-using the
+        // same parse here is cheap and keeps the lifetimes simple.
+        let (yuv_bytes, alpha_bytes) = self.split_alpha(&data)?;
+
+        // SAFETY: the three pointers come from disjoint
+        // arena.alloc<u8>() calls; their backing regions never overlap.
+        // We borrow as mutable slices for the duration of the kernel
+        // call only (no other alias outstanding).
+        let dims = unsafe {
+            let y_slice = std::slice::from_raw_parts_mut(y_ptr, y_len);
+            let u_slice = std::slice::from_raw_parts_mut(u_ptr, u_len);
+            let v_slice = std::slice::from_raw_parts_mut(v_ptr, v_len);
+            self.stream
+                .decode_frame_into(yuv_bytes, y_slice, u_slice, v_slice)?
+        };
+        self.width = Some(dims.width as u32);
+        self.height = Some(dims.height as u32);
+
+        // Alpha plane (vp6a only). We treat its luma plane as the
+        // alpha sample data and ignore the chroma bands; the
+        // alpha_stream's chroma scratch goes into a small temp Vec
+        // here (chroma is only used internally for the alpha decode's
+        // MC, not surfaced to the caller).
+        if let (Some(ab), Some(_off), Some(alen), Some(aptr), Some(ad)) =
+            (alpha_bytes, alpha_off, alpha_len, alpha_ptr, alpha_dims)
+        {
+            // Scratch chroma planes for the alpha-stream decode. These
+            // never reach the caller (the alpha plane is the alpha
+            // stream's *luma*); allocate from the heap rather than the
+            // arena so we don't waste arena capacity on bytes the
+            // Frame won't expose.
+            let mut alpha_u_scratch = vec![128u8; ad.c_bytes];
+            let mut alpha_v_scratch = vec![128u8; ad.c_bytes];
+            // SAFETY: alpha_ptr came from a disjoint arena.alloc<u8>()
+            // call (the only other arena allocs were Y / U / V above).
+            let alpha_dims_actual = unsafe {
+                let alpha_slice = std::slice::from_raw_parts_mut(aptr, alen);
+                self.alpha_stream.decode_frame_into(
+                    ab,
+                    alpha_slice,
+                    &mut alpha_u_scratch,
+                    &mut alpha_v_scratch,
+                )?
+            };
+            if alpha_dims_actual.width != dims.width || alpha_dims_actual.height != dims.height {
+                return Err(Error::invalid(
+                    "VP6 vp6a: alpha dimensions disagree with YUV",
+                ));
+            }
+        }
+
+        // Build the FrameHeader (pixel format depends on alpha
+        // presence) and freeze into a Frame.
+        let pixel_format = if alpha_off.is_some() {
+            PixelFormat::Yuva420P
+        } else {
+            PixelFormat::Yuv420P
+        };
+        let header = FrameHeader::new(dims.width as u32, dims.height as u32, pixel_format, pts);
+
+        let mut planes: Vec<(usize, usize)> = Vec::with_capacity(4);
+        planes.push((y_off, y_len));
+        planes.push((u_off, u_len));
+        planes.push((v_off, v_len));
+        if let (Some(off), Some(len)) = (alpha_off, alpha_len) {
+            planes.push((off, len));
+        }
+        FrameInner::new(arena, &planes, header)
     }
 }
 
@@ -722,22 +1010,45 @@ impl Decoder for Vp6Decoder {
         self.pending_pts = packet.pts;
         self.pending_tb = packet.time_base;
         // FLV wraps VP6 frames with a 1-byte adjustment prefix; strip
-        // it before decoding.
+        // it before queueing.
         let data = if packet.data.is_empty() {
-            packet.data.as_slice()
+            packet.data.clone()
         } else {
-            &packet.data[1..]
+            packet.data[1..].to_vec()
         };
-        let frame = self.decode_bytes(data)?;
-        self.queued.push_back(frame);
+        // DoS check fires before queueing so a malformed-size packet is
+        // rejected at send_packet rather than sitting in the queue
+        // until receive_*. We don't lease anything here — just parse
+        // the header bytes that name the dims.
+        let _ = self.check_pending_dims(&data)?;
+        self.pending.push_back((data, packet.pts, packet.time_base));
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        match self.queued.pop_front() {
-            Some(v) => Ok(Frame::Video(v)),
-            None => Err(Error::NeedMore),
+        if self.pending.is_empty() {
+            return Err(Error::NeedMore);
         }
+        // Decode the next pending packet through the arena pipeline,
+        // then materialise a heap-owned VideoFrame from it. The arena
+        // lease is released when `arena_frame` is dropped at the end
+        // of this scope — the legacy `receive_frame` path therefore
+        // never holds a pool slot across calls.
+        let arena_frame = self.decode_into_arena()?;
+        let video = arena_frame_to_video_frame(&arena_frame, self.pending_pts);
+        drop(arena_frame);
+        Ok(Frame::Video(video))
+    }
+
+    fn receive_arena_frame(&mut self) -> Result<oxideav_core::arena::sync::Frame> {
+        if self.pending.is_empty() {
+            return Err(Error::NeedMore);
+        }
+        // True zero-copy: `decode_into_arena` writes pixels straight
+        // into the arena buffer; we hand the resulting Frame back
+        // unchanged. The pool slot stays checked out until the caller
+        // drops the last `Arc` clone of the returned Frame.
+        self.decode_into_arena()
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -745,12 +1056,53 @@ impl Decoder for Vp6Decoder {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.queued.clear();
+        self.pending.clear();
         self.pending_pts = None;
         self.stream = Vp6Stream::default();
         self.alpha_stream = Vp6Stream::default();
         Ok(())
     }
+}
+
+/// Materialise a stride-packed `VideoFrame` from an arena Frame. Walks
+/// the plane table and copies each plane via `to_vec()` — used by the
+/// legacy [`Decoder::receive_frame`] path to surface heap-owned bytes
+/// across `Send` boundaries that don't want the arena lifetime tied to
+/// the consumer's frame lifetime.
+fn arena_frame_to_video_frame(
+    af: &oxideav_core::arena::sync::Frame,
+    pts: Option<i64>,
+) -> VideoFrame {
+    let hdr = af.header();
+    let w = hdr.width as usize;
+    let cw = w.div_ceil(2);
+    let mut planes = Vec::with_capacity(af.plane_count());
+    // Plane 0: luma (full width).
+    if let Some(p) = af.plane(0) {
+        planes.push(VideoPlane {
+            stride: w,
+            data: p.to_vec(),
+        });
+    }
+    // Planes 1, 2: chroma (half width).
+    for i in 1..af.plane_count().min(3) {
+        if let Some(p) = af.plane(i) {
+            planes.push(VideoPlane {
+                stride: cw,
+                data: p.to_vec(),
+            });
+        }
+    }
+    // Plane 3 (optional): alpha (full width again).
+    if af.plane_count() >= 4 {
+        if let Some(p) = af.plane(3) {
+            planes.push(VideoPlane {
+                stride: w,
+                data: p.to_vec(),
+            });
+        }
+    }
+    VideoFrame { pts, planes }
 }
 
 #[cfg(test)]
@@ -759,8 +1111,7 @@ mod tests {
 
     #[test]
     fn inter_before_keyframe_errors() {
-        let params = CodecParameters::video(CodecId::new("vp6f"));
-        let mut dec = Vp6Decoder::new(params);
+        let mut dec = Vp6Decoder::new(CodecId::new("vp6f"));
         // Inter frame (bit 7 set), sub_coeff=0, QP=10.
         let mut data = vec![0u8];
         let qp = 10u8;
@@ -816,8 +1167,7 @@ mod tests {
     fn alpha_packet_too_short_for_offset_prefix() {
         // Without enough bytes for the 3-byte alpha offset prefix, the
         // decoder reports InvalidData (not Unsupported).
-        let params = CodecParameters::video(CodecId::new("vp6a"));
-        let mut dec = Vp6Decoder::new(params);
+        let mut dec = Vp6Decoder::new(CodecId::new("vp6a"));
         // 1-byte flv prefix + 2 body bytes → after strip, len=2, short
         // for alpha prefix.
         let pkt = Packet::new(0, TimeBase::new(1, 1000), vec![0u8, 0, 0]);

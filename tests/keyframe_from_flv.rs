@@ -83,7 +83,7 @@ fn decode_first_vp6_keyframe() {
         return;
     };
     let params = CodecParameters::video(CodecId::new("vp6f"));
-    let mut dec = Vp6Decoder::new(params);
+    let mut dec = Vp6Decoder::new(params.codec_id.clone());
     let mut pkt = Packet::new(0, TimeBase::new(1, 1000), keyframe.clone());
     pkt.pts = Some(0);
     pkt.flags.keyframe = true;
@@ -138,7 +138,7 @@ fn decode_first_20_frames() {
     let want = tags.len();
 
     let params = CodecParameters::video(CodecId::new("vp6f"));
-    let mut dec = Vp6Decoder::new(params);
+    let mut dec = Vp6Decoder::new(params.codec_id.clone());
     let mut decoded = 0usize;
     let mut means = Vec::new();
     for (idx, (is_key, payload)) in tags.iter().enumerate() {

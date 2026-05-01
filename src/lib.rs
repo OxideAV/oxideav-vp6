@@ -37,11 +37,15 @@ pub const CODEC_ID_VP6F: &str = "vp6f";
 pub const CODEC_ID_VP6A: &str = "vp6a";
 
 /// Decoder factory — see the [`oxideav_codec`] registry for the
-/// integration details. Accepts both `vp6f` and `vp6a`; the `vp6a`
-/// path currently errors out at `send_packet` because the alpha-plane
-/// decode isn't wired up yet.
+/// integration details. Accepts both `vp6f` and `vp6a`. Honours
+/// [`CodecParameters::limits`] so server callers that pass a tightened
+/// `CodecParameters` actually get a tightened decoder (header-parse
+/// pixel cap + arena-pool size + per-arena byte cap).
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Ok(Box::new(Vp6Decoder::new(params.clone())))
+    Ok(Box::new(Vp6Decoder::with_limits(
+        params.codec_id.clone(),
+        *params.limits(),
+    )))
 }
 
 /// Factory value, suitable for `CodecInfo::decoder(...)` when

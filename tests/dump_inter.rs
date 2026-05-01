@@ -40,7 +40,7 @@ fn dump_inter_minimal() {
     // Decode the keyframe so we have reconstructed planes for the
     // skip-frame motion search baseline (matches what ffmpeg sees).
     let params = CodecParameters::video(CodecId::new("vp6f"));
-    let mut dec = Vp6Decoder::new(params);
+    let mut dec = Vp6Decoder::new(params.codec_id.clone());
     let mut p = Vec::new();
     p.push(0u8);
     p.extend_from_slice(&key);
