@@ -1472,3 +1472,280 @@ fn ffmpeg_decodes_inter_with_golden_refresh_flag() {
         "ffmpeg should accept key + golden-refresh inter (got {last} frames). stderr:\n{stderr}"
     );
 }
+
+// =============================================================================
+// Round 27 — INTER_FOURMV (per-8×8 motion vectors, mb_type = Inter4V)
+// =============================================================================
+//
+// VP6 lets a 16×16 macroblock carry FOUR independent 8×8 luma motion
+// vectors via mb_type = Inter4V (the spec's "FOURMV" mode). Decoder side
+// has supported this since the initial port; the encoder gained it in
+// r27 alongside per-block ME and a single-vs-FOURMV RDO step. The wire
+// layout (see `decode_4mv` in `decoder.rs`):
+//
+//   * 4 × 2 raw bits — block-type tags, ALL emitted before any delta MV
+//     (`v + 1` mapping: raw 0 = NoVec, raw 1 = Delta, raw 2/3 = candidate
+//     cycle; the encoder never emits 2/3).
+//   * For each Delta-tagged block, one MV-component delta pair via
+//     `parse_vector_adjustment` semantics (PVA short / FDV long tree).
+//   * Chroma MVs are derived as the round-shifted average of the 4 luma
+//     MVs (`(sum + 2) >> 2`, signed-aware) — there's no explicit chroma
+//     MV on the wire.
+//
+// The encoder picks Inter4V only when (a) per-block MVs diverge from the
+// whole-MB MV by ≥ 2 qpel in either component AND (b) the FOURMV
+// Lagrangian cost (luma SAD + λ × proxy bits) strictly beats the
+// single-MV cost. Both requirements together suppress the FOURMV branch
+// on smooth-motion content where it would be pure overhead.
+
+/// Build a high-detail textured pair where each 8×8 block within a 16×16
+/// MB has a clearly distinct optimal MV. The keyframe carries a
+/// pseudo-random spatial pattern (so per-block matches are unique
+/// modulo the texture). The inter frame applies a different rigid
+/// translation to each 8×8 quadrant of every MB:
+///
+///   * top-left (block 0):     shift right by 2 px
+///   * top-right (block 1):    shift left  by 2 px
+///   * bottom-left (block 2):  shift down  by 2 px
+///   * bottom-right (block 3): shift up    by 2 px
+///
+/// The whole-MB optimal single MV is therefore close to (0, 0) but a
+/// distinct per-block MV gives near-zero residual on each block — exactly
+/// the regime where FOURMV pays off.
+fn build_diverging_block_motion(w: usize, h: usize) -> (Vec<u8>, Vec<u8>) {
+    // Pseudo-random texture seeded so neighbouring pixels differ by a
+    // measurable amount in any 8x8 window — guarantees the 8x8 SAD has a
+    // strict minimum per shift.
+    let texture = |x: i32, y: i32| -> u8 {
+        // 32-bit splittable hash on (x, y) → byte. Stable across runs.
+        let x = x.unsigned_abs();
+        let y = y.unsigned_abs();
+        let mut h = (x.wrapping_mul(2654435761)).wrapping_add(y.wrapping_mul(2246822519));
+        h ^= h >> 16;
+        h = h.wrapping_mul(0x85ebca6b);
+        h ^= h >> 13;
+        h = h.wrapping_mul(0xc2b2ae35);
+        h ^= h >> 16;
+        (h & 0xff) as u8
+    };
+
+    let mut y0 = vec![0u8; w * h];
+    let mut y1 = vec![0u8; w * h];
+    for r in 0..h as i32 {
+        for c in 0..w as i32 {
+            y0[(r * w as i32 + c) as usize] = texture(c, r);
+        }
+    }
+    for r in 0..h as i32 {
+        for c in 0..w as i32 {
+            // Identify which 8×8 block within its 16×16 MB this pixel
+            // sits in: 0 = TL, 1 = TR, 2 = BL, 3 = BR.
+            let block_x = (c % 16) / 8;
+            let block_y = (r % 16) / 8;
+            let bi = (block_y * 2 + block_x) as usize;
+            let (dx, dy) = match bi {
+                0 => (2i32, 0), // TL: shifted right by 2 (so MV = -2)
+                1 => (-2, 0),   // TR: shifted left by 2 (MV = +2)
+                2 => (0, 2),    // BL: shifted down by 2 (MV = 0, -2)
+                3 => (0, -2),   // BR: shifted up by 2 (MV = 0, +2)
+                _ => (0, 0),
+            };
+            // y1[r][c] = y0[r-dy][c-dx] (with edge clamp).
+            let sx = (c - dx).clamp(0, w as i32 - 1);
+            let sy = (r - dy).clamp(0, h as i32 - 1);
+            y1[(r * w as i32 + c) as usize] = texture(sx, sy);
+        }
+    }
+    (y0, y1)
+}
+
+/// r27 — Inter4V (FOURMV) round-trips through our own decoder and
+/// produces a measurably smaller wire size than the equivalent
+/// single-MV encode on a fixture where each 8×8 block of every MB has a
+/// distinct optimal motion vector.
+///
+/// Hard requirements:
+///   1. Both `allow_fourmv = true` and `false` encodes round-trip
+///      cleanly through our decoder (FOURMV doesn't break the bool
+///      stream framing).
+///   2. The FOURMV-on encode is at least 5% smaller than the FOURMV-off
+///      encode on the diverging-block fixture (acceptance criterion).
+///
+/// The 5% bar is a soft floor — the actual delta on the
+/// 32×32-diverging-blocks fixture is much larger because the FOURMV-off
+/// path has to encode large per-MB DCT residuals to absorb the
+/// per-block motion the single MV can't capture.
+#[test]
+fn r27_fourmv_inter_smaller_than_single_mv_on_diverging_blocks() {
+    let (w, h) = (32usize, 32usize);
+    let (y0, y1) = build_diverging_block_motion(w, h);
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    // Encode at QP 12 — tight enough that the FOURMV residual savings
+    // matter (a coarse QP would zero-out the per-block residual on both
+    // paths, hiding the win).
+    let qp = 12u8;
+
+    // -- Path A: FOURMV-on (default).
+    let mut enc_fourmv = Vp6Encoder::new(qp);
+    let key_a = enc_fourmv.encode_keyframe(&y0, &u, &v, w, h).unwrap();
+    let (recon_y_a, recon_u_a, recon_v_a, _, _) = decode_first_frame(key_a.clone());
+    let inter_a = enc_fourmv
+        .encode_inter_frame(&recon_y_a, &recon_u_a, &recon_v_a, &y1, &u, &v, w, h, 4)
+        .expect("encode inter (fourmv on)");
+
+    // -- Path B: FOURMV-off (regression baseline).
+    let mut enc_single = Vp6Encoder::new(qp);
+    enc_single.allow_fourmv = false;
+    let key_b = enc_single.encode_keyframe(&y0, &u, &v, w, h).unwrap();
+    let (recon_y_b, recon_u_b, recon_v_b, _, _) = decode_first_frame(key_b.clone());
+    let inter_b = enc_single
+        .encode_inter_frame(&recon_y_b, &recon_u_b, &recon_v_b, &y1, &u, &v, w, h, 4)
+        .expect("encode inter (fourmv off)");
+
+    // Both keyframes are produced by the same code path so should match
+    // byte-for-byte; sanity check that the only delta is the inter
+    // payload.
+    assert_eq!(
+        key_a, key_b,
+        "keyframe encodes must match across allow_fourmv values"
+    );
+
+    let bytes_fourmv = inter_a.len();
+    let bytes_single = inter_b.len();
+    eprintln!(
+        "r27 inter sizes — fourmv-on={bytes_fourmv} bytes, fourmv-off={bytes_single} bytes \
+         (delta = {} bytes / {:.2}%)",
+        bytes_single as i64 - bytes_fourmv as i64,
+        100.0 * (bytes_single as f64 - bytes_fourmv as f64) / bytes_single as f64,
+    );
+
+    // Acceptance: FOURMV path is at least 5% smaller. On the
+    // diverging-blocks fixture we observe much larger deltas in
+    // practice (the single-MV residual carries the per-block motion
+    // content that FOURMV absorbs into MC).
+    let bound = (bytes_single as f64 * 0.95).floor() as usize;
+    assert!(
+        bytes_fourmv <= bound,
+        "FOURMV inter must be ≤95% of single-MV inter; \
+         got fourmv={bytes_fourmv} single={bytes_single} (bound={bound})"
+    );
+
+    // Both must round-trip cleanly through our own decoder. Decode the
+    // FOURMV inter and verify Y reconstruction is reasonable (residual
+    // path inside the FOURMV branch is the same shape as single-MV, so
+    // PSNR should clear ~25 dB on this textured fixture even with the
+    // per-block DCT quant noise).
+    let params = CodecParameters::video(CodecId::new("vp6f"));
+    let mut dec = Vp6Decoder::new(params.codec_id.clone());
+    let mut key_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(key_a));
+    key_pkt.pts = Some(0);
+    key_pkt.flags.keyframe = true;
+    dec.send_packet(&key_pkt).expect("send key");
+    let _ = dec.receive_frame().expect("recv key");
+    let mut inter_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(inter_a));
+    inter_pkt.pts = Some(33);
+    dec.send_packet(&inter_pkt).expect("send fourmv inter");
+    let inter_frame = match dec.receive_frame().expect("recv fourmv inter") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video frame, got {other:?}"),
+    };
+    let dy = &inter_frame.planes[0].data;
+    let psnr = plane_psnr(&y1, dy);
+    eprintln!("r27 fourmv inter Y PSNR (own decoder) = {psnr:.2} dB");
+    assert!(
+        psnr >= 20.0,
+        "FOURMV round-trip PSNR too low: {psnr:.2} dB (target ≥ 20 dB)"
+    );
+}
+
+/// r27 — ffmpeg cross-decode on a FOURMV inter packet. Mirrors
+/// `r25_ffmpeg_decodes_qpel_inter_frame` but for the FOURMV path: encode
+/// the diverging-blocks fixture, mux key + inter into FLV, and verify
+/// ffmpeg's vp6f decoder accepts both packets (i.e. the per-block tag +
+/// delta wire layout doesn't desync ffmpeg's parser).
+#[test]
+fn r27_ffmpeg_decodes_fourmv_inter_frame() {
+    use std::process::Command;
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("ffmpeg not available — skipping");
+        return;
+    }
+
+    let (w, h) = (32usize, 32usize);
+    let (y0, y1) = build_diverging_block_motion(w, h);
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    let mut enc = Vp6Encoder::new(12);
+    let key = enc.encode_keyframe(&y0, &u, &v, w, h).expect("keyframe");
+    let (recon_y, recon_u, recon_v, _, _) = decode_first_frame(key.clone());
+    let inter = enc
+        .encode_inter_frame(&recon_y, &recon_u, &recon_v, &y1, &u, &v, w, h, 4)
+        .expect("encode inter");
+
+    // Mux key + inter into a 2-tag FLV stream — same shape as
+    // `r25_ffmpeg_decodes_qpel_inter_frame`.
+    let mut flv = Vec::new();
+    flv.extend_from_slice(b"FLV");
+    flv.push(0x01);
+    flv.push(0x01);
+    flv.extend_from_slice(&9u32.to_be_bytes());
+    flv.extend_from_slice(&0u32.to_be_bytes());
+
+    let push_tag = |flv: &mut Vec<u8>, frame: &[u8], pts: u32, is_key: bool| -> u32 {
+        let video_payload_len = (1 + 1 + frame.len()) as u32;
+        flv.push(9);
+        flv.extend_from_slice(&video_payload_len.to_be_bytes()[1..]);
+        let ts = pts;
+        flv.push(((ts >> 16) & 0xff) as u8);
+        flv.push(((ts >> 8) & 0xff) as u8);
+        flv.push((ts & 0xff) as u8);
+        flv.push(((ts >> 24) & 0xff) as u8);
+        flv.extend_from_slice(&[0, 0, 0]);
+        flv.push(if is_key { 0x14 } else { 0x24 });
+        flv.push(0x00);
+        flv.extend_from_slice(frame);
+        let tag_size = 11 + video_payload_len;
+        flv.extend_from_slice(&tag_size.to_be_bytes());
+        tag_size
+    };
+    let _ = push_tag(&mut flv, &key, 0, true);
+    let _ = push_tag(&mut flv, &inter, 33, false);
+
+    let stamp = std::process::id();
+    let flv_path = std::env::temp_dir().join(format!("oxideav_vp6_r27_{stamp}.flv"));
+    let yuv_path = std::env::temp_dir().join(format!("oxideav_vp6_r27_{stamp}.yuv"));
+    std::fs::write(&flv_path, &flv).unwrap();
+    let status = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "flv",
+            "-i",
+        ])
+        .arg(&flv_path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv_path)
+        .status()
+        .expect("spawn ffmpeg");
+    let _ = std::fs::remove_file(&flv_path);
+    assert!(status.success(), "ffmpeg failed to decode 2-tag FOURMV FLV");
+    let raw = std::fs::read(&yuv_path).unwrap();
+    let _ = std::fs::remove_file(&yuv_path);
+    let frame_size = w * h + 2 * (w / 2) * (h / 2);
+    assert!(
+        raw.len() >= 2 * frame_size,
+        "expected 2 frames decoded, got {} bytes",
+        raw.len()
+    );
+}

@@ -251,6 +251,17 @@ pub struct Vp6Encoder {
     /// without paying the keyframe cost (a golden-refresh frame is
     /// still a P-frame with bool-coded residual).
     pub golden_refresh_period: u32,
+    /// When `true` (default) the inter-frame encoder considers
+    /// [`tables::Vp56Mb::Inter4V`] (FOURMV / per-8×8 MV) as a candidate
+    /// alongside the single-MV InterDelta path on a per-MB basis. When
+    /// `false` the encoder behaves as it did pre-FOURMV: every inter MB
+    /// is either `InterNoVecPf` (zero MV) or `InterDeltaPf` (single MV).
+    /// Useful for byte-cost A/B testing and for reproducing pre-FOURMV
+    /// behaviour in regression-style tests. Currently honoured only by
+    /// [`Vp6Encoder::encode_inter_frame`] — the golden-aware path stays
+    /// single-MV regardless (Inter4V references `RefFrame::Previous`
+    /// only, so it has no role on a golden-ref MB).
+    pub allow_fourmv: bool,
     /// Dimensions (in MBs) from the last encoded keyframe. Needed so
     /// [`Vp6Encoder::encode_skip_frame`] can produce a well-formed
     /// inter-frame header without requiring callers to re-supply them.
@@ -287,6 +298,7 @@ impl Default for Vp6Encoder {
             // comment.)
             sub_version: 6,
             golden_refresh_period: 30,
+            allow_fourmv: true,
             mb_width: 0,
             mb_height: 0,
             have_keyframe: false,
@@ -304,6 +316,7 @@ impl Vp6Encoder {
             qp: qp.min(63),
             sub_version: 6,
             golden_refresh_period: 30,
+            allow_fourmv: true,
             mb_width: 0,
             mb_height: 0,
             have_keyframe: false,
@@ -1019,6 +1032,102 @@ impl Vp6Encoder {
                     new_y, prev_y, width, height, mb_row, mb_col, search, self.qp,
                 );
 
+                // -- 1b. Per-8×8-block ME for the FOURMV candidate. Each
+                // luma block (0..=3) runs an integer-pel search seeded
+                // from the whole-MB integer winner with a tight `±2`
+                // window (smaller than the full-MB search to keep the
+                // FOURMV path bounded), then a qpel refine. Block-MV
+                // divergence vs the whole-MB MV is what drives the FOURMV
+                // RDO win below — high-detail moving content where each
+                // block's best MV differs from the others gets a lower
+                // residual SAD with 4 distinct MVs.
+                let mb_x = (mb_col * 16) as i32;
+                let mb_y = (mb_row * 16) as i32;
+                let block4_search = search.min(2);
+                let mut block_mvs = [Mv::default(); 4];
+                for bi in 0..4usize {
+                    let bx = mb_x + if bi & 1 != 0 { 8 } else { 0 };
+                    let by = mb_y + if bi & 2 != 0 { 8 } else { 0 };
+                    let (bqx, bqy) = motion_search_8x8(
+                        new_y,
+                        prev_y,
+                        width,
+                        height,
+                        bx,
+                        by,
+                        q_dx,
+                        q_dy,
+                        block4_search,
+                        self.qp,
+                    );
+                    block_mvs[bi] = Mv {
+                        x: bqx as i16,
+                        y: bqy as i16,
+                    };
+                }
+
+                // -- 1c. RDO between the single-MV (InterDelta/InterNoVec)
+                // and FOURMV (Inter4V) candidates.
+                //
+                // Cost = SAD(MC residual) + λ * bits, where:
+                //   * SAD is summed across the 4 luma 8×8 blocks of the
+                //     MB. Single-MV mode uses the same MV everywhere,
+                //     FOURMV mode uses each block's own MV.
+                //   * `bits` is a coarse proxy: single-MV ≈ MV-delta cost
+                //     for one component pair; FOURMV ≈ 8 raw type bits
+                //     plus 4 × (MV-delta cost) for blocks whose chosen
+                //     wire type is `Delta` (we always pick `Delta` for
+                //     non-zero block MVs and `NoVec` for zero — never
+                //     emit candidate-cycle types from the encoder).
+                //
+                // We only consider FOURMV when at least one block's MV
+                // diverges from the whole-MB MV by ≥ 2 qpel units in
+                // either component — otherwise the 4 MVs are all the
+                // same and FOURMV is pure overhead.
+                let single_mv = Mv {
+                    x: q_dx as i16,
+                    y: q_dy as i16,
+                };
+                let mut fourmv_diverges = false;
+                for bi in 0..4usize {
+                    let dx = (block_mvs[bi].x as i32 - single_mv.x as i32).abs();
+                    let dy = (block_mvs[bi].y as i32 - single_mv.y as i32).abs();
+                    if dx >= 2 || dy >= 2 {
+                        fourmv_diverges = true;
+                        break;
+                    }
+                }
+
+                // SAD residual estimate: re-use the qpel SAD helpers.
+                // We score luma only — chroma residual is a small fraction
+                // of the total and chroma MVs are derived in both modes.
+                let mut sad_single = 0u64;
+                let mut sad_fourmv = 0u64;
+                for bi in 0..4usize {
+                    let bx = mb_x + if bi & 1 != 0 { 8 } else { 0 };
+                    let by = mb_y + if bi & 2 != 0 { 8 } else { 0 };
+                    sad_single += sad8x8_qpel(
+                        new_y,
+                        prev_y,
+                        width,
+                        height,
+                        bx,
+                        by,
+                        single_mv.x as i32,
+                        single_mv.y as i32,
+                    );
+                    sad_fourmv += sad8x8_qpel(
+                        new_y,
+                        prev_y,
+                        width,
+                        height,
+                        bx,
+                        by,
+                        block_mvs[bi].x as i32,
+                        block_mvs[bi].y as i32,
+                    );
+                }
+
                 // -- 2. Predictor + candidate state, mirroring the decoder.
                 let (ctx_val, candidate0, candidate1, new_pos) = enc_vector_predictors(
                     &mb_info,
@@ -1038,15 +1147,43 @@ impl Vp6Encoder {
 
                 // -- 3. Choose mb_type. Picking InterNoVecPf when the best
                 // MV is zero keeps the bitstream tight (no MV bits) and
-                // matches the decoder's expectation for skip MBs.
-                let want_mv = Mv {
-                    x: q_dx as i16, // already in quarter-pel luma units
-                    y: q_dy as i16,
-                };
-                let new_type = if want_mv.x == 0 && want_mv.y == 0 {
+                // matches the decoder's expectation for skip MBs. The
+                // FOURMV branch fires only when (a) the per-block MVs
+                // diverge from the whole-MB MV by ≥ 2 qpel and (b) the
+                // FOURMV Lagrangian cost beats the single-MV cost — see
+                // §1c above for the cost shape.
+                let want_mv = single_mv;
+                let single_type = if want_mv.x == 0 && want_mv.y == 0 {
                     tables::Vp56Mb::InterNoVecPf
                 } else {
                     tables::Vp56Mb::InterDeltaPf
+                };
+
+                // Bit-cost estimates: λ * bits, with λ = qp.
+                let lambda = self.qp as u64;
+                let single_bits = if single_type == tables::Vp56Mb::InterDeltaPf {
+                    mv_bit_cost_estimate(want_mv.x as i32, want_mv.y as i32)
+                } else {
+                    0
+                };
+                let mut fourmv_bits: u64 = 8; // 4 × 2 raw type bits
+                for bi in 0..4usize {
+                    if block_mvs[bi].x != 0 || block_mvs[bi].y != 0 {
+                        fourmv_bits = fourmv_bits.saturating_add(mv_bit_cost_estimate(
+                            block_mvs[bi].x as i32,
+                            block_mvs[bi].y as i32,
+                        ));
+                    }
+                }
+
+                let cost_single = sad_single.saturating_add(lambda.saturating_mul(single_bits));
+                let cost_fourmv = sad_fourmv.saturating_add(lambda.saturating_mul(fourmv_bits));
+
+                let new_type = if self.allow_fourmv && fourmv_diverges && cost_fourmv < cost_single
+                {
+                    tables::Vp56Mb::Inter4V
+                } else {
+                    single_type
                 };
 
                 // -- 4. Emit MB-type into partition 1.
@@ -1058,21 +1195,118 @@ impl Vp6Encoder {
                     encode_pmbt_tree(&mut enc, &model.mb_type[ctx][prev_type as usize], new_type);
                 }
 
-                // -- 5. Emit MV delta into partition 1 if this MB has one.
-                let stored_mv = if new_type == tables::Vp56Mb::InterDeltaPf {
-                    let base = if vector_candidate_pos < 2 {
-                        candidate0
-                    } else {
-                        Mv::default()
-                    };
-                    let delta_x = want_mv.x as i32 - base.x as i32;
-                    let delta_y = want_mv.y as i32 - base.y as i32;
-                    encode_mv_component(&mut enc, &model, 0, delta_x);
-                    encode_mv_component(&mut enc, &model, 1, delta_y);
-                    want_mv
-                } else {
-                    Mv::default()
-                };
+                // -- 5. Emit MV delta(s) into partition 1.
+                //
+                // Single-MV path: one component pair via
+                //   `parse_vector_adjustment` (PVA short / FDV long tree).
+                // FOURMV path: 4 × (2 raw type bits + optional delta MV
+                //   pair) per `vp56_decode_4mv` in `decoder.rs`. We pick
+                //   wire type 0 (NoVec) for zero block MVs and wire type
+                //   2 (Delta) otherwise — never types 3/4 (candidate
+                //   cycle), since the encoder doesn't pre-mirror the
+                //   decoder's per-block candidate state.
+                //
+                // Per-block MV deltas are taken against `vector_candidate[0]`
+                // when `vector_candidate_pos < 2` (mirror of
+                //   `parse_vector_adjustment`'s seed branch). The MB-type-
+                //   tree call above doesn't change `vector_candidate_pos`,
+                //   so the same `candidate0` seed applies to every Delta
+                //   block in the 4MV path.
+                let stored_mv;
+                let mut block_mv_full = [Mv::default(); 6];
+                match new_type {
+                    tables::Vp56Mb::InterDeltaPf => {
+                        let base = if vector_candidate_pos < 2 {
+                            candidate0
+                        } else {
+                            Mv::default()
+                        };
+                        let delta_x = want_mv.x as i32 - base.x as i32;
+                        let delta_y = want_mv.y as i32 - base.y as i32;
+                        encode_mv_component(&mut enc, &model, 0, delta_x);
+                        encode_mv_component(&mut enc, &model, 1, delta_y);
+                        for b in 0..4 {
+                            block_mv_full[b] = want_mv;
+                        }
+                        // Single-MV path: chroma uses the same MV.
+                        block_mv_full[4] = want_mv;
+                        block_mv_full[5] = want_mv;
+                        stored_mv = want_mv;
+                    }
+                    tables::Vp56Mb::Inter4V => {
+                        // Wire layout per `decode_4mv` in `decoder.rs`:
+                        //   1) 4 × 2 raw bits — block type tags, ALL
+                        //      tags emitted first, BEFORE any delta MV.
+                        //      Decoded as `t = (v != 0) ? v + 1 : 0`,
+                        //      so we emit raw=0 for NoVec (decoded
+                        //      type 0) and raw=1 for Delta (decoded
+                        //      type 2). We never emit candidate-cycle
+                        //      types (raw=2 → t=3, raw=3 → t=4) since
+                        //      the encoder doesn't pre-mirror the
+                        //      decoder's per-block candidate state.
+                        //   2) For each block whose tag = Delta, one
+                        //      MV-component delta pair via
+                        //      `parse_vector_adjustment` semantics.
+                        //
+                        // Critical: tags MUST come first in the wire
+                        // stream (interleaving them with the deltas
+                        // mis-frames the decoder).
+                        let base = if vector_candidate_pos < 2 {
+                            candidate0
+                        } else {
+                            Mv::default()
+                        };
+                        // Phase 1: emit all 4 type tags first.
+                        for bi in 0..4usize {
+                            let mv = block_mvs[bi];
+                            let is_zero = mv.x == 0 && mv.y == 0;
+                            let raw = if is_zero { 0u32 } else { 1u32 };
+                            enc.put_bits(2, raw);
+                        }
+                        // Phase 2: emit per-block deltas in order; mirror
+                        // the decoder's loop so MV-component prob updates
+                        // arrive in the same sequence.
+                        let mut sum_x = 0i32;
+                        let mut sum_y = 0i32;
+                        for bi in 0..4usize {
+                            let mv = block_mvs[bi];
+                            let is_zero = mv.x == 0 && mv.y == 0;
+                            if !is_zero {
+                                let dx = mv.x as i32 - base.x as i32;
+                                let dy = mv.y as i32 - base.y as i32;
+                                encode_mv_component(&mut enc, &model, 0, dx);
+                                encode_mv_component(&mut enc, &model, 1, dy);
+                            }
+                            block_mv_full[bi] = mv;
+                            sum_x += mv.x as i32;
+                            sum_y += mv.y as i32;
+                        }
+                        // Chroma MV = round-shifted sum (mirror of
+                        // `decode_4mv`'s `RSHIFT(sum, 2)` chroma derive).
+                        let shifted = |v: i32| -> i16 {
+                            let r = if v >= 0 {
+                                (v + 2) >> 2
+                            } else {
+                                -(((-v) + 2) >> 2)
+                            };
+                            r as i16
+                        };
+                        let chroma_mv = Mv {
+                            x: shifted(sum_x),
+                            y: shifted(sum_y),
+                        };
+                        block_mv_full[4] = chroma_mv;
+                        block_mv_full[5] = chroma_mv;
+                        // Decoder stashes `scratch.mv[3]` into
+                        //   `macroblocks[].mv` for 4V — see `decode_mv`'s
+                        //   Inter4V branch in `decoder.rs`.
+                        stored_mv = block_mvs[3];
+                    }
+                    _ => {
+                        // InterNoVecPf and any other no-MV variants.
+                        stored_mv = Mv::default();
+                    }
+                }
                 let _ = candidate1;
 
                 // -- 6. Update per-MB cache for downstream predictors.
@@ -1116,6 +1350,12 @@ impl Vp6Encoder {
                     );
 
                     // -- (b) Materialise the integer-pel MC prediction.
+                    // For Inter4V (FOURMV) the per-block luma MVs differ
+                    //   and the chroma MVs are the round-shifted average
+                    //   of the 4 luma MVs (mirror of `decode_4mv`'s
+                    //   chroma derive). For single-MV inter
+                    //   (`InterDeltaPf` / `InterNoVecPf`) every entry of
+                    //   `block_mv_full` already holds the same MV.
                     let mut mc_tile = [0i32; 64];
                     sample_mc_tile(
                         b,
@@ -1128,7 +1368,7 @@ impl Vp6Encoder {
                         uv_stride,
                         height,
                         uv_h,
-                        stored_mv,
+                        block_mv_full[b],
                         &mut mc_tile,
                     );
 
@@ -1914,6 +2154,145 @@ fn sad16x16_qpel(
         }
     }
     acc
+}
+
+/// SAD over a single 8×8 luma block at integer-pel offset `(dx, dy)`
+/// against the previous frame. `(blk_x, blk_y)` is the top-left pixel of
+/// the 8×8 block in the current frame. Used by [`motion_search_8x8`] for
+/// the per-block stage of the FOURMV path.
+fn sad8x8(cur: &[u8], prev: &[u8], stride: usize, blk_x: i32, blk_y: i32, dx: i32, dy: i32) -> u64 {
+    let mut acc = 0u64;
+    for r in 0..8i32 {
+        let cy = (blk_y + r) as usize;
+        let py = (blk_y + r + dy) as usize;
+        for c in 0..8i32 {
+            let cx = (blk_x + c) as usize;
+            let px = (blk_x + c + dx) as usize;
+            let a = cur[cy * stride + cx] as i32;
+            let b = prev[py * stride + px] as i32;
+            acc += (a - b).unsigned_abs() as u64;
+        }
+    }
+    acc
+}
+
+/// SAD over a single 8×8 luma block against a quarter-pel MV `(qx, qy)`.
+/// 8×8 mirror of [`sad16x16_qpel`] used by the FOURMV per-block search.
+#[allow(clippy::too_many_arguments)]
+fn sad8x8_qpel(
+    cur: &[u8],
+    prev: &[u8],
+    stride: usize,
+    height: usize,
+    blk_x: i32,
+    blk_y: i32,
+    qx: i32,
+    qy: i32,
+) -> u64 {
+    let dx = qx / 4;
+    let dy = qy / 4;
+    let x8 = (qx & 3) * 2;
+    let y8 = (qy & 3) * 2;
+    let mut acc = 0u64;
+    for r in 0..8i32 {
+        let cy = (blk_y + r) as usize;
+        for c in 0..8i32 {
+            let cx = (blk_x + c) as usize;
+            let mc =
+                bilinear_luma_sample(prev, stride, height, blk_x + dx + c, blk_y + dy + r, x8, y8);
+            let a = cur[cy * stride + cx] as i32;
+            acc += (a - mc).unsigned_abs() as u64;
+        }
+    }
+    acc
+}
+
+/// Per-8×8 quarter-pel motion search seeded around `(seed_qx, seed_qy)`.
+/// Mirrors the qpel-refine half of [`motion_search`] but for an 8×8
+/// luma block instead of the 16×16 MB. Used by the FOURMV path: the
+/// caller seeds with the whole-MB integer winner so the block search
+/// picks up the global motion plus any per-block divergence.
+///
+/// Search shape: integer-pel SAD across `±search` pels around the seed
+/// (clamped to plane bounds), then a `±3 qpel` refine around the
+/// integer winner. Returns `(qx, qy)` in luma quarter-pel units.
+#[allow(clippy::too_many_arguments)]
+fn motion_search_8x8(
+    cur: &[u8],
+    prev: &[u8],
+    width: usize,
+    height: usize,
+    blk_x: i32,
+    blk_y: i32,
+    seed_qx: i32,
+    seed_qy: i32,
+    search: i32,
+    qp: u8,
+) -> (i32, i32) {
+    let pw = width as i32;
+    let ph = height as i32;
+    let seed_int_x = seed_qx / 4;
+    let seed_int_y = seed_qy / 4;
+
+    // Integer-pel bounds: keep the candidate 8×8 block inside the plane.
+    let max_dx = (pw - 8 - blk_x).min(seed_int_x + search);
+    let min_dx = (-blk_x).max(seed_int_x - search);
+    let max_dy = (ph - 8 - blk_y).min(seed_int_y + search);
+    let min_dy = (-blk_y).max(seed_int_y - search);
+
+    let mut best_int_dx = seed_int_x.clamp(min_dx, max_dx);
+    let mut best_int_dy = seed_int_y.clamp(min_dy, max_dy);
+    let mut best_int_sad = sad8x8(cur, prev, width, blk_x, blk_y, best_int_dx, best_int_dy);
+    for dy in min_dy..=max_dy {
+        for dx in min_dx..=max_dx {
+            if dx == best_int_dx && dy == best_int_dy {
+                continue;
+            }
+            let s = sad8x8(cur, prev, width, blk_x, blk_y, dx, dy);
+            if s < best_int_sad {
+                best_int_sad = s;
+                best_int_dx = dx;
+                best_int_dy = dy;
+            }
+        }
+    }
+
+    // qpel refine.
+    let lambda = qp as u64;
+    let int_qx = best_int_dx * 4;
+    let int_qy = best_int_dy * 4;
+    let min_q_x = (-blk_x * 4).max(int_qx - 4);
+    let max_q_x = ((pw - 9 - blk_x) * 4).min(int_qx + 4);
+    let min_q_y = (-blk_y * 4).max(int_qy - 4);
+    let max_q_y = ((ph - 9 - blk_y) * 4).min(int_qy + 4);
+
+    let int_bits = mv_bit_cost_estimate(int_qx, int_qy);
+    let mut best_qx = int_qx;
+    let mut best_qy = int_qy;
+    let mut best_cost = best_int_sad.saturating_add(lambda.saturating_mul(int_bits));
+
+    for dqy in -3..=3i32 {
+        for dqx in -3..=3i32 {
+            if dqx == 0 && dqy == 0 {
+                continue;
+            }
+            let qx = int_qx + dqx;
+            let qy = int_qy + dqy;
+            if qx < min_q_x || qx > max_q_x || qy < min_q_y || qy > max_q_y {
+                continue;
+            }
+            let sad = sad8x8_qpel(cur, prev, width, height, blk_x, blk_y, qx, qy);
+            let bits = mv_bit_cost_estimate(qx, qy);
+            let cost = sad.saturating_add(lambda.saturating_mul(bits));
+            if cost < best_cost {
+                best_cost = cost;
+                best_qx = qx;
+                best_qy = qy;
+            }
+        }
+    }
+
+    (best_qx, best_qy)
 }
 
 /// Bilinear luma sample at `(base_x + frac_x/8, base_y + frac_y/8)`

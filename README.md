@@ -28,7 +28,25 @@ Specification* (vendored in this workspace at
 FFmpeg's reverse-engineered `libavcodec/vp56.c` + `libavcodec/vp6.c`
 (+ `vp3dsp.c` for the IDCT / loop filter + `vp6dsp.c` for the 2D
 bicubic interpolator + `vpx_rac.h` for the bool coder), but encoder
-audit rounds (r19+) lean on the spec directly. r22 lands the spec
+audit rounds (r19+) lean on the spec directly. **r27 wires INTER_FOURMV
+on the encoder side**: `encode_inter_frame` now considers
+`Vp56Mb::Inter4V` per MB. After the existing whole-MB qpel motion
+search, a per-8×8 search runs (seeded from the integer winner with a
+tight `±2` pel window + `±3` qpel refine) and a Lagrangian RDO step
+picks FOURMV over `InterDeltaPf` when (a) at least one block's MV
+diverges from the whole-MB MV by ≥ 2 qpel and (b) the FOURMV cost
+(luma SAD across 4 blocks + λ × proxy bits) strictly beats the
+single-MV cost. Wire emission mirrors `decode_4mv` in `decoder.rs`:
+4 × 2 raw type bits FIRST (raw 0 = NoVec, raw 1 = Delta), then
+per-block deltas. Per-block residual encoding picks up each block's MV
+automatically; chroma MV is the round-shifted average of the 4 luma MVs
+(mirror of the decoder's `RSHIFT(sum, 2)` chroma derive). New public
+field `Vp6Encoder::allow_fourmv: bool` (default `true`) gates the
+branch; setting to `false` reproduces pre-r27 single-MV behaviour. On a
+32×32 diverging-blocks fixture (each 8×8 quadrant of every MB has a
+distinct optimal MV), the FOURMV encode is 292 bytes vs 430 for
+single-MV (~32% smaller); ffmpeg's vp6f decoder accepts the FOURMV
+bitstream cleanly. r22 lands the spec
 page 28 Table 5 ctx mapping for `vector_predictors` (`ctx = 2 -
 nb_pred`) on both decoder + encoder sides. **r23 unblocks ffmpeg
 inter-frame interop**: encoder default `sub_version` is now 6
@@ -128,6 +146,23 @@ inter pair cleanly.
 - **Reference-frame management**: tracks `prev_frame` and
   `golden_frame` planes inside the decoder. Keyframes overwrite both;
   inter frames refresh golden when the golden-frame flag is set.
+- **Encoder INTER_FOURMV / per-8×8 motion vectors** (r27+):
+  `Vp6Encoder::encode_inter_frame` considers `Vp56Mb::Inter4V` as a
+  third candidate alongside `InterNoVecPf` / `InterDeltaPf`. Per-MB
+  pipeline: whole-MB qpel ME → per-8×8 qpel ME (`motion_search_8x8`,
+  seeded from the whole-MB integer winner) → Lagrangian RDO between
+  single-MV and FOURMV costs. FOURMV fires when (a) at least one
+  block's MV diverges from the whole-MB MV by ≥ 2 qpel AND (b) the
+  FOURMV cost strictly beats single-MV. Wire format mirrors
+  `decode_4mv`: 4 × 2 raw type bits (raw 0 = NoVec, raw 1 = Delta) all
+  emitted before any delta, then per-block MV deltas in order. Chroma
+  MVs derived as the round-shifted average of the 4 luma MVs. Public
+  `allow_fourmv: bool` (default `true`) gates the branch; turning it
+  off reproduces pre-r27 single-MV behaviour for A/B comparison. On
+  the diverging-blocks fixture (each 8×8 quadrant within every MB has
+  a distinct optimal MV) the FOURMV encode is 32% smaller than the
+  single-MV encode at QP 12; ffmpeg's vp6f decoder cross-decodes the
+  FOURMV bitstream cleanly.
 - **Encoder golden-frame refresh** (r26+):
   `Vp6Encoder::encode_inter_frame_with_golden(prev_*, golden_*,
   new_*, …)` accepts both refs and per-MB picks whichever beats the
@@ -153,8 +188,8 @@ inter pair cleanly.
 
 ### Test coverage
 
-The crate ships 41 library unit tests plus 36 integration tests
-across 7 files (77 tests total):
+The crate ships 41 library unit tests plus 38 integration tests
+across 7 files (79 tests total):
 
 - **Unit tests** for the range coder round-trip, the IDCT (DC-only flat
   block, add-zero identity), the loop filter bounding-values table and
@@ -204,6 +239,15 @@ across 7 files (77 tests total):
   unmistakable. `r25_ffmpeg_decodes_qpel_inter_frame` cross-decodes
   the stripes packet through ffmpeg's vp6f decoder and asserts ≥ 20
   dB Y PSNR, confirming the qpel MV bits parse cleanly.
+- `tests/encoder_roundtrip.rs::r27_fourmv_inter_smaller_than_single_mv_on_diverging_blocks`
+  / `r27_ffmpeg_decodes_fourmv_inter_frame` (new in r27) — pin the
+  FOURMV path against a 32×32 diverging-blocks fixture (each 8×8
+  quadrant of every MB has a distinct optimal MV). The first asserts
+  the FOURMV-on encode is ≤ 95% of the FOURMV-off encode (we observe
+  ~68% in practice — 292 vs 430 bytes), keyframes are byte-identical
+  across `allow_fourmv` values, and own-decoder Y PSNR ≥ 20 dB. The
+  second cross-decodes the key + FOURMV inter pair through ffmpeg's
+  vp6f decoder and asserts both packets parse cleanly.
 - `tests/encoder_roundtrip.rs::golden_refresh_*` (new in r26) — five
   guards on the new `encode_inter_frame_with_golden` API:
   `golden_refresh_cadence_fires_on_period` pins the counter

@@ -9,6 +9,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **r27 — INTER_FOURMV (per-8×8 motion vectors, encoder).**
+  `Vp6Encoder::encode_inter_frame` now considers `Vp56Mb::Inter4V`
+  (the spec's "FOURMV" mb_type) as a candidate alongside the single-MV
+  `InterDeltaPf` / `InterNoVecPf` path. Per-MB pipeline:
+  1. Whole-MB qpel motion search (existing r25 behaviour) → single MV.
+  2. **NEW**: per-8×8 luma motion search (`motion_search_8x8`) seeded
+     from the whole-MB integer winner with a tight `±2` pel window plus
+     a `±3 qpel` refine — same shape as the whole-MB qpel refine, but
+     scoped to the block.
+  3. RDO on `cost = SAD + λ * bits`. SAD is summed across the 4 luma
+     8×8 blocks (single-MV reuses one MV everywhere; FOURMV uses each
+     block's own MV). `bits` is a coarse proxy: single-MV ≈ MV-delta
+     cost for one component pair; FOURMV ≈ 8 raw type bits + 4 ×
+     (MV-delta cost) for non-zero blocks. FOURMV fires only when (a)
+     per-block MVs diverge from the whole-MB MV by ≥ 2 qpel in either
+     component AND (b) the FOURMV cost strictly beats the single-MV
+     cost.
+  4. Wire emission mirrors `decode_4mv` in `decoder.rs`: 4 × 2 raw
+     bits for block-type tags (raw 0 = NoVec, raw 1 = Delta — never
+     candidate-cycle types 2/3 since the encoder doesn't pre-mirror
+     per-block candidate state), THEN per-block deltas in order.
+     Critical: tags emitted before deltas, otherwise the decoder
+     desynchronises (per-block deltas reach `parse_vector_adjustment`
+     mid-tag-read).
+  5. Per-block residual encoding picks up the per-block MV automatically
+     via `block_mv_full[b]` threaded into `sample_mc_tile`. Chroma MVs
+     are derived as the round-shifted average of the 4 luma MVs (mirror
+     of the decoder's `RSHIFT(sum, 2)` chroma derive).
+  6. The MV stored back into `mb_info[]` for downstream MV-candidate
+     lookup is `block_mvs[3]` (decoder's `decode_mv` Inter4V branch
+     uses `scratch.mv[3]` for the same purpose).
+
+  Public API surface: new field `Vp6Encoder::allow_fourmv: bool`
+  (default `true`). Setting to `false` reproduces pre-r27 single-MV
+  behaviour for A/B testing and regression pinning. Honoured by
+  `encode_inter_frame` only — the golden-aware path
+  (`encode_inter_frame_with_golden`) stays single-MV regardless because
+  `tables::REFERENCE_FRAME[Inter4V] = Previous`, so FOURMV has no role
+  on a golden-ref MB.
+
+  On a 32×32 fixture where each 8×8 quadrant of every MB has a
+  distinct optimal motion (`build_diverging_block_motion`), the FOURMV
+  encode is 292 bytes vs 430 bytes for the single-MV encode — a 32%
+  reduction. ffmpeg's vp6f decoder accepts the FOURMV bitstream
+  cleanly. The pre-r27 `inter_frame_horizontal_shift_uses_mv` fixture
+  (no per-block divergence) records the same PSNR as before; the
+  single-MV path is unchanged on smooth-motion content.
+
+- `tests/encoder_roundtrip.rs::r27_fourmv_inter_smaller_than_single_mv_on_diverging_blocks`:
+  pins the wire-size win at ≤ 95% of the single-MV baseline on the
+  diverging-blocks fixture (we observe ~68% in practice). Also pins
+  Y PSNR through our own decoder ≥ 20 dB and the fact that FOURMV-on
+  vs FOURMV-off keyframe encodes are byte-for-byte identical (only the
+  inter payload moves).
+- `tests/encoder_roundtrip.rs::r27_ffmpeg_decodes_fourmv_inter_frame`:
+  pins ffmpeg cross-decode of the FOURMV bitstream layer. Mirrors
+  `r25_ffmpeg_decodes_qpel_inter_frame` shape (mux key + inter into a
+  2-tag FLV stream, run ffmpeg's vp6f decoder, assert it produces 2
+  frames of YUV).
+
 - **r26 — golden-frame refresh (encoder).**
   New `Vp6Encoder::encode_inter_frame_with_golden(prev_*, golden_*,
   new_*, w, h, search)` accepts both a previous-frame reference and a
