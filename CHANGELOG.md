@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-vp6/compare/v0.0.4...v0.0.5) - 2026-05-03
+
+### Other
+
+- commit module + roundtrip tests previously left untracked
+- vp6 r28: Huffman coefficient path (encoder + decoder)
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- r27 — INTER_FOURMV (per-8×8 motion vectors, encoder)
+- r26 — golden-frame refresh + per-MB golden-vs-previous selection (encoder)
+- r25 — quarter-pel sub-pel motion estimation (encoder)
+- port to DoS-limits framework (true zero-copy arena receive)
+- r24 — inter residual coefficient encoding
+- r23 — Vp3VersionNo spec fix unblocks ffmpeg inter interop
+- r22 — vector_predictors ctx mapping spec fix + coeff shortcut audit
+- r21 — DEF_MB_TYPES_STATS pair-order spec fix
+- r20 — Buff2Offset spec compliance + ffmpeg interop scaffolding
+- round 19 — partial inter-frame audit (ffmpeg still rejects)
+- round 18 — diagnostic dump for inter-frame ffmpeg interop
+- round 17 — encoder MV emission + integer-pel ME
+- adopt slim VideoFrame shape
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - **r28 — Huffman coefficient path (encoder + decoder).**
