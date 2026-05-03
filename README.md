@@ -89,7 +89,27 @@ pinning golden to the keyframe brings the inter-frame total wire size
 from 378 bytes to 282 bytes (~25% smaller) vs refreshing every frame
 — the loop-back A frames pick golden for every MB and emit
 near-zero residual. ffmpeg cross-decodes the key + golden-refresh
-inter pair cleanly.
+inter pair cleanly. **r28 adds the Huffman coefficient path on both
+encoder and decoder sides.** The frame-header `UseHuffman` bit (spec
+page 23 Table 1) selects between the existing bool-coded coefficient
+partition and a new raw-bit Huffman partition described in spec
+sections 7.2 + 13.1 + 13.2.2 + 13.3.2 + 13.3.3.2 + 13.4. Trees are
+built per `VP6_CreateHuffmanTree` from probability vectors derived
+via the spec's `DCTTokenBoolTreeToHuffProbs` /
+`ZRLBoolTreeToHuffProbs` conversions; the DCT-token tree (12 leaves),
+AC-band trees (prec×plane×band = 24 trees) and ZRL trees (2) are all
+rebuilt per frame from the post-update bool-coded model state.
+Cross-block DC-zero and AC1-EOB runs use the spec page 81
+`1 + R(2)` raw-bit encoding. New encoder method
+`Vp6Encoder::encode_keyframe_huffman(...)` writes a keyframe whose
+partition 2 is Huffman-coded; the decoder's previous
+`Error::Unsupported` for `use_huffman = 1` is replaced by the new
+parse path. Both sides share the bool-coded DC-predictor /
+dequantiser plumbing (`mb::add_predictors_dc`), so the
+reconstruction model is byte-identical to the bool path — only the
+coefficient-bitstream emission changes. Round-trips through our own
+decoder; ffmpeg's vp6f decoder accepts the Huffman keyframe
+(`tests/huffman_roundtrip.rs::ffmpeg_decodes_huffman_keyframe`).
 
 ### Implemented
 
@@ -177,13 +197,26 @@ inter pair cleanly.
   packet cleanly. Reduces wire size on periodic-structure content
   (animation loop, slideshow) — see CHANGELOG / fixture results.
 
+- **Huffman coefficient path** (r28+, encoder + decoder). When a VP6F
+  stream sets `UseHuffman = 1` in the frame header (per VP6 spec page
+  23 Table 1) the second data partition (DCT coefficients) is read /
+  written as a raw MSB-first bitstream of Huffman codewords instead of
+  the range-coder bool path. Trees are constructed per spec section 7.2
+  (`VP6_CreateHuffmanTree`) from the bool-coded probability vectors via
+  the spec's `DCTTokenBoolTreeToHuffProbs` /
+  `ZRLBoolTreeToHuffProbs` conversions (sections 13.1 and 13.3.3.2).
+  The DC token path uses the `DCT_EOB` / `ZERO` / `ONE` …
+  `DCT_VAL_CATEGORY6` token set (spec page 57 Table 18); cross-block
+  DC-zero and AC1-EOB runs follow the spec page 81 `1 + R(2)` raw-bit
+  encoding. Encoder side: `Vp6Encoder::encode_keyframe_huffman(...)`
+  emits a keyframe whose partition 2 is Huffman-coded; the existing
+  `encode_keyframe(...)` continues to emit the bool path. Decoder side:
+  the `UseHuffman` bit in the picture header is now respected — both
+  paths share the same DC predictor / dequantiser plumbing
+  (`mb::add_predictors_dc`).
+
 ### Not yet implemented (deferrals)
 
-- **Huffman coefficient path** (`vp6_parse_coeff_huffman`): the older
-  optional path some VP6 streams use. When the frame header signals
-  `use_huffman = 1`, the decoder returns `Error::Unsupported`. Out of
-  scope for the first release; the main FLV sample and most real
-  streams use the range-coder path.
 - **Interlaced profile**: parsed but not exercised end-to-end.
 
 ### Test coverage

@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **r28 — Huffman coefficient path (encoder + decoder).**
+  Implements the optional VP6 second-data-partition Huffman coding
+  scheme described in spec sections 7.2 (Huffman Decoder), 13.1 (DCT
+  Token Huffman Tree), 13.2.2 (Huffman Decoding DC Values), 13.3.2
+  (Decoding Huffman AC Coefficients), 13.3.3.2 (Decoding Huffman AC
+  Zero Runs), and 13.4 (Decoding Huffman EOB and DC 0 Runs). New
+  module `oxideav_vp6::huffman` exports:
+  * `BitReader` / `BitWriter` — MSB-first raw bit IO matching the
+    spec's `R(n)` operator in the Huffman path.
+  * `HuffTree` — tree built per `VP6_CreateHuffmanTree` (spec page
+    14) with pre-computed `(codeword, length)` per symbol so encode
+    is O(1) per token. Decode walks the tree with `read_bit()`.
+  * `dct_token_bool_tree_to_huff_probs` /
+    `zrl_bool_tree_to_huff_probs` — the spec's
+    `DCTTokenBoolTreeToHuffProbs` / `ZRLBoolTreeToHuffProbs` exact
+    ports.
+  * `HuffmanTreeSet` — DC trees [Y, UV], AC trees [prec][plane][band],
+    ZRL trees [band] — built from current model state.
+  * `encode_block_huffman` / `decode_block_huffman` — per-block
+    coefficient emission + parse with the cross-block DC-zero and
+    AC1-EOB run state in `HuffmanFrameState`.
+  * `encode_eob_run` / `decode_eob_run` — spec page 81 raw-bit run
+    encoding (`1 + R(2)` … `11 + R(6)`).
+  Encoder side: new `Vp6Encoder::encode_keyframe_huffman(...)` method
+  emits a keyframe with `MultiStream = 1` + `UseHuffman = 1`, header
+  + bool-coded partition 1 (model updates) + Huffman partition 2.
+  Decoder side: the previous `Error::Unsupported` for `use_huffman ==
+  1` is replaced; the decoder builds `HuffmanTreeSet` after the
+  bool-coded picture-header model updates, then routes per-MB
+  coefficient decode through a new `parse_coeff_huffman` helper that
+  mirrors `mb::parse_coeff` but reads Huffman tokens instead. New
+  test file `tests/huffman_roundtrip.rs` exercises:
+  * `huffman_keyframe_wire_markers` — pins MultiStream / Vp3VersionNo
+    / Buff2Offset header bytes.
+  * `huffman_keyframe_flat_gray_roundtrip` — flat Y=128 keyframe
+    roundtrip via in-tree decoder.
+  * `huffman_keyframe_constant_color_roundtrip` — non-128 flat color
+    exercises non-zero DC tokens.
+  * `huffman_keyframe_gradient_roundtrip` — vertical gradient
+    exercises every Huffman token category.
+  * `ffmpeg_decodes_huffman_keyframe` — opt-in ffmpeg vp6f
+    cross-decode of the Huffman keyframe.
+  10 huffman-module unit tests pin tree construction, bit-IO
+  roundtrip, EOB-run / zero-run roundtrip, and per-block encode +
+  decode roundtrips for empty / DC-only / general / cross-block-run
+  blocks.
+
 - **r27 — INTER_FOURMV (per-8×8 motion vectors, encoder).**
   `Vp6Encoder::encode_inter_frame` now considers `Vp56Mb::Inter4V`
   (the spec's "FOURMV" mb_type) as a candidate alongside the single-MV

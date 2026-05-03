@@ -40,6 +40,7 @@ use oxideav_core::{
 };
 
 use crate::frame_header::{FrameHeader as Vp6FrameHeader, FrameKind};
+use crate::huffman::{self, decode_block_huffman, BitReader, HuffmanFrameState, HuffmanTreeSet};
 use crate::mb::{self, BlockScratch, MacroblockInfo, Mv, RefKind};
 use crate::models::{self, Vp6Model};
 use crate::range_coder::RangeCoder;
@@ -248,11 +249,6 @@ impl Vp6Stream {
         }
 
         let use_huffman = rac.get_bit() != 0;
-        if use_huffman {
-            return Err(Error::unsupported(
-                "VP6: huffman coefficient path not yet implemented",
-            ));
-        }
 
         let coeff_offset_bytes = header.coeff_offset_bytes.max(0) as usize;
 
@@ -275,7 +271,10 @@ impl Vp6Stream {
         let _ = filter_selection;
         let _ = golden_frame_flag;
 
-        let mut rac2_storage: Option<RangeCoder<'_>> = if coeff_offset_bytes > 0 {
+        // Bool-coded second partition (if any). For the Huffman path
+        // we leave this as `None` and instead build a [`BitReader`]
+        // over the partition-2 byte slice below.
+        let mut rac2_storage: Option<RangeCoder<'_>> = if !use_huffman && coeff_offset_bytes > 0 {
             let coeff_start = rac_start + coeff_offset_bytes;
             if coeff_start >= data.len() {
                 return Err(Error::invalid("VP6: coeff partition past end"));
@@ -284,6 +283,35 @@ impl Vp6Stream {
         } else {
             None
         };
+
+        // Huffman path: build the per-frame tree set + a raw bit
+        // reader over partition 2. Spec page 16 Figure 1 right branch
+        // mandates `use_huffman = 1` always coexists with `MultiStream
+        // = 1` (i.e. a separate partition 2), so coeff_offset_bytes
+        // must be > 0 here. Per spec page 22 Figure 7 the per-MB walk
+        // is 4 Y → U → V and per spec section 7.2 + 13.* the partition
+        // is a raw MSB-first bitstream (no bool coder priming).
+        let huffman_partition: Option<&[u8]> = if use_huffman {
+            if coeff_offset_bytes == 0 {
+                return Err(Error::invalid(
+                    "VP6 huffman: requires MultiStream=1 + Buff2Offset",
+                ));
+            }
+            let coeff_start = rac_start + coeff_offset_bytes;
+            if coeff_start >= data.len() {
+                return Err(Error::invalid("VP6 huffman: coeff partition past end"));
+            }
+            Some(&data[coeff_start..])
+        } else {
+            None
+        };
+        let huffman_trees: Option<HuffmanTreeSet> = if use_huffman {
+            Some(HuffmanTreeSet::build(&self.model))
+        } else {
+            None
+        };
+        let mut huffman_reader: Option<BitReader<'_>> = huffman_partition.map(BitReader::new);
+        let mut huffman_state = HuffmanFrameState::default();
 
         let width = self.mb_width * 16;
         let height = self.mb_height * 16;
@@ -341,11 +369,23 @@ impl Vp6Stream {
                 cell.mb_type = mb_type;
                 cell.mv = stored_mv;
 
-                let coeff_rac: &mut RangeCoder<'_> = rac2_storage.as_mut().unwrap_or(&mut rac);
-                if !mb::parse_coeff(&self.model, &mut self.scratch, coeff_rac) {
-                    return Err(Error::invalid(format!(
-                        "VP6: coeff stream ended prematurely at mb ({mb_row},{mb_col})"
-                    )));
+                if let (Some(reader), Some(trees)) =
+                    (huffman_reader.as_mut(), huffman_trees.as_ref())
+                {
+                    parse_coeff_huffman(
+                        &self.model,
+                        &mut self.scratch,
+                        trees,
+                        reader,
+                        &mut huffman_state,
+                    )?;
+                } else {
+                    let coeff_rac: &mut RangeCoder<'_> = rac2_storage.as_mut().unwrap_or(&mut rac);
+                    if !mb::parse_coeff(&self.model, &mut self.scratch, coeff_rac) {
+                        return Err(Error::invalid(format!(
+                            "VP6: coeff stream ended prematurely at mb ({mb_row},{mb_col})"
+                        )));
+                    }
                 }
 
                 let ref_kind: RefKind = tables::REFERENCE_FRAME[mb_type as usize].into();
@@ -740,6 +780,71 @@ impl Vp6Decoder {
         }
         FrameInner::new(arena, &planes, header)
     }
+}
+
+/// Huffman counterpart to [`mb::parse_coeff`]. Decodes one MB's six
+/// 8×8 blocks from a raw [`BitReader`] over the second data partition,
+/// using the [`HuffmanTreeSet`] built from the post-update model.
+///
+/// Per spec page 22 Figure 7 the per-MB walk is `4 Y → U → V`, with the
+/// DC-zero / AC-EOB run state in [`HuffmanFrameState`] persisting
+/// across MBs within the same plane (per spec Table 19).
+///
+/// Coefficient layout matches the bool-coded path (`mb::parse_coeff`):
+/// the Huffman bitstream emits coefficients in `coeff_idx` order; we
+/// translate to the natural raster position via
+/// `permute[coeff_index_to_pos[coeff_idx]]` and apply the AC dequant
+/// scale before storing.
+fn parse_coeff_huffman(
+    model: &Vp6Model,
+    scratch: &mut BlockScratch,
+    trees: &HuffmanTreeSet,
+    br: &mut BitReader<'_>,
+    state: &mut HuffmanFrameState,
+) -> Result<()> {
+    let permute = &tables::IDCT_SCANTABLE;
+    for block in &mut scratch.block_coeff {
+        for c in block.iter_mut() {
+            *c = 0;
+        }
+    }
+
+    for b in 0..6usize {
+        let plane = huffman::block_plane_index(b);
+        let mut levels = [0i32; 64];
+        let mut dc_run = state.dc_run_len[plane];
+        let mut eob_run = state.ac1_eob_run_len[plane];
+        decode_block_huffman(br, trees, plane, &mut levels, &mut dc_run, &mut eob_run)?;
+        state.dc_run_len[plane] = dc_run;
+        state.ac1_eob_run_len[plane] = eob_run;
+
+        // Translate `coeff_idx`-ordered levels into the raster block
+        // coefficient buffer the IDCT consumes. DC at idx 0 lands at
+        // permute[0] = 0; AC are scaled by `dequant_ac` (DC is left
+        // un-scaled; the `add_predictors_dc` path multiplies it by
+        // `dequant_dc` after applying the predictor).
+        scratch.block_coeff[b][permute[0] as usize] = levels[0].clamp(-32768, 32767) as i16;
+        let mut last_nz_idx = 0usize;
+        for coeff_idx in 1..64usize {
+            let v = levels[coeff_idx];
+            if v == 0 {
+                continue;
+            }
+            let pos = model.coeff_index_to_pos[coeff_idx] as usize;
+            let perm = permute[pos] as usize;
+            let scaled = v.saturating_mul(scratch.dequant_ac);
+            scratch.block_coeff[b][perm] = scaled.clamp(-32768, 32767) as i16;
+            if coeff_idx > last_nz_idx {
+                last_nz_idx = coeff_idx;
+            }
+        }
+
+        let has_nonzero_dc = scratch.block_coeff[b][0] != 0;
+        scratch.left_block[tables::B6_TO_4[b] as usize].not_null_dc = has_nonzero_dc;
+        scratch.above_blocks[scratch.above_block_idx[b]].not_null_dc = has_nonzero_dc;
+        scratch.idct_selector[b] = model.coeff_index_to_idct_selector[last_nz_idx.min(63)];
+    }
+    Ok(())
 }
 
 /// Port of `vp56_decode_mv` / `vp6_parse_vector_adjustment` + the MB

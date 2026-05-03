@@ -18,6 +18,7 @@ pub mod decoder;
 pub mod dsp;
 pub mod encoder;
 pub mod frame_header;
+pub mod huffman;
 pub mod mb;
 pub mod models;
 pub mod range_coder;

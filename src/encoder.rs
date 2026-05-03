@@ -194,6 +194,7 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::huffman::{encode_block_huffman, BitWriter, HuffmanFrameState, HuffmanTreeSet};
 use crate::mb::{Mv, RefKind};
 use crate::models::Vp6Model;
 use crate::range_coder::RangeEncoder;
@@ -558,6 +559,365 @@ impl Vp6Encoder {
         // `golden_frame` slot (see decoder.rs:422), so the cadence
         // counter resets here too — the next inter frame is "0 inters
         // since golden refresh" by definition.
+        self.inter_frames_since_golden = 0;
+        Ok(out)
+    }
+
+    /// Encode a keyframe whose **second data partition (coefficients)**
+    /// is Huffman-coded rather than bool-coded. Picture-header / model
+    /// updates / mode info still ride through the bool coder in
+    /// partition 1; only the per-block DCT-token stream switches to the
+    /// raw-bit Huffman scheme described in spec sections 7.2 + 13.1 +
+    /// 13.2.2 + 13.3.2 + 13.3.3.2 + 13.4.
+    ///
+    /// Wire layout matches the spec page 16 Figure 1 right-hand path:
+    ///
+    /// 1. 8-byte fixed header (with `MultiStream = 1` so a `Buff2Offset`
+    ///    R(16) field is present, pointing at the start of the Huffman
+    ///    partition).
+    /// 2. Bool-coded partition 1: 2 skip bits, `use_huffman = 1`,
+    ///    coefficient model updates, MB-mode info (keyframes are all
+    ///    `Intra` so this is a single byte's worth — same as the
+    ///    standard keyframe path).
+    /// 3. Huffman partition 2: per MB, per block (4 Y → U → V), DC
+    ///    token followed by AC tokens until EOB or position 63.
+    ///
+    /// The reconstruction model on the decoder side mirrors
+    /// `encode_keyframe` exactly — same DCT scaling, same DC predictor,
+    /// same quantisation. Only the bitstream emission of the resulting
+    /// coefficient levels switches between bool and Huffman.
+    pub fn encode_keyframe_huffman(
+        &mut self,
+        y_plane: &[u8],
+        u_plane: &[u8],
+        v_plane: &[u8],
+        width: usize,
+        height: usize,
+    ) -> Result<EncodedFrame> {
+        if width == 0 || height == 0 || width % 16 != 0 || height % 16 != 0 {
+            return Err(Error::invalid(
+                "VP6 encode: width/height must be non-zero multiples of 16",
+            ));
+        }
+        let mb_width = width / 16;
+        let mb_height = height / 16;
+        if mb_width > 255 || mb_height > 255 {
+            return Err(Error::invalid(
+                "VP6 encode: simple-profile MB dims capped at 255",
+            ));
+        }
+        if y_plane.len() < width * height {
+            return Err(Error::invalid("VP6 encode: y plane too small"));
+        }
+        let uv_stride = width / 2;
+        let uv_h = height / 2;
+        if u_plane.len() < uv_stride * uv_h || v_plane.len() < uv_stride * uv_h {
+            return Err(Error::invalid("VP6 encode: chroma plane too small"));
+        }
+
+        // --- Fixed header (multi-stream + Buff2Offset) -------------------
+        // VP6 spec Tables 1 & 2: byte 0 carries FrameType R(1) +
+        // DctQMask R(6) + MultiStream R(1). MultiStream = 1 means the
+        // Buff2Offset R(16) field follows directly. Byte 1 carries
+        // Vp3VersionNo R(5) + VpProfile R(2) + Reserved R(1).
+        let mut out = Vec::<u8>::with_capacity(32 + mb_width * mb_height * 6);
+        out.push(((self.qp << 1) & 0x7E) | 0x01); // FrameType=0 (key) | QP | MultiStream=1
+        out.push(self.sub_version << 3); // VpProfile=0, Reserved=0
+                                         // Buff2Offset placeholder; overwritten once partition 1 is sized.
+        out.push(0);
+        out.push(0);
+        let buff2_hi_idx = out.len() - 2;
+        let buff2_lo_idx = out.len() - 1;
+        out.push(mb_height as u8);
+        out.push(mb_width as u8);
+        out.push(mb_height as u8);
+        out.push(mb_width as u8);
+
+        // --- Bool-coded partition 1 --------------------------------------
+        let mut enc = RangeEncoder::new();
+        // 2 skip bits.
+        enc.put_bits(2, 0);
+        // use_huffman = 1.
+        enc.put_bit(1);
+
+        // --- Coefficient-model update pass -------------------------------
+        let mut model = Vp6Model::default();
+        model.reset_defaults(false, self.sub_version);
+
+        let def_prob_template = [0x80u8; 11];
+        for pt in 0..2 {
+            for node in 0..11 {
+                enc.put_prob(tables::VP6_DCCV_PCT[pt][node], 0);
+                model.coeff_dccv[pt][node] = def_prob_template[node];
+            }
+        }
+        // Coefficient-reorder update flag = 0 (keep defaults).
+        enc.put_bit(0);
+        // Run-value update probabilities — emit 0 for every node.
+        for cg in 0..2 {
+            for node in 0..14 {
+                enc.put_prob(tables::VP6_RUNV_PCT[cg][node], 0);
+            }
+        }
+        // AC coefficient update probabilities — emit 0 for every node.
+        let def_prob = def_prob_template;
+        for ct in 0..3 {
+            for pt in 0..2 {
+                for cg in 0..6 {
+                    for node in 0..11 {
+                        enc.put_prob(tables::VP6_RACT_PCT[ct][pt][cg][node], 0);
+                        model.coeff_ract[pt][ct][cg][node] = def_prob[node];
+                    }
+                }
+            }
+        }
+        for cg in 0..2 {
+            for node in 0..14 {
+                model.coeff_runv[cg][node] = 0x80;
+            }
+        }
+        // Recompute the `coeff_dcct` linear combination.
+        for pt in 0..2 {
+            for ctx in 0..3 {
+                for node in 0..5 {
+                    let v = ((model.coeff_dccv[pt][node] as i32
+                        * tables::VP6_DCCV_LC[ctx][node][0]
+                        + 128)
+                        >> 8)
+                        + tables::VP6_DCCV_LC[ctx][node][1];
+                    model.coeff_dcct[pt][ctx][node] = v.clamp(1, 255) as u8;
+                }
+            }
+        }
+
+        // Build Huffman trees from the post-update model.
+        let trees = HuffmanTreeSet::build(&model);
+
+        // --- Quantise + DC-predict every block, collect into a flat ---
+        // array indexed by `(mb, b)`. We need the full grid up-front so
+        // we can pre-compute DC-zero-run lengths per plane (the run
+        // crosses block boundaries within the same plane per spec Table
+        // 19).
+        let dequant_dc = (tables::VP56_DC_DEQUANT[self.qp as usize & 0x3F] as i32) << 2;
+        let dequant_ac = (tables::VP56_AC_DEQUANT[self.qp as usize & 0x3F] as i32) << 2;
+
+        // `block_coeffs[(mb_row * mb_width + mb_col) * 6 + b]` — 64
+        // i32 entries per block (DC at index 0, AC at 1..=63 in
+        // encoded-coeff order — i.e. the post-quantisation, post-DC-
+        // predictor levels the Huffman path emits).
+        let total_blocks = mb_width * mb_height * 6;
+        let mut block_coeffs: Vec<[i32; 64]> = vec![[0i32; 64]; total_blocks];
+
+        let mut left_block: [EncRefDc; 4] = [EncRefDc::default(); 4];
+        let mut above_blocks: Vec<EncRefDc> = vec![EncRefDc::default(); 4 * mb_width + 6];
+        if 2 * mb_width + 2 < above_blocks.len() {
+            above_blocks[2 * mb_width + 2].ref_frame = RefKind::Current;
+        }
+        if 3 * mb_width + 4 < above_blocks.len() {
+            above_blocks[3 * mb_width + 4].ref_frame = RefKind::Current;
+        }
+        let mut prev_dc = [[0i16; 3]; 3];
+        prev_dc[1][0] = 128;
+        prev_dc[2][0] = 128;
+
+        for mb_row in 0..mb_height {
+            for b in &mut left_block {
+                *b = EncRefDc::default();
+            }
+            let mut above_block_idx: [usize; 6] = [0; 6];
+            above_block_idx[0] = 1;
+            above_block_idx[1] = 2;
+            above_block_idx[2] = 1;
+            above_block_idx[3] = 2;
+            above_block_idx[4] = 2 * mb_width + 2 + 1;
+            above_block_idx[5] = 3 * mb_width + 4 + 1;
+
+            for mb_col in 0..mb_width {
+                for b in 0..6usize {
+                    let plane_idx = tables::B2P[b] as usize;
+
+                    let mut tile = [0i32; 64];
+                    sample_block_tile(
+                        b, mb_row, mb_col, y_plane, u_plane, v_plane, width, uv_stride, &mut tile,
+                    );
+
+                    let mut coefs = [0i32; 64];
+                    forward_dct8x8(&tile, &mut coefs);
+
+                    let new_dc = div_nearest(coefs[0], dequant_dc).clamp(-32768, 32767) as i16;
+
+                    let lb = left_block[tables::B6_TO_4[b] as usize];
+                    let ab = above_blocks[above_block_idx[b]];
+                    let mut count = 0i32;
+                    let mut pdc = 0i32;
+                    if lb.ref_frame == RefKind::Current {
+                        pdc += lb.dc_coeff as i32;
+                        count += 1;
+                    }
+                    if ab.ref_frame == RefKind::Current {
+                        pdc += ab.dc_coeff as i32;
+                        count += 1;
+                    }
+                    let predictor = match count {
+                        0 => prev_dc[plane_idx][0] as i32,
+                        2 => pdc / 2,
+                        _ => pdc,
+                    };
+                    let coded_dc = (new_dc as i32 - predictor).clamp(-32768, 32767) as i16;
+
+                    let mut levels = [0i32; 64];
+                    levels[0] = coded_dc as i32;
+                    for coeff_idx in 1..64usize {
+                        let pos = model.coeff_index_to_pos[coeff_idx] as usize;
+                        let perm = tables::IDCT_SCANTABLE[pos] as usize;
+                        levels[coeff_idx] = div_nearest(coefs[perm], dequant_ac).clamp(-2047, 2047);
+                    }
+
+                    let blk_idx = (mb_row * mb_width + mb_col) * 6 + b;
+                    block_coeffs[blk_idx] = levels;
+
+                    let has_nonzero_dc = coded_dc != 0;
+                    let lb_idx = tables::B6_TO_4[b] as usize;
+                    let new_dc_final = (coded_dc as i32 + predictor) as i16;
+                    left_block[lb_idx] = EncRefDc {
+                        not_null_dc: has_nonzero_dc,
+                        ref_frame: RefKind::Current,
+                        dc_coeff: new_dc_final,
+                    };
+                    above_blocks[above_block_idx[b]] = EncRefDc {
+                        not_null_dc: has_nonzero_dc,
+                        ref_frame: RefKind::Current,
+                        dc_coeff: new_dc_final,
+                    };
+                    prev_dc[plane_idx][0] = new_dc_final;
+                }
+
+                for y in 0..4 {
+                    above_block_idx[y] += 2;
+                }
+                for uv in 4..6 {
+                    above_block_idx[uv] += 1;
+                }
+            }
+        }
+
+        // --- Emit Huffman coefficient partition --------------------------
+        //
+        // Decoding order per spec page 22 Figure 7: 4 Y blocks, U, V,
+        // for each MB in raster order. DC-zero runs apply within a
+        // plane (Y=0; U+V map to plane=1 per spec Table 21 ordering).
+        //
+        // To keep the encode path simple we pre-compute the lengths of
+        // any DC-zero runs that start at each block: when the next K
+        // blocks within the same plane all have DC == 0, we emit a run
+        // of length K+1 on the first one and skip DC emission on the
+        // following K. EOB-at-AC1 runs are handled the same way.
+        let mut bw = BitWriter::new();
+        let mut state = HuffmanFrameState::default();
+
+        // Build a per-plane block-order list so run-length scans are
+        // O(1) per block.
+        let mut plane_seq: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+        for mb_row in 0..mb_height {
+            for mb_col in 0..mb_width {
+                for b in 0..6usize {
+                    let p = if b < 4 { 0usize } else { 1usize };
+                    plane_seq[p].push((mb_row * mb_width + mb_col) * 6 + b);
+                }
+            }
+        }
+        // For each block, look up its position within its plane sequence.
+        let mut plane_pos = vec![(0usize, 0usize); total_blocks];
+        for p in 0..2 {
+            for (i, &blk_idx) in plane_seq[p].iter().enumerate() {
+                plane_pos[blk_idx] = (p, i);
+            }
+        }
+
+        for mb_row in 0..mb_height {
+            for mb_col in 0..mb_width {
+                for b in 0..6usize {
+                    let plane = if b < 4 { 0usize } else { 1usize };
+                    let blk_idx = (mb_row * mb_width + mb_col) * 6 + b;
+                    let (_, pos) = plane_pos[blk_idx];
+                    let levels = block_coeffs[blk_idx];
+
+                    // Compute queued runs starting at this block.
+                    let queued_dc = if state.dc_run_len[plane] == 0 && levels[0] == 0 {
+                        let mut k = 0u32;
+                        let mut q = pos + 1;
+                        while q < plane_seq[plane].len() {
+                            let next_blk = plane_seq[plane][q];
+                            if block_coeffs[next_blk][0] == 0 {
+                                k += 1;
+                                q += 1;
+                                if k >= 73 {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        k
+                    } else {
+                        0
+                    };
+                    let all_ac_zero = levels[1..=63].iter().all(|&c| c == 0);
+                    let queued_eob = if state.ac1_eob_run_len[plane] == 0 && all_ac_zero {
+                        let mut k = 0u32;
+                        let mut q = pos + 1;
+                        while q < plane_seq[plane].len() {
+                            let next_blk = plane_seq[plane][q];
+                            let nl = &block_coeffs[next_blk];
+                            if nl[1..=63].iter().all(|&c| c == 0) {
+                                k += 1;
+                                q += 1;
+                                if k >= 73 {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        k
+                    } else {
+                        0
+                    };
+
+                    let mut dc_run = state.dc_run_len[plane];
+                    let mut eob_run = state.ac1_eob_run_len[plane];
+                    encode_block_huffman(
+                        &mut bw,
+                        &trees,
+                        plane,
+                        &levels,
+                        &mut dc_run,
+                        &mut eob_run,
+                        queued_dc,
+                        queued_eob,
+                    );
+                    state.dc_run_len[plane] = dc_run;
+                    state.ac1_eob_run_len[plane] = eob_run;
+                }
+            }
+        }
+
+        let p1 = enc.finish();
+        let p2 = bw.finish();
+
+        // Buff2Offset is the spec-defined raw byte offset from the start
+        // of the frame buffer to the start of partition 2 (VP6 spec §9 /
+        // Tables 2). Header is 8 bytes; partition 2 starts at
+        // `8 + p1.len()`.
+        let buff2 = ((8 + p1.len()) as u32).min(0xFFFF);
+        out[buff2_hi_idx] = ((buff2 >> 8) & 0xFF) as u8;
+        out[buff2_lo_idx] = (buff2 & 0xFF) as u8;
+        out.extend_from_slice(&p1);
+        out.extend_from_slice(&p2);
+
+        self.mb_width = mb_width as u16;
+        self.mb_height = mb_height as u16;
+        self.have_keyframe = true;
         self.inter_frames_since_golden = 0;
         Ok(out)
     }
