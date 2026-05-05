@@ -119,6 +119,39 @@ vs 306 B for intra-off — 23% smaller, 30.5 dB Y PSNR via our decoder
 (no MC-only baseline). On smooth-motion content the wire output is
 byte-identical with `allow_intra_in_inter = true` vs `false` — the
 heuristic correctly identifies that inter compensates fully.
+**r30 promotes the rate controller to PI + adds DCT-count
+intra cost + lifts intra-in-inter into the golden-aware path.** Three
+encoder-only refinements layered on r29:
+
+1. `BitrateControl` grows `ki: f32` (default `0.05`) + `integral: f32`
+   + `integral_clamp: f32` (default `5.0`). `update_qp_after_frame` now
+   computes `qp_delta = round((kp * err + ki * integral) * 8)` after an
+   anti-windup-clamped integral accumulation; the integral term
+   eliminates the steady-state bitrate offset a P-only controller leaves
+   on content whose intrinsic complexity needs a QP set-point different
+   from the seed. Saturated-actuator back-leak prevents runaway. Setting
+   `ki = 0.0` recovers pre-r30 P-only behaviour exactly. On a
+   noisy-content fixture the PI controller pushes QP from 20 → 44 in 6
+   frames vs P-only's 20 → 36 (22% faster convergence).
+2. The intra-vs-inter cost in `encode_inter_frame` now adds a DCT-count
+   term (`mb_intra_dct_count_proxy`) that quantises each 8×8 luma block
+   of the MB at the current `qp` and counts surviving non-zero AC
+   coefficients. Cost = `Σ |pixel - mean| + λ * (count * 4 + 6)`,
+   matching the per-token bit budget of the bool-coded coefficient
+   tree (~4 bits per surviving AC token). Closer to actual encode cost
+   than SAD-against-mean alone — high-frequency MBs no longer slip
+   through the cheap-intra cracks; flat-but-noisy MBs no longer get
+   mis-classified as expensive-intra.
+3. `encode_inter_frame_with_golden` now also evaluates intra against
+   the BEST inter (golden vs prev) — the "golden-aware" qualifier means
+   intra fires only when both refs are unrelated to the new content.
+   Per-MB residual encoding picks up a 3-way split (Intra / Inter-Prev
+   / Inter-Golden) sharing the same emission shape; ref-kind drives
+   the DC-predictor neighbour-match. On a scene-change against
+   matching-content refs (both prev + golden = stripes, new =
+   checkerboard) the with-intra encode is 235 B vs 306 B for intra-off
+   (~23% smaller), 30.5 dB Y PSNR; ffmpeg's vp6f decoder cross-decodes
+   cleanly.
 **r28 adds the Huffman coefficient path on both
 encoder and decoder sides.** The frame-header `UseHuffman` bit (spec
 page 23 Table 1) selects between the existing bool-coded coefficient
@@ -227,22 +260,36 @@ decoder; ffmpeg's vp6f decoder accepts the Huffman keyframe
   packet cleanly. Reduces wire size on periodic-structure content
   (animation loop, slideshow) — see CHANGELOG / fixture results.
 
-- **Encoder bitrate-targeting feedback loop** (r29+). New
+- **Encoder bitrate-targeting PI controller** (r29+, PI in r30).
   `oxideav_vp6::encoder::BitrateControl` carries `target_bytes_per_frame`
-  + `qp_min` / `qp_max` bounds + EMA + proportional gain.
-  `Vp6Encoder::set_bitrate_target(bps, fps)` initialises the controller
-  with sensible defaults; `Vp6Encoder::update_qp_after_frame(bytes)`
-  applies the per-frame nudge. Pure no-op when `bitrate.is_none()`.
+  + `qp_min` / `qp_max` bounds + EMA + proportional + integral gains
+  (`kp`, `ki`) + anti-windup `integral_clamp`. `set_bitrate_target(bps,
+  fps)` initialises the controller; `update_qp_after_frame(bytes)`
+  applies the per-frame nudge `qp_delta = round((kp * err + ki *
+  integral) * 8)` after EMA-smoothed error and clamped integral
+  accumulation, with saturated-actuator back-leak so the integral can
+  never grow unboundedly when `qp` is pinned at `qp_min`/`qp_max`. Set
+  `ki = 0.0` to recover pre-r30 P-only behaviour. Pure no-op when
+  `bitrate.is_none()`.
 
-- **Encoder Intra-in-inter RDO** (r29+). `encode_inter_frame` now
-  considers `Vp56Mb::Intra` as a per-MB candidate alongside the inter
-  modes. Spec-correct wire emission via the existing PMBT-tree walk;
-  per-block residual encoding switches between `forward_dct8x8`
-  (Intra, with -128 bias) and `forward_dct8x8_residual` (Inter), with
-  the matching DC predictor (`RefKind::Current` vs `RefKind::Previous`).
-  Public field `Vp6Encoder::allow_intra_in_inter: bool` (default
-  `true`) gates the branch — set to `false` for pre-r29 inter-only
-  behaviour.
+- **Encoder Intra-in-inter RDO** (r29+, golden-aware in r30).
+  Both `encode_inter_frame` and `encode_inter_frame_with_golden`
+  consider `Vp56Mb::Intra` as a per-MB candidate alongside the inter
+  modes. Cost = `Σ |pixel - mean| + λ * (DCT-survivor-count * 4 + 6)`
+  — the SAD-against-mean predictability proxy plus an
+  `mb_intra_dct_count_proxy` term that quantises each 8×8 luma block
+  at the current `qp` and counts surviving non-zero AC coefficients,
+  matching the per-token bit budget of the bool-coded coefficient tree
+  much more closely than SAD alone. The golden-aware path compares
+  intra against the BEST inter (golden vs prev) so intra fires only
+  when both refs are unrelated to the new content. Spec-correct wire
+  emission via the existing PMBT-tree walk; per-block residual
+  encoding switches between `forward_dct8x8` (Intra, with -128 bias)
+  and `forward_dct8x8_residual` (Inter), with the matching DC
+  predictor (`RefKind::Current` vs `RefKind::Previous` /
+  `RefKind::Golden`). Public field `Vp6Encoder::allow_intra_in_inter:
+  bool` (default `true`) gates the branch — set to `false` for
+  pre-r29 inter-only behaviour.
 
 - **Huffman coefficient path** (r28+, encoder + decoder). When a VP6F
   stream sets `UseHuffman = 1` in the frame header (per VP6 spec page

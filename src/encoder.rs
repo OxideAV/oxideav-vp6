@@ -305,12 +305,15 @@ pub struct Vp6Encoder {
 }
 
 /// Bitrate-control state carried in [`Vp6Encoder::bitrate`]. Implements
-/// a simple proportional-with-EMA controller: after each frame the
-/// encoder reads `bytes_emitted`, computes a smoothed running average
-/// against `target_bytes_per_frame`, and nudges `qp` up (when over-
-/// shooting) or down (when under-shooting). The `kp` term is small so
-/// the controller is intentionally slow and stable — bursty content
-/// gets absorbed by smoothing rather than triggering a runaway QP swing.
+/// a discrete-time PI (proportional + integral) controller with EMA
+/// pre-filtering: after each frame the encoder reads `bytes_emitted`,
+/// computes a smoothed running average against `target_bytes_per_frame`,
+/// accumulates the running error into the `integral` term (with
+/// anti-windup clamping), and nudges `qp` by `kp * err + ki * integral`.
+/// The proportional term gives a fast response to bursty deviations;
+/// the integral term eliminates the steady-state offset a P-only
+/// controller leaves behind on content whose intrinsic complexity
+/// requires a QP set-point different from the seed `qp`.
 ///
 /// Construction: callers usually go through
 /// [`Vp6Encoder::set_bitrate_target`] which derives sensible defaults
@@ -341,19 +344,36 @@ pub struct BitrateControl {
     /// which is large enough to converge in ~3-5 frames but small
     /// enough not to oscillate.
     pub kp: f32,
+    /// Integral gain on the accumulated-error → QP-step mapping.
+    /// Default `0.05` — small relative to `kp` so the integral term
+    /// drifts the steady-state QP slowly without inducing oscillation
+    /// on its own. Set to `0.0` to recover pre-r30 P-only behaviour.
+    pub ki: f32,
+    /// Anti-windup clamp on the integral term — `integral` is clipped
+    /// to `[-integral_clamp, +integral_clamp]` after each accumulation.
+    /// Default `5.0` (i.e. the integral by itself can never push qp
+    /// more than `ki * integral_clamp * 8 ≈ 2` steps when `ki = 0.05`,
+    /// which is a deliberately gentle steady-state nudge that won't
+    /// fight the proportional term during transient overshoot).
+    pub integral_clamp: f32,
     /// Smoothed running average of `bytes_emitted` from
     /// [`Vp6Encoder::update_qp_after_frame`] calls. Internal state —
     /// callers usually don't read this directly. Initialised to the
     /// target on construction so the first frame's controller sees a
     /// zero error.
     pub ema_bytes: f32,
+    /// Accumulated error-ratio for the integral term. Internal state —
+    /// callers usually don't read this directly. Reset to 0 on
+    /// construction so the integral starts contributing nothing.
+    pub integral: f32,
 }
 
 impl BitrateControl {
     /// Construct a controller with sensible defaults for a target of
-    /// `target_bytes_per_frame` bytes. QP bounds + EMA + kp are at
+    /// `target_bytes_per_frame` bytes. QP bounds + EMA + kp + ki are at
     /// their default values; the EMA seed is initialised to the target
-    /// so the first frame's update sees only the actual error.
+    /// so the first frame's update sees only the actual error, and the
+    /// integral starts at 0.
     pub fn new(target_bytes_per_frame: u32) -> Self {
         Self {
             target_bytes_per_frame,
@@ -361,7 +381,10 @@ impl BitrateControl {
             qp_max: 60,
             ema_alpha: 0.3,
             kp: 0.5,
+            ki: 0.05,
+            integral_clamp: 5.0,
             ema_bytes: target_bytes_per_frame as f32,
+            integral: 0.0,
         }
     }
 }
@@ -442,12 +465,22 @@ impl Vp6Encoder {
     /// next frame within `[qp_min, qp_max]`. No-op when
     /// [`Self::bitrate`] is `None`.
     ///
-    /// Controller shape (proportional with EMA smoothing):
+    /// Controller shape (PI with EMA smoothing — r30):
     /// 1. `ema_bytes := ema_alpha * bytes_emitted + (1 - ema_alpha) * ema_bytes`
     /// 2. `error_ratio := (ema_bytes - target) / max(target, 1)`
-    /// 3. `qp_delta := kp * error_ratio * 8` (scaled so 100% overshoot
-    ///    nudges qp by ~`kp * 8`, i.e. ~4 at the default `kp = 0.5`)
-    /// 4. `new_qp := clamp(qp + round(qp_delta), qp_min, qp_max)`
+    /// 3. `integral := clamp(integral + error_ratio, ±integral_clamp)`
+    ///    (anti-windup: clip the accumulator so a long stretch of
+    ///    saturated-QP operation doesn't bank a giant correction)
+    /// 4. `qp_delta := round((kp * error_ratio + ki * integral) * 8)`
+    ///    (scaled so 100% overshoot nudges qp by ~`(kp + ki * integral) * 8`)
+    /// 5. `new_qp := clamp(qp + qp_delta, qp_min, qp_max)`
+    /// 6. **Anti-windup back-leak**: when the new `qp` lands at either
+    ///    `qp_min` or `qp_max` AND the integral term is pushing further
+    ///    in the saturated direction, drain that frame's contribution
+    ///    back out so the integral can't grow unboundedly during long
+    ///    over-/under-shoots that the actuator can't compensate for.
+    ///
+    /// Setting `ki = 0.0` recovers pre-r30 P-only behaviour exactly.
     ///
     /// Returns the new `qp` for diagnostic purposes.
     pub fn update_qp_after_frame(&mut self, bytes_emitted: u32) -> u8 {
@@ -457,13 +490,29 @@ impl Vp6Encoder {
         // EMA update.
         let bytes_f = bytes_emitted as f32;
         ctl.ema_bytes = ctl.ema_alpha * bytes_f + (1.0 - ctl.ema_alpha) * ctl.ema_bytes;
-        // Proportional QP nudge.
+        // Error + integral accumulation with anti-windup clamp.
         let target = ctl.target_bytes_per_frame.max(1) as f32;
         let error_ratio = (ctl.ema_bytes - target) / target;
-        let qp_delta = (ctl.kp * error_ratio * 8.0).round() as i32;
+        let prev_integral = ctl.integral;
+        let clamp = ctl.integral_clamp.max(0.0);
+        ctl.integral = (ctl.integral + error_ratio).clamp(-clamp, clamp);
+        // PI QP nudge.
+        let qp_delta_f = (ctl.kp * error_ratio + ctl.ki * ctl.integral) * 8.0;
+        let qp_delta = qp_delta_f.round() as i32;
         let qp_min = ctl.qp_min.min(63);
         let qp_max = ctl.qp_max.min(63).max(qp_min);
-        let new_qp = (self.qp as i32 + qp_delta).clamp(qp_min as i32, qp_max as i32) as u8;
+        let unclamped = self.qp as i32 + qp_delta;
+        let new_qp = unclamped.clamp(qp_min as i32, qp_max as i32) as u8;
+        // Anti-windup back-leak: if we saturated AND the integral is
+        // still pushing further into the saturation, undo this frame's
+        // integral accumulation. This prevents the integral from banking
+        // unbounded "credit" during long stretches where the actuator
+        // (qp) cannot move further.
+        let saturated_high = new_qp == qp_max && unclamped > qp_max as i32 && error_ratio > 0.0;
+        let saturated_low = new_qp == qp_min && unclamped < qp_min as i32 && error_ratio < 0.0;
+        if saturated_high || saturated_low {
+            ctl.integral = prev_integral;
+        }
         self.qp = new_qp;
         new_qp
     }
@@ -1703,25 +1752,36 @@ impl Vp6Encoder {
                 // residual is too costly to encode efficiently) and on
                 // scene-change-style discontinuities.
                 //
-                // Cost shape: SAD of original pixels against the per-MB
-                // mean as a cheap predictability proxy (high variance
-                // = many AC coefficients to encode either way; low
-                // variance + high inter SAD = revealed area where intra
-                // wins). The proxy underestimates the actual encode cost
-                // but is monotonic in MB difficulty and lets us pick
-                // intra when inter SAD is dramatically worse — exactly
-                // the case where intra refresh is the right call.
+                // Cost shape (r30+): SAD-against-mean predictability
+                // proxy + a DCT-count term that quantises each 8×8 luma
+                // block of the MB at the current `qp` and counts surviving
+                // non-zero AC coefficients. The DCT-count term mirrors
+                // VP8's intra-cost weighting where each surviving coef
+                // costs roughly its log2-token-bit-budget — by charging
+                // `lambda * coef_count * 4` we match the wire-side cost
+                // of an average coef token (~4 bool-coded bits per
+                // surviving coef in the bool path). The combination
+                // tracks actual intra-encode cost much more closely than
+                // SAD-against-mean alone — flat-but-noisy MBs (high SAD,
+                // few surviving coefs after quantisation) no longer get
+                // mis-classified as expensive-intra, and high-frequency
+                // MBs no longer slip through the cheap-intra cracks.
                 let mut intra_sad_proxy = 0u64;
+                let mut intra_dct_count = 0u64;
                 let mut intra_bits = 0u64;
                 if self.allow_intra_in_inter {
                     intra_sad_proxy = mb_intra_sad_proxy(new_y, width, mb_x, mb_y);
+                    intra_dct_count =
+                        mb_intra_dct_count_proxy(new_y, width, mb_x, mb_y, dequant_ac);
                     // Intra coding has no MV bits but pays the PMBT-tree
                     // depth cost (Intra is at depth 4 from InterNoVecPf
                     // in the decoder's PMBT tree walk), so charge a
                     // baseline of ~6 bits.
                     intra_bits = 6;
                 }
-                let cost_intra = intra_sad_proxy.saturating_add(lambda.saturating_mul(intra_bits));
+                let cost_intra = intra_sad_proxy
+                    .saturating_add(lambda.saturating_mul(intra_bits))
+                    .saturating_add(lambda.saturating_mul(intra_dct_count.saturating_mul(4)));
 
                 let new_type = if self.allow_intra_in_inter && cost_intra < inter_best_cost {
                     tables::Vp56Mb::Intra
@@ -2291,18 +2351,63 @@ impl Vp6Encoder {
                 // `InterNoVecPf` at depth 1 and `InterNoVecGf` at depth
                 // ~3, so prev is intrinsically cheaper to encode.
                 let use_golden = gf_cost < pf_cost;
+                let inter_best_cost = if use_golden { gf_cost } else { pf_cost };
                 let (q_dx, q_dy) = if use_golden {
                     (q_dx_gf, q_dy_gf)
                 } else {
                     (q_dx_pf, q_dy_pf)
                 };
-                let ref_kind = if use_golden {
+
+                // -- 2b. Golden-aware intra-in-inter RDO (r30+).
+                //
+                // Golden-aware means the intra-cost has to beat BOTH the
+                // golden and the previous-frame inter candidate — we
+                // evaluate intra against `inter_best_cost` (the winner
+                // of golden-vs-prev), not against either ref in
+                // isolation. On a true revealed-content / scene-change
+                // MB the new content is unrelated to BOTH refs, so both
+                // pf_cost and gf_cost are large — intra wins. On a
+                // scene-change frame that lands on a golden-refresh
+                // frame (golden = previous keyframe = wholly different
+                // content), the gf_cost is high too, so intra still
+                // wins. On periodic-loop content (golden has the right
+                // content but prev doesn't), the gf_cost is small —
+                // intra correctly stays out of the way.
+                //
+                // Cost shape mirrors `encode_inter_frame`'s intra-vs-
+                // inter RDO: SAD-against-mean predictability proxy +
+                // DCT-survivor count term + 6-bit PMBT-tree depth charge.
+                // See `mb_intra_sad_proxy` / `mb_intra_dct_count_proxy`.
+                let (intra_sad_proxy, intra_dct_count) = if self.allow_intra_in_inter {
+                    (
+                        mb_intra_sad_proxy(new_y, width, mb_x, mb_y),
+                        mb_intra_dct_count_proxy(new_y, width, mb_x, mb_y, dequant_ac),
+                    )
+                } else {
+                    (0u64, 0u64)
+                };
+                let intra_bits = if self.allow_intra_in_inter {
+                    6u64
+                } else {
+                    0u64
+                };
+                let cost_intra = intra_sad_proxy
+                    .saturating_add(lambda.saturating_mul(intra_bits))
+                    .saturating_add(lambda.saturating_mul(intra_dct_count.saturating_mul(4)));
+                let pick_intra = self.allow_intra_in_inter && cost_intra < inter_best_cost;
+
+                let ref_kind = if pick_intra {
+                    RefKind::Current
+                } else if use_golden {
                     RefKind::Golden
                 } else {
                     RefKind::Previous
                 };
 
                 // -- 3. MV-candidate predictor for the chosen ref.
+                // Intra MBs don't need an MV and don't update the
+                // per-ref candidate position — the ref-specific path is
+                // only walked when we actually pick an inter mode.
                 let want_ref_frame = if use_golden {
                     tables::RefFrame::Golden
                 } else {
@@ -2322,10 +2427,12 @@ impl Vp6Encoder {
                     want_ref_frame,
                     initial_pos,
                 );
-                if use_golden {
-                    vector_candidate_pos_gf = new_pos;
-                } else {
-                    vector_candidate_pos_pf = new_pos;
+                if !pick_intra {
+                    if use_golden {
+                        vector_candidate_pos_gf = new_pos;
+                    } else {
+                        vector_candidate_pos_pf = new_pos;
+                    }
                 }
                 let ctx = ctx_val.clamp(0, 2) as usize;
 
@@ -2334,11 +2441,15 @@ impl Vp6Encoder {
                     x: q_dx as i16,
                     y: q_dy as i16,
                 };
-                let new_type = match (use_golden, want_mv.x == 0 && want_mv.y == 0) {
-                    (false, true) => tables::Vp56Mb::InterNoVecPf,
-                    (false, false) => tables::Vp56Mb::InterDeltaPf,
-                    (true, true) => tables::Vp56Mb::InterNoVecGf,
-                    (true, false) => tables::Vp56Mb::InterDeltaGf,
+                let new_type = if pick_intra {
+                    tables::Vp56Mb::Intra
+                } else {
+                    match (use_golden, want_mv.x == 0 && want_mv.y == 0) {
+                        (false, true) => tables::Vp56Mb::InterNoVecPf,
+                        (false, false) => tables::Vp56Mb::InterDeltaPf,
+                        (true, true) => tables::Vp56Mb::InterNoVecGf,
+                        (true, false) => tables::Vp56Mb::InterDeltaGf,
+                    }
                 };
 
                 // -- 5. Emit MB-type into partition 1 via PMBT tree walk.
@@ -2383,7 +2494,12 @@ impl Vp6Encoder {
                 prev_type = new_type;
 
                 // -- 8. Residual encoding into partition 2.
+                // Three sub-paths: Intra (no MC, -128 bias DCT, Current
+                // DC predictor), Inter-Prev, Inter-Golden — all share
+                // the per-block emission shape, only the DCT-input and
+                // the DC-predictor neighbour-match differ.
                 let ref_dc_idx = match ref_kind {
+                    RefKind::Current => 0usize,
                     RefKind::Previous => 1usize,
                     RefKind::Golden => 2usize,
                     _ => 1usize,
@@ -2408,40 +2524,49 @@ impl Vp6Encoder {
                         &mut orig_tile,
                     );
 
-                    // Sample from prev or golden depending on ref.
-                    let (rp_y, rp_u, rp_v): (&[u8], &[u8], &[u8]) = if use_golden {
-                        (golden_y, golden_u, golden_v)
-                    } else {
-                        (prev_y, prev_u, prev_v)
-                    };
-                    let mut mc_tile = [0i32; 64];
-                    sample_mc_tile(
-                        b,
-                        mb_row,
-                        mb_col,
-                        rp_y,
-                        rp_u,
-                        rp_v,
-                        width,
-                        uv_stride,
-                        height,
-                        uv_h,
-                        stored_mv,
-                        &mut mc_tile,
-                    );
-
-                    let mut residual = [0i32; 64];
-                    for i in 0..64 {
-                        residual[i] = orig_tile[i] - mc_tile[i];
-                    }
-
                     let mut coefs = [0i32; 64];
-                    forward_dct8x8_residual(&residual, &mut coefs);
+                    if pick_intra {
+                        // Intra: forward DCT directly on the original
+                        // tile (with -128 bias), mirror of the keyframe
+                        // path's `forward_dct8x8`. No MC, no residual.
+                        forward_dct8x8(&orig_tile, &mut coefs);
+                    } else {
+                        // Inter: materialise the MC prediction tile,
+                        // compute per-pixel residual, residual-mode DCT.
+                        let (rp_y, rp_u, rp_v): (&[u8], &[u8], &[u8]) = if use_golden {
+                            (golden_y, golden_u, golden_v)
+                        } else {
+                            (prev_y, prev_u, prev_v)
+                        };
+                        let mut mc_tile = [0i32; 64];
+                        sample_mc_tile(
+                            b,
+                            mb_row,
+                            mb_col,
+                            rp_y,
+                            rp_u,
+                            rp_v,
+                            width,
+                            uv_stride,
+                            height,
+                            uv_h,
+                            stored_mv,
+                            &mut mc_tile,
+                        );
+                        let mut residual = [0i32; 64];
+                        for i in 0..64 {
+                            residual[i] = orig_tile[i] - mc_tile[i];
+                        }
+                        forward_dct8x8_residual(&residual, &mut coefs);
+                    }
 
                     let new_dc = div_nearest(coefs[0], dequant_dc).clamp(-32768, 32767) as i16;
 
                     // DC predictor — neighbour contributes only when it
-                    // matches the current MB's ref kind.
+                    // matches the current MB's ref kind. For Intra this
+                    // picks up the keyframe-style `RefKind::Current`
+                    // neighbours; for Inter-Prev/Inter-Golden it picks
+                    // up the matching ref kind.
                     let lb = enc_left_block[tables::B6_TO_4[b] as usize];
                     let ab = enc_above_blocks[above_block_idx[b]];
                     let mut count = 0i32;
@@ -2892,6 +3017,64 @@ fn mb_intra_sad_proxy(plane: &[u8], stride: usize, mb_x: i32, mb_y: i32) -> u64 
         }
     }
     sad
+}
+
+/// DCT-survivor count proxy for the intra-vs-inter RDO. Forward-DCTs
+/// each of the 4 luma 8×8 blocks of the MB (with the keyframe-style
+/// `-128` bias matching `forward_dct8x8`), quantises every coefficient
+/// by `dequant_ac` (we don't differentiate DC from AC here — the goal
+/// is a coarse "how many tokens does this MB encode to" estimate, not
+/// an exact bit count), and counts surviving non-zero AC positions
+/// across all 4 blocks.
+///
+/// Higher count = more bits to encode this MB as Intra. The count is
+/// roughly proportional to the actual coefficient-token cost the
+/// encoder would pay if it picked Intra mode for this MB — VP6's bool-
+/// coded coefficient tree spends ~3-6 bits per non-zero AC token
+/// (token-class tree depth + sign bit + zero-run prelude), so callers
+/// scale by `λ * 4` to get a Lagrangian cost in the same units as the
+/// SAD-against-mean term.
+///
+/// Used by [`Vp6Encoder::encode_inter_frame`] alongside
+/// [`mb_intra_sad_proxy`]. Cost = `Σ |pixel - mean| + λ * (count * 4 + 6)`.
+/// On flat-but-noisy content the SAD-against-mean is large but few
+/// coefficients survive quantisation — the DCT-count term keeps the
+/// intra-cost realistic. On high-frequency content the SAD-against-mean
+/// is also large AND many coefficients survive — the DCT-count term
+/// inflates the intra-cost so we don't pick Intra over Inter for
+/// content that would emit many tokens either way.
+fn mb_intra_dct_count_proxy(
+    plane: &[u8],
+    stride: usize,
+    mb_x: i32,
+    mb_y: i32,
+    dequant_ac: i32,
+) -> u64 {
+    let mut total = 0u64;
+    let dq = dequant_ac.max(1);
+    // 4 luma blocks at MB offsets (0,0), (8,0), (0,8), (8,8).
+    let offsets = [(0i32, 0i32), (8, 0), (0, 8), (8, 8)];
+    for (ox, oy) in offsets.iter().copied() {
+        let mut tile = [0i32; 64];
+        for r in 0..8i32 {
+            let py = (mb_y + oy + r) as usize;
+            for c in 0..8i32 {
+                let px = (mb_x + ox + c) as usize;
+                tile[(r as usize) * 8 + c as usize] = plane[py * stride + px] as i32;
+            }
+        }
+        let mut coefs = [0i32; 64];
+        forward_dct8x8(&tile, &mut coefs);
+        // Skip DC (idx 0) — DC is always coded; AC survival is what
+        // varies with content complexity.
+        for coef in coefs.iter().skip(1) {
+            let q = div_nearest(*coef, dq);
+            if q != 0 {
+                total += 1;
+            }
+        }
+    }
+    total
 }
 
 /// Bilinear luma sample at `(base_x + frac_x/8, base_y + frac_y/8)`

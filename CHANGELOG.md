@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **r30 — PI controller + DCT-count intra cost + golden-aware
+  intra-in-inter (encoder).** Three encoder-only refinements layered on
+  r29's bitrate control + intra-in-inter RDO:
+
+  1. **PI controller (was P-only).** `BitrateControl` grows three
+     fields: `ki: f32` (default `0.05`), `integral: f32` (internal
+     state, accumulator), and `integral_clamp: f32` (default `5.0`,
+     anti-windup bound). `update_qp_after_frame` now computes
+     `qp_delta = round((kp * error_ratio + ki * integral) * 8)` after
+     accumulating `integral := clamp(integral + error_ratio,
+     ±integral_clamp)`. Two anti-windup mechanisms:
+     * The accumulator is hard-clamped to `[-integral_clamp,
+       +integral_clamp]` so a long stretch of saturated-QP operation
+       can't bank an arbitrarily large correction.
+     * **Saturated-actuator back-leak**: when the new `qp` lands at
+       `qp_max` AND the integral is still pushing further up (or
+       symmetrically `qp_min` and pushing down), the most recent
+       integral accumulation is undone — the integral can't grow during
+       stretches where the actuator is pinned.
+
+     Setting `ki = 0.0` recovers pre-r30 P-only behaviour exactly. The
+     integral term eliminates the steady-state bitrate offset a P-only
+     controller leaves on content whose intrinsic complexity needs a
+     QP set-point different from the seed. On a noisy 32x32 fixture
+     (target 1067 bytes/frame, seed QP 20), the PI controller pushes
+     QP from 20 → 44 in 6 frames vs the P-only path's 20 → 36 — ~22%
+     faster convergence. New tests:
+     * `r30_pi_controller_ki_zero_matches_p_only` — PI with `ki=0`
+       keeps QP trajectory and frame-byte size identical to the
+       default-PI path while QPs match.
+     * `r30_pi_controller_integral_accumulates_steady_state` — over
+       6 over-target frames the integral accumulates positively and
+       respects the clamp.
+     * `r30_pi_controller_antiwindup_caps_integral` — pin
+       `qp_min = qp_max`, run 20 frames, integral never exceeds clamp.
+
+  2. **DCT-count intra cost.** New helper `mb_intra_dct_count_proxy`
+     forward-DCTs each of the 4 luma 8×8 blocks of the MB at the
+     current `qp`, quantises by `dequant_ac`, and counts surviving
+     non-zero AC coefficients. The intra-vs-inter cost in
+     `encode_inter_frame` (and now in `encode_inter_frame_with_golden`)
+     becomes `Σ |pixel - mean| + λ * (DCT-survivor-count * 4 + 6)` —
+     the SAD-against-mean predictability proxy plus a per-token bit
+     budget term (~4 bool-coded bits per surviving AC token). Closer to
+     actual encode cost than SAD-against-mean alone — high-frequency
+     MBs no longer slip through the cheap-intra cracks; flat-but-noisy
+     MBs no longer get mis-classified as expensive-intra. Verified by
+     `r30_dct_count_intra_cost_no_regression_on_smooth_motion`: on
+     well-MC-compensated horizontal-shift content the intra-on encode
+     is byte-identical to the intra-off baseline (RDO correctly rejects
+     intra everywhere).
+
+  3. **Golden-aware intra-in-inter.** `encode_inter_frame_with_golden`
+     now also evaluates `Vp56Mb::Intra` as a per-MB candidate (it
+     previously had no intra branch at all — the r29 work only landed
+     in the single-ref `encode_inter_frame`). "Golden-aware" means the
+     intra-cost has to beat the BEST inter (golden vs prev) — intra
+     fires only when both refs are unrelated to the new content. The
+     per-MB residual encoding becomes a 3-way split (Intra /
+     Inter-Prev / Inter-Golden) sharing the same emission shape;
+     ref-kind drives the `RefKind`-matched DC-predictor neighbour
+     check (Intra → `Current`, Inter-Prev → `Previous`, Inter-Golden
+     → `Golden`). Vector-candidate position state for the chosen ref
+     is only advanced when an inter mode is picked — Intra MBs don't
+     consume an MV-candidate slot. On a scene-change against
+     matching-content refs (both prev + golden = vertical stripes,
+     new = checkerboard, QP 16), the with-intra encode is 235 B vs
+     306 B for intra-off — ~23% smaller, 30.5 dB Y PSNR via our own
+     decoder. ffmpeg's vp6f decoder cross-decodes the resulting
+     bitstream cleanly. New tests:
+     * `r30_golden_aware_intra_in_inter_fires_on_scene_change` —
+       wire-size + Y PSNR sanity vs intra-off baseline.
+     * `r30_golden_aware_intra_byte_identical_on_smooth_motion` —
+       smooth-motion content stays byte-identical (RDO rejects intra
+       on every MB).
+     * `r30_ffmpeg_decodes_golden_aware_intra_in_inter` — opt-in
+       ffmpeg vp6f cross-decode of the key + golden-aware-with-intra
+       inter pair.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-vp6/compare/v0.0.5...v0.0.6) - 2026-05-05
 
 ### Other
