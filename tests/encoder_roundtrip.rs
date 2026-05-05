@@ -2578,3 +2578,458 @@ fn r30_ffmpeg_decodes_golden_aware_intra_in_inter() {
         "ffmpeg failed to decode r30 golden-aware intra-in-inter stream"
     );
 }
+
+// =====================================================================
+// r31 tests — scene-change golden refresh + Huffman inter + RDO
+// =====================================================================
+
+/// Build a VP6 FLV with key + inter from raw elementary frames.
+fn build_two_tag_flv(key: &[u8], inter: &[u8]) -> Vec<u8> {
+    let mut flv = Vec::new();
+    flv.extend_from_slice(b"FLV");
+    flv.push(0x01);
+    flv.push(0x01);
+    flv.extend_from_slice(&9u32.to_be_bytes());
+    flv.extend_from_slice(&0u32.to_be_bytes());
+
+    let push = |flv: &mut Vec<u8>, frame: &[u8], pts: u32, is_key: bool| {
+        let plen = (1 + 1 + frame.len()) as u32;
+        flv.push(9);
+        flv.push(((plen >> 16) & 0xff) as u8);
+        flv.push(((plen >> 8) & 0xff) as u8);
+        flv.push((plen & 0xff) as u8);
+        flv.push(((pts >> 16) & 0xff) as u8);
+        flv.push(((pts >> 8) & 0xff) as u8);
+        flv.push((pts & 0xff) as u8);
+        flv.push(((pts >> 24) & 0xff) as u8);
+        flv.extend_from_slice(&[0, 0, 0]);
+        flv.push(if is_key { 0x14 } else { 0x24 });
+        flv.push(0x00);
+        flv.extend_from_slice(frame);
+        flv.extend_from_slice(&(11 + plen).to_be_bytes());
+    };
+    push(&mut flv, key, 0, true);
+    push(&mut flv, inter, 33, false);
+    flv
+}
+
+/// Decode the Nth video frame (0-indexed) from a raw FLV byte stream using
+/// our own VP6 decoder. Returns the Y/U/V planes.
+fn decode_frame_n(flv: &[u8], n: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("vp6f"));
+    let mut dec = Vp6Decoder::new(params.codec_id.clone());
+    let mut count = 0usize;
+    let mut pos = 9 + 4; // skip FLV header (9) + PreviousTagSize0 (4)
+    while pos + 11 <= flv.len() {
+        let tag_type = flv[pos];
+        let data_size = ((flv[pos + 1] as u32) << 16
+            | (flv[pos + 2] as u32) << 8
+            | flv[pos + 3] as u32) as usize;
+        pos += 11;
+        if tag_type == 9 && data_size >= 2 {
+            let payload = &flv[pos..pos + data_size];
+            // payload[0] = FrameType+CodecId, payload[1] = adjuster
+            let frame_bytes = &payload[1..]; // include adjuster
+            let mut raw = Vec::with_capacity(frame_bytes.len());
+            raw.extend_from_slice(frame_bytes);
+            let pkt = oxideav_core::Packet::new(
+                count as u32,
+                oxideav_core::TimeBase::new(1, 1000),
+                raw,
+            );
+            dec.send_packet(&pkt).expect("send_packet");
+            if let Ok(oxideav_core::Frame::Video(vf)) = dec.receive_frame() {
+                if count == n {
+                    let _w = vf.planes[0].stride;
+                    return (
+                        vf.planes[0].data.clone(),
+                        vf.planes[1].data.clone(),
+                        vf.planes[2].data.clone(),
+                    );
+                }
+                count += 1;
+            }
+        }
+        pos += data_size + 4; // data + PreviousTagSize
+    }
+    panic!("frame {n} not found in FLV stream");
+}
+
+/// r31: Scene-change golden refresh fires on a large SAD spike.
+///
+/// Setup: encode 3-frame sequence:
+///   frame 0 (keyframe) — vertical stripes
+///   frame 1 (inter, same content) — no scene cut expected
+///   frame 2 (inter, checkerboard — completely different content) — scene cut
+///
+/// After frame 2, `inter_frames_since_golden` should be 1 (reset happened).
+/// With a cadence-only encoder at period=30, it would be 2.
+#[test]
+fn r31_scene_change_triggers_golden_refresh() {
+    let (w, h) = (32usize, 32usize);
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+    let u = vec![128u8; uv_w * uv_h];
+    let v = vec![128u8; uv_w * uv_h];
+
+    // Keyframe: vertical stripes
+    let mut y_stripes = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y_stripes[r * w + c] = if (c / 8) % 2 == 0 { 50 } else { 200 };
+        }
+    }
+
+    // Frame 1: same stripes (near-zero SAD → no cut)
+    let y_stripes2 = y_stripes.clone();
+
+    // Frame 2: checkerboard (very high SAD → scene cut)
+    let mut y_checker = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y_checker[r * w + c] = if (r / 8 + c / 8) % 2 == 0 { 40 } else { 210 };
+        }
+    }
+
+    let mut enc = Vp6Encoder::new(16);
+    enc.golden_refresh_period = 30; // cadence-only would be period 30
+    enc.scene_change_threshold = 2.0;
+
+    let golden_y = y_stripes.clone();
+    let golden_u = u.clone();
+    let golden_v = v.clone();
+
+    enc.encode_keyframe(&y_stripes, &u, &v, w, h).expect("key");
+    // Frame 1: inter against stripes → SAD ≈ 0 → seeds EMA, no cut
+    enc.encode_inter_frame_with_golden(
+        &y_stripes, &u, &v, &golden_y, &golden_u, &golden_v,
+        &y_stripes2, &u, &v, w, h, 4,
+    ).expect("inter 1");
+    // At this point inter_frames_since_golden = 1 (no refresh fired)
+    assert_eq!(
+        enc.inter_frames_since_golden(), 1,
+        "No refresh expected after near-identical frame"
+    );
+
+    // Frame 2: checkerboard — large SAD spike → scene cut fires
+    enc.encode_inter_frame_with_golden(
+        &y_stripes2, &u, &v, &golden_y, &golden_u, &golden_v,
+        &y_checker, &u, &v, w, h, 4,
+    ).expect("inter 2");
+    // Refresh fired: counter should be reset to 1 (first frame after refresh)
+    assert_eq!(
+        enc.inter_frames_since_golden(), 1,
+        "Scene-change refresh should have reset counter to 1"
+    );
+}
+
+/// r31: With threshold=0 (disabled), scene-change detection is off.
+/// Counter should reach 2 after 2 inter frames even on high-SAD content.
+#[test]
+fn r31_scene_change_detection_disabled_at_threshold_zero() {
+    let (w, h) = (32usize, 32usize);
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+    let u = vec![128u8; uv_w * uv_h];
+    let v = vec![128u8; uv_w * uv_h];
+    let mut y_stripes = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y_stripes[r * w + c] = if (c / 8) % 2 == 0 { 50 } else { 200 };
+        }
+    }
+    let mut y_checker = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y_checker[r * w + c] = if (r / 8 + c / 8) % 2 == 0 { 40 } else { 210 };
+        }
+    }
+    let mut enc = Vp6Encoder::new(16);
+    enc.golden_refresh_period = 30;
+    enc.scene_change_threshold = 0.0; // disabled
+    let golden_y = y_stripes.clone();
+    let golden_u = u.clone();
+    let golden_v = v.clone();
+    enc.encode_keyframe(&y_stripes, &u, &v, w, h).expect("key");
+    enc.encode_inter_frame_with_golden(
+        &y_stripes, &u, &v, &golden_y, &golden_u, &golden_v,
+        &y_stripes, &u, &v, w, h, 4,
+    ).expect("inter 1");
+    enc.encode_inter_frame_with_golden(
+        &y_stripes, &u, &v, &golden_y, &golden_u, &golden_v,
+        &y_checker, &u, &v, w, h, 4,
+    ).expect("inter 2");
+    // With scene-change detection disabled, no refresh fired — counter = 2
+    assert_eq!(
+        enc.inter_frames_since_golden(), 2,
+        "Disabled scene-change should leave counter at 2"
+    );
+}
+
+/// r31: Huffman inter roundtrip through our own decoder.
+///
+/// Encode a key + Huffman-inter pair, decode both through Vp6Decoder,
+/// assert the inter frame PSNR ≥ 32 dB (same content, just residual coded).
+#[test]
+fn r31_huffman_inter_roundtrip_own_decoder() {
+    let (w, h) = (32usize, 32usize);
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+    let u = vec![128u8; uv_w * uv_h];
+    let v = vec![128u8; uv_w * uv_h];
+
+    // Keyframe: vertical stripes
+    let mut y_prev = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y_prev[r * w + c] = if (c / 8) % 2 == 0 { 60 } else { 180 };
+        }
+    }
+
+    // Inter: shift the pattern by 4 pixels
+    let mut y_new = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            let src = (c + 4) % w;
+            y_new[r * w + c] = y_prev[r * w + src];
+        }
+    }
+
+    let mut enc = Vp6Encoder::new(16);
+    let key = enc.encode_keyframe(&y_prev, &u, &v, w, h).expect("key");
+    let inter = enc
+        .encode_inter_frame_huffman(&y_prev, &u, &v, &y_new, &u, &v, w, h, 8)
+        .expect("huffman inter");
+
+    // Wrap in FLV and decode both frames.
+    let flv = build_two_tag_flv(&key, &inter);
+
+    // Decode the inter frame (index 1).
+    let (dec_y, _dec_u, _dec_v) = decode_frame_n(&flv, 1);
+
+    let psnr = plane_psnr(&y_new, &dec_y);
+    assert!(
+        psnr >= 32.0,
+        "Huffman inter roundtrip Y PSNR too low: {psnr:.1} dB (want >= 32 dB)"
+    );
+}
+
+/// r31: ffmpeg decodes our Huffman inter frame.
+#[test]
+fn r31_ffmpeg_decodes_huffman_inter_frame() {
+    use std::process::Command;
+    use std::io::Write;
+
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("ffmpeg not available — skipping r31_ffmpeg_decodes_huffman_inter_frame");
+        return;
+    }
+
+    let (w, h) = (32usize, 32usize);
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+    let u = vec![128u8; uv_w * uv_h];
+    let v = vec![128u8; uv_w * uv_h];
+    let mut y_prev = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y_prev[r * w + c] = if (c / 8) % 2 == 0 { 60 } else { 180 };
+        }
+    }
+    let mut y_new = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            let src = (c + 4) % w;
+            y_new[r * w + c] = y_prev[r * w + src];
+        }
+    }
+
+    let mut enc = Vp6Encoder::new(16);
+    let key = enc.encode_keyframe(&y_prev, &u, &v, w, h).expect("key");
+    let inter = enc
+        .encode_inter_frame_huffman(&y_prev, &u, &v, &y_new, &u, &v, w, h, 8)
+        .expect("huffman inter");
+
+    // Build FLV and pipe into ffmpeg.
+    let flv = build_two_tag_flv(&key, &inter);
+
+    let mut child = Command::new("ffmpeg")
+        .args(["-hide_banner", "-i", "pipe:0", "-c:v", "rawvideo", "-f", "null", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn ffmpeg");
+    {
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin.write_all(&flv).expect("write flv");
+    }
+    let out = child.wait_with_output().expect("ffmpeg wait");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), stderr);
+    let mut last = 0u32;
+    for line in combined.lines() {
+        if let Some(after) = line.split("frame=").nth(1) {
+            let digits: String = after
+                .chars()
+                .skip_while(|c| c.is_whitespace())
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                last = n;
+            }
+        }
+    }
+    assert_eq!(
+        last, 2,
+        "ffmpeg should decode both keyframe + Huffman inter (got {last}); stderr: {stderr}"
+    );
+}
+
+/// r31: RDO path produces a valid stream readable by our decoder at ≥ 32 dB.
+#[test]
+fn r31_rdo_inter_roundtrip_own_decoder() {
+    let (w, h) = (32usize, 32usize);
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+    let u = vec![128u8; uv_w * uv_h];
+    let v = vec![128u8; uv_w * uv_h];
+    let mut y_prev = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y_prev[r * w + c] = if (c / 8) % 2 == 0 { 60 } else { 180 };
+        }
+    }
+    let mut y_new = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            let src = (c + 4) % w;
+            y_new[r * w + c] = y_prev[r * w + src];
+        }
+    }
+
+    let mut enc = Vp6Encoder::new(16);
+    let key = enc.encode_keyframe(&y_prev, &u, &v, w, h).expect("key");
+    let inter = enc
+        .encode_inter_frame_rdo(&y_prev, &u, &v, &y_new, &u, &v, w, h, 8)
+        .expect("rdo inter");
+
+    let flv = build_two_tag_flv(&key, &inter);
+    let (dec_y, _, _) = decode_frame_n(&flv, 1);
+
+    let psnr = plane_psnr(&y_new, &dec_y);
+    assert!(
+        psnr >= 32.0,
+        "RDO inter roundtrip Y PSNR too low: {psnr:.1} dB (want >= 32 dB)"
+    );
+}
+
+/// r31: RDO inter is ≤ bool-only inter (bytes ratio).
+///
+/// The RDO path always picks the smaller of bool vs Huffman — it can
+/// never produce more bytes than either single path alone. This test
+/// verifies the invariant by comparing against the bool-only path on
+/// a fixture where both paths are expected to be close (striped content).
+#[test]
+fn r31_rdo_inter_not_larger_than_bool_inter() {
+    let (w, h) = (32usize, 32usize);
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+    let u = vec![128u8; uv_w * uv_h];
+    let v = vec![128u8; uv_w * uv_h];
+    let mut y_prev = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y_prev[r * w + c] = if (c / 8) % 2 == 0 { 60 } else { 180 };
+        }
+    }
+    let mut y_new = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            let src = (c + 4) % w;
+            y_new[r * w + c] = y_prev[r * w + src];
+        }
+    }
+
+    // Bool path
+    let mut enc_bool = Vp6Encoder::new(16);
+    enc_bool.encode_keyframe(&y_prev, &u, &v, w, h).expect("key bool");
+    let bool_bytes = enc_bool
+        .encode_inter_frame(&y_prev, &u, &v, &y_new, &u, &v, w, h, 8)
+        .expect("bool inter")
+        .len();
+
+    // RDO path (fresh encoder, same key content)
+    let mut enc_rdo = Vp6Encoder::new(16);
+    enc_rdo.encode_keyframe(&y_prev, &u, &v, w, h).expect("key rdo");
+    let rdo_bytes = enc_rdo
+        .encode_inter_frame_rdo(&y_prev, &u, &v, &y_new, &u, &v, w, h, 8)
+        .expect("rdo inter")
+        .len();
+
+    assert!(
+        rdo_bytes <= bool_bytes,
+        "RDO inter ({rdo_bytes} B) must not exceed bool inter ({bool_bytes} B)"
+    );
+}
+
+/// r31: byte-size comparison: Huffman vs bool inter on flat-delta content.
+///
+/// On a flat-color frame with a near-uniform shift (most residual is
+/// ~zero after MC) the Huffman path should be competitive with bool.
+/// We document the ratio rather than enforcing a hard bound since the
+/// winner varies with content and QP.
+#[test]
+fn r31_huffman_vs_bool_inter_byte_ratio_documented() {
+    let (w, h) = (32usize, 32usize);
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+    let u = vec![128u8; uv_w * uv_h];
+    let v = vec![128u8; uv_w * uv_h];
+    let mut y_prev = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y_prev[r * w + c] = if (c / 8) % 2 == 0 { 60 } else { 180 };
+        }
+    }
+    let mut y_new = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            let src = (c + 4) % w;
+            y_new[r * w + c] = y_prev[r * w + src];
+        }
+    }
+
+    let mut enc_bool = Vp6Encoder::new(16);
+    enc_bool.encode_keyframe(&y_prev, &u, &v, w, h).expect("key bool");
+    let bool_bytes = enc_bool
+        .encode_inter_frame(&y_prev, &u, &v, &y_new, &u, &v, w, h, 8)
+        .expect("bool inter")
+        .len();
+
+    let mut enc_huff = Vp6Encoder::new(16);
+    enc_huff.encode_keyframe(&y_prev, &u, &v, w, h).expect("key huff");
+    let huff_bytes = enc_huff
+        .encode_inter_frame_huffman(&y_prev, &u, &v, &y_new, &u, &v, w, h, 8)
+        .expect("huffman inter")
+        .len();
+
+    let ratio = huff_bytes as f64 / bool_bytes as f64;
+    // Document the ratio — both should be small and in a plausible range.
+    // The Huffman partition overhead (full table per frame) makes it
+    // larger on small frames; on larger frames it typically wins.
+    // We just assert both are sane (> 0) and the ratio is bounded.
+    assert!(bool_bytes > 0 && huff_bytes > 0, "frame sizes must be non-zero");
+    assert!(
+        ratio < 3.0,
+        "Huffman inter is {ratio:.2}× the bool inter — unexpectedly large"
+    );
+    eprintln!(
+        "r31 Huffman vs bool inter ratio: {huff_bytes} B / {bool_bytes} B = {ratio:.2}×"
+    );
+}

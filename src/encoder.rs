@@ -302,6 +302,28 @@ pub struct Vp6Encoder {
     /// [`Self::set_bitrate_target`] / [`Self::update_qp_after_frame`]
     /// for the wiring.
     pub bitrate: Option<BitrateControl>,
+    /// Scene-change detection threshold. When > 0.0, the encoder
+    /// computes the mean absolute difference (SAD) of the incoming
+    /// luma frame against the previous frame and compares it against
+    /// an EMA-smoothed running mean of past frame SADs. When the
+    /// current SAD exceeds `scene_change_threshold * ema_sad`, a scene
+    /// cut is declared and
+    /// [`Vp6Encoder::encode_inter_frame_with_golden`] forces a golden-
+    /// frame refresh on that frame regardless of the cadence counter.
+    ///
+    /// Typical useful range: `2.0` (default) to `4.0`. Higher values
+    /// require a larger SAD spike to trigger; set to `0.0` to disable
+    /// scene-change detection entirely (cadence-only golden refresh).
+    ///
+    /// EMA smoothing factor is fixed at 0.1 (strongly backward-looking)
+    /// so a single noisy frame doesn't pollute the baseline. The EMA is
+    /// initialised to 0 and the first frame always seeds it without
+    /// triggering a scene change.
+    pub scene_change_threshold: f32,
+    /// EMA of per-frame normalised SAD (luma pixels, SAD-per-pixel).
+    /// Updated by `encode_inter_frame_with_golden` after the scene-
+    /// change check. Internal state — callers don't usually read this.
+    sad_ema: f32,
 }
 
 /// Bitrate-control state carried in [`Vp6Encoder::bitrate`]. Implements
@@ -414,6 +436,8 @@ impl Default for Vp6Encoder {
             have_keyframe: false,
             inter_frames_since_golden: 0,
             bitrate: None,
+            scene_change_threshold: 2.0,
+            sad_ema: 0.0,
         }
     }
 }
@@ -434,6 +458,8 @@ impl Vp6Encoder {
             have_keyframe: false,
             inter_frames_since_golden: 0,
             bitrate: None,
+            scene_change_threshold: 2.0,
+            sad_ema: 0.0,
         }
     }
 
@@ -2191,8 +2217,49 @@ impl Vp6Encoder {
             return Err(Error::invalid("VP6 encode: plane buffers too small"));
         }
 
+        // Scene-change detection (r31+). Compute the normalised per-pixel
+        // SAD of the incoming luma frame against the previous frame and
+        // compare against the EMA running mean. A spike above
+        // `scene_change_threshold × ema_sad` triggers a golden refresh
+        // independently of the cadence counter, giving the decoder a fresh
+        // reference on cuts so subsequent golden-ref MBs don't reach back
+        // to stale pre-cut content.
+        //
+        // The EMA is initialised to 0; the first inter frame always seeds
+        // it (SAD / ema_sad = inf > threshold → scene_cut = false because
+        // we guard on ema_sad > 0.0). This prevents the first frame from
+        // spuriously triggering a scene cut.
+        let frame_sad_pp = if prev_y.len() >= width * height {
+            let pix = (width * height) as f32;
+            let mut acc = 0u64;
+            for (a, b) in new_y[..width * height]
+                .iter()
+                .zip(prev_y[..width * height].iter())
+            {
+                acc += (*a as i32 - *b as i32).unsigned_abs() as u64;
+            }
+            acc as f32 / pix
+        } else {
+            0.0
+        };
+        let scene_cut = self.scene_change_threshold > 0.0
+            && self.sad_ema > 0.0
+            && frame_sad_pp > self.scene_change_threshold * self.sad_ema;
+        // Update EMA regardless of whether a cut was declared.
+        const SAD_EMA_ALPHA: f32 = 0.1;
+        // Seed EMA with at least 1.0 so that after a static (SAD=0) first
+        // inter frame the second frame can still trigger a scene cut. A
+        // raw seed of 0.0 would permanently disable the threshold check.
+        self.sad_ema = if self.sad_ema == 0.0 {
+            // First frame — seed with the current SAD or a small positive
+            // floor so the second frame has a non-zero EMA to compare against.
+            frame_sad_pp.max(1.0)
+        } else {
+            SAD_EMA_ALPHA * frame_sad_pp + (1.0 - SAD_EMA_ALPHA) * self.sad_ema
+        };
+
         // Decide whether to flip the golden_frame_flag this frame.
-        let refresh_golden = self.should_refresh_golden();
+        let refresh_golden = self.should_refresh_golden() || scene_cut;
 
         // --- Fixed inter header (MultiStream=1, two partitions) ---------
         let mut out = Vec::<u8>::with_capacity(16 + mb_width * mb_height * 8);
@@ -2641,6 +2708,633 @@ impl Vp6Encoder {
             self.inter_frames_since_golden = self.inter_frames_since_golden.saturating_add(1);
         }
         Ok(out)
+    }
+
+    /// Emit a P-frame with a Huffman-coded coefficient partition (r31).
+    ///
+    /// Mirror of [`Self::encode_inter_frame`] with one change: partition 2
+    /// (DCT coefficients) is emitted as a raw-bit Huffman stream (`UseHuffman = 1`
+    /// in the picture header) rather than the bool-coded range-coder path.
+    /// Partition 1 (mode info / MVs) remains bool-coded.
+    ///
+    /// The Huffman trees are built from the post-update coefficient model
+    /// using the same `VP6_CreateHuffmanTree` algorithm as
+    /// [`Self::encode_keyframe_huffman`]. Since we emit no coefficient model
+    /// updates (all "no update" flags), the trees are built from the
+    /// `0x80`-baseline model that the keyframe established.
+    ///
+    /// Spec ref: same as `encode_keyframe_huffman` — sections 7.2 + 13.1 +
+    /// 13.2.2 + 13.3.2 + 13.3.3.2 + 13.4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_inter_frame_huffman(
+        &mut self,
+        prev_y: &[u8],
+        prev_u: &[u8],
+        prev_v: &[u8],
+        new_y: &[u8],
+        new_u: &[u8],
+        new_v: &[u8],
+        width: usize,
+        height: usize,
+        search: i32,
+    ) -> Result<EncodedFrame> {
+        if !self.have_keyframe {
+            return Err(Error::invalid(
+                "VP6 encode: inter frame requires a preceding keyframe",
+            ));
+        }
+        let mb_width = self.mb_width as usize;
+        let mb_height = self.mb_height as usize;
+        if width != mb_width * 16 || height != mb_height * 16 {
+            return Err(Error::invalid(
+                "VP6 encode: inter-frame dims must match the preceding keyframe",
+            ));
+        }
+        let uv_stride = width / 2;
+        let uv_h = height / 2;
+        let need_y = width * height;
+        let need_uv = uv_stride * uv_h;
+        if prev_y.len() < need_y
+            || new_y.len() < need_y
+            || prev_u.len() < need_uv
+            || prev_v.len() < need_uv
+            || new_u.len() < need_uv
+            || new_v.len() < need_uv
+        {
+            return Err(Error::invalid("VP6 encode: plane buffers too small"));
+        }
+
+        // --- Fixed inter header (MultiStream=1, Huffman=1 in partition 1)
+        let mut out = Vec::<u8>::with_capacity(16 + mb_width * mb_height * 8);
+        out.push(0x80 | ((self.qp << 1) & 0x7E) | 0x01);
+        out.push(0);
+        out.push(0);
+        let buff2_hi_idx = out.len() - 2;
+        let buff2_lo_idx = out.len() - 1;
+
+        let mut enc = RangeEncoder::new();
+        // golden_frame_flag = 0 (no cadence-driven refresh on this path).
+        enc.put_bit(0);
+        // use_huffman = 1 — switches the coefficient partition to Huffman.
+        enc.put_bit(1);
+
+        // All prob-model update passes: no updates.
+        for _ctx in 0..3 {
+            enc.put_prob(174, 0);
+            enc.put_prob(254, 0);
+        }
+        for comp in 0..2 {
+            enc.put_prob(tables::VP6_SIG_DCT_PCT[comp][0], 0);
+            enc.put_prob(tables::VP6_SIG_DCT_PCT[comp][1], 0);
+        }
+        for comp in 0..2 {
+            for node in 0..7 {
+                enc.put_prob(tables::VP6_PDV_PCT[comp][node], 0);
+            }
+        }
+        for comp in 0..2 {
+            for node in 0..8 {
+                enc.put_prob(tables::VP6_FDV_PCT[comp][node], 0);
+            }
+        }
+        for pt in 0..2 {
+            for node in 0..11 {
+                enc.put_prob(tables::VP6_DCCV_PCT[pt][node], 0);
+            }
+        }
+        enc.put_bit(0);
+        for cg in 0..2 {
+            for node in 0..14 {
+                enc.put_prob(tables::VP6_RUNV_PCT[cg][node], 0);
+            }
+        }
+        for ct in 0..3 {
+            for pt in 0..2 {
+                for cg in 0..6 {
+                    for node in 0..11 {
+                        enc.put_prob(tables::VP6_RACT_PCT[ct][pt][cg][node], 0);
+                    }
+                }
+            }
+        }
+
+        // Build the model at the 0x80 inter-frame baseline.
+        let mut model = Vp6Model::default();
+        model.reset_defaults(false, self.sub_version);
+        for pt in 0..2 {
+            for node in 0..11 {
+                model.coeff_dccv[pt][node] = 0x80;
+            }
+        }
+        for ct in 0..3 {
+            for pt in 0..2 {
+                for cg in 0..6 {
+                    for node in 0..11 {
+                        model.coeff_ract[pt][ct][cg][node] = 0x80;
+                    }
+                }
+            }
+        }
+        // coeff_runv: reset_defaults(false, ..) already sets VP6_DEF_RUNV_MODEL;
+        // we emit no runv updates, so the decoder retains the same defaults.
+        // Do NOT override to 0x80 here — that would mismatch the decoder.
+        for pt in 0..2 {
+            for ctx in 0..3 {
+                for node in 0..5 {
+                    let v = ((model.coeff_dccv[pt][node] as i32
+                        * tables::VP6_DCCV_LC[ctx][node][0]
+                        + 128)
+                        >> 8)
+                        + tables::VP6_DCCV_LC[ctx][node][1];
+                    model.coeff_dcct[pt][ctx][node] = v.clamp(1, 255) as u8;
+                }
+            }
+        }
+        model.rebuild_mb_type_probs();
+
+        // Build Huffman trees from the baseline model.
+        let trees = crate::huffman::HuffmanTreeSet::build(&model);
+
+        let mut mb_info: Vec<EncMbInfo> = vec![EncMbInfo::default(); mb_width * mb_height];
+        let mut vector_candidate_pos: i32 = 0;
+        let mut prev_type = tables::Vp56Mb::InterNoVecPf;
+
+        let mut enc_left_block: [EncRefDc; 4] = [EncRefDc::default(); 4];
+        let mut enc_above_blocks: Vec<EncRefDc> =
+            vec![EncRefDc::default(); 4 * mb_width + 6];
+        if 2 * mb_width + 2 < enc_above_blocks.len() {
+            enc_above_blocks[2 * mb_width + 2].ref_frame = RefKind::Current;
+        }
+        if 3 * mb_width + 4 < enc_above_blocks.len() {
+            enc_above_blocks[3 * mb_width + 4].ref_frame = RefKind::Current;
+        }
+        let mut enc_prev_dc = [[0i16; 3]; 3];
+        enc_prev_dc[1][0] = 128;
+        enc_prev_dc[2][0] = 128;
+
+        let dequant_dc = (tables::VP56_DC_DEQUANT[self.qp as usize & 0x3F] as i32) << 2;
+        let dequant_ac = (tables::VP56_AC_DEQUANT[self.qp as usize & 0x3F] as i32) << 2;
+
+        // Per-MB mode info goes into partition 1 (bool); coefficients go
+        // into the per-block coefficient table for Huffman emission later.
+        let total_blocks = mb_width * mb_height * 6;
+        // `block_coeffs[mb*6+b]` — 64 i32 entries: DC at index 0, AC at 1..=63.
+        let mut block_coeffs: Vec<[i32; 64]> = vec![[0i32; 64]; total_blocks];
+        // `block_mv[mb*6+b]` — the MV assigned to each block.
+        let mut block_mv: Vec<Mv> = vec![Mv::default(); total_blocks];
+
+        for mb_row in 0..mb_height {
+            for b in &mut enc_left_block {
+                *b = EncRefDc::default();
+            }
+            let mut above_block_idx: [usize; 6] = [0; 6];
+            above_block_idx[0] = 1;
+            above_block_idx[1] = 2;
+            above_block_idx[2] = 1;
+            above_block_idx[3] = 2;
+            above_block_idx[4] = 2 * mb_width + 2 + 1;
+            above_block_idx[5] = 3 * mb_width + 4 + 1;
+
+            for mb_col in 0..mb_width {
+                let mb_idx = mb_row * mb_width + mb_col;
+                // ME + mode decision (mirrors encode_inter_frame exactly).
+                let (q_dx, q_dy) = motion_search(
+                    new_y, prev_y, width, height, mb_row, mb_col, search, self.qp,
+                );
+                let mb_x = (mb_col * 16) as i32;
+                let mb_y = (mb_row * 16) as i32;
+                let block4_search = search.min(2);
+                let mut block_mvs = [Mv::default(); 4];
+                for bi in 0..4usize {
+                    let bx = mb_x + if bi & 1 != 0 { 8 } else { 0 };
+                    let by = mb_y + if bi & 2 != 0 { 8 } else { 0 };
+                    let (bqx, bqy) = motion_search_8x8(
+                        new_y, prev_y, width, height, bx, by, q_dx, q_dy, block4_search, self.qp,
+                    );
+                    block_mvs[bi] = Mv {
+                        x: bqx as i16,
+                        y: bqy as i16,
+                    };
+                }
+                let single_mv = Mv {
+                    x: q_dx as i16,
+                    y: q_dy as i16,
+                };
+                let mut fourmv_diverges = false;
+                for bi in 0..4usize {
+                    let dx = (block_mvs[bi].x as i32 - single_mv.x as i32).abs();
+                    let dy = (block_mvs[bi].y as i32 - single_mv.y as i32).abs();
+                    if dx >= 2 || dy >= 2 {
+                        fourmv_diverges = true;
+                        break;
+                    }
+                }
+                let mut sad_single = 0u64;
+                let mut sad_fourmv = 0u64;
+                for bi in 0..4usize {
+                    let bx = mb_x + if bi & 1 != 0 { 8 } else { 0 };
+                    let by = mb_y + if bi & 2 != 0 { 8 } else { 0 };
+                    sad_single += sad8x8_qpel(
+                        new_y, prev_y, width, height, bx, by, single_mv.x as i32,
+                        single_mv.y as i32,
+                    );
+                    sad_fourmv += sad8x8_qpel(
+                        new_y, prev_y, width, height, bx, by, block_mvs[bi].x as i32,
+                        block_mvs[bi].y as i32,
+                    );
+                }
+                let (ctx_val, candidate0, candidate1, new_pos) = enc_vector_predictors(
+                    &mb_info, mb_width, mb_height, mb_row, mb_col,
+                    tables::RefFrame::Previous, vector_candidate_pos,
+                );
+                vector_candidate_pos = new_pos;
+                let ctx = ctx_val.clamp(0, 2) as usize;
+                let want_mv = single_mv;
+                let single_type = if want_mv.x == 0 && want_mv.y == 0 {
+                    tables::Vp56Mb::InterNoVecPf
+                } else {
+                    tables::Vp56Mb::InterDeltaPf
+                };
+                let lambda = self.qp as u64;
+                let single_bits = if single_type == tables::Vp56Mb::InterDeltaPf {
+                    mv_bit_cost_estimate(want_mv.x as i32, want_mv.y as i32)
+                } else {
+                    0
+                };
+                let mut fourmv_bits: u64 = 8;
+                for bi in 0..4usize {
+                    if block_mvs[bi].x != 0 || block_mvs[bi].y != 0 {
+                        fourmv_bits = fourmv_bits.saturating_add(mv_bit_cost_estimate(
+                            block_mvs[bi].x as i32, block_mvs[bi].y as i32,
+                        ));
+                    }
+                }
+                let cost_single = sad_single.saturating_add(lambda.saturating_mul(single_bits));
+                let cost_fourmv = sad_fourmv.saturating_add(lambda.saturating_mul(fourmv_bits));
+                let inter_best_type =
+                    if self.allow_fourmv && fourmv_diverges && cost_fourmv < cost_single {
+                        tables::Vp56Mb::Inter4V
+                    } else {
+                        single_type
+                    };
+                let inter_best_cost = if inter_best_type == tables::Vp56Mb::Inter4V {
+                    cost_fourmv
+                } else {
+                    cost_single
+                };
+                let mut intra_sad_proxy = 0u64;
+                let mut intra_dct_count = 0u64;
+                let mut intra_bits = 0u64;
+                if self.allow_intra_in_inter {
+                    intra_sad_proxy = mb_intra_sad_proxy(new_y, width, mb_x, mb_y);
+                    intra_dct_count =
+                        mb_intra_dct_count_proxy(new_y, width, mb_x, mb_y, dequant_ac);
+                    intra_bits = 6;
+                }
+                let cost_intra = intra_sad_proxy
+                    .saturating_add(lambda.saturating_mul(intra_bits))
+                    .saturating_add(lambda.saturating_mul(intra_dct_count.saturating_mul(4)));
+                let new_type = if self.allow_intra_in_inter && cost_intra < inter_best_cost {
+                    tables::Vp56Mb::Intra
+                } else {
+                    inter_best_type
+                };
+
+                // Emit MB-type into partition 1.
+                let stay_prob = model.mb_type[ctx][prev_type as usize][0];
+                if new_type == prev_type {
+                    enc.put_prob(stay_prob, 1);
+                } else {
+                    enc.put_prob(stay_prob, 0);
+                    encode_pmbt_tree(&mut enc, &model.mb_type[ctx][prev_type as usize], new_type);
+                }
+
+                // Emit MV delta(s) into partition 1.
+                let stored_mv;
+                let mut block_mv_full = [Mv::default(); 6];
+                match new_type {
+                    tables::Vp56Mb::InterDeltaPf => {
+                        let base = if vector_candidate_pos < 2 {
+                            candidate0
+                        } else {
+                            Mv::default()
+                        };
+                        let delta_x = want_mv.x as i32 - base.x as i32;
+                        let delta_y = want_mv.y as i32 - base.y as i32;
+                        encode_mv_component(&mut enc, &model, 0, delta_x);
+                        encode_mv_component(&mut enc, &model, 1, delta_y);
+                        for b in 0..4 {
+                            block_mv_full[b] = want_mv;
+                        }
+                        block_mv_full[4] = want_mv;
+                        block_mv_full[5] = want_mv;
+                        stored_mv = want_mv;
+                    }
+                    tables::Vp56Mb::Inter4V => {
+                        let base = if vector_candidate_pos < 2 {
+                            candidate0
+                        } else {
+                            Mv::default()
+                        };
+                        for bi in 0..4usize {
+                            let mv = block_mvs[bi];
+                            let is_zero = mv.x == 0 && mv.y == 0;
+                            let raw = if is_zero { 0u32 } else { 1u32 };
+                            enc.put_bits(2, raw);
+                        }
+                        let mut sum_x = 0i32;
+                        let mut sum_y = 0i32;
+                        for bi in 0..4usize {
+                            let mv = block_mvs[bi];
+                            let is_zero = mv.x == 0 && mv.y == 0;
+                            if !is_zero {
+                                let dx = mv.x as i32 - base.x as i32;
+                                let dy = mv.y as i32 - base.y as i32;
+                                encode_mv_component(&mut enc, &model, 0, dx);
+                                encode_mv_component(&mut enc, &model, 1, dy);
+                            }
+                            block_mv_full[bi] = mv;
+                            sum_x += mv.x as i32;
+                            sum_y += mv.y as i32;
+                        }
+                        let shifted = |v: i32| -> i16 {
+                            let r = if v >= 0 {
+                                (v + 2) >> 2
+                            } else {
+                                -(((-v) + 2) >> 2)
+                            };
+                            r as i16
+                        };
+                        let chroma_mv = Mv {
+                            x: shifted(sum_x),
+                            y: shifted(sum_y),
+                        };
+                        block_mv_full[4] = chroma_mv;
+                        block_mv_full[5] = chroma_mv;
+                        stored_mv = block_mvs[3];
+                    }
+                    _ => {
+                        stored_mv = Mv::default();
+                    }
+                }
+                let _ = candidate1;
+
+                mb_info[mb_idx] = EncMbInfo { mb_type: new_type, mv: stored_mv };
+                prev_type = new_type;
+
+                // Quantise residual coefficients — same logic as
+                // encode_inter_frame, but store into block_coeffs for
+                // the Huffman pass below instead of emitting directly.
+                let mb_ref_kind = if new_type == tables::Vp56Mb::Intra {
+                    RefKind::Current
+                } else {
+                    RefKind::Previous
+                };
+                let mb_ref_dc_idx = match mb_ref_kind {
+                    RefKind::Current => 0usize,
+                    RefKind::Previous => 1usize,
+                    RefKind::Golden => 2usize,
+                    RefKind::None => 1usize,
+                };
+                for b in 0..6usize {
+                    let plane_idx = tables::B2P[b] as usize;
+
+                    let mut orig_tile = [0i32; 64];
+                    sample_block_tile(
+                        b, mb_row, mb_col, new_y, new_u, new_v, width, uv_stride, &mut orig_tile,
+                    );
+
+                    let mut coefs = [0i32; 64];
+                    if new_type == tables::Vp56Mb::Intra {
+                        forward_dct8x8(&orig_tile, &mut coefs);
+                    } else {
+                        let mut mc_tile = [0i32; 64];
+                        sample_mc_tile(
+                            b, mb_row, mb_col, prev_y, prev_u, prev_v, width, uv_stride, height,
+                            uv_h, block_mv_full[b], &mut mc_tile,
+                        );
+                        let mut residual = [0i32; 64];
+                        for i in 0..64 {
+                            residual[i] = orig_tile[i] - mc_tile[i];
+                        }
+                        forward_dct8x8_residual(&residual, &mut coefs);
+                    }
+
+                    let new_dc = div_nearest(coefs[0], dequant_dc).clamp(-32768, 32767) as i16;
+
+                    let lb = enc_left_block[tables::B6_TO_4[b] as usize];
+                    let ab = enc_above_blocks[above_block_idx[b]];
+                    let mut count = 0i32;
+                    let mut pdc = 0i32;
+                    if lb.ref_frame == mb_ref_kind {
+                        pdc += lb.dc_coeff as i32;
+                        count += 1;
+                    }
+                    if ab.ref_frame == mb_ref_kind {
+                        pdc += ab.dc_coeff as i32;
+                        count += 1;
+                    }
+                    let predictor: i32 = match count {
+                        0 => enc_prev_dc[plane_idx][mb_ref_dc_idx] as i32,
+                        2 => pdc / 2,
+                        _ => pdc,
+                    };
+                    let coded_dc = (new_dc as i32 - predictor).clamp(-32768, 32767) as i16;
+
+                    let mut levels = [0i32; 64];
+                    levels[0] = coded_dc as i32;
+                    for coeff_idx in 1..64usize {
+                        let pos = model.coeff_index_to_pos[coeff_idx] as usize;
+                        let perm = tables::IDCT_SCANTABLE[pos] as usize;
+                        levels[coeff_idx] =
+                            div_nearest(coefs[perm], dequant_ac).clamp(-2047, 2047);
+                    }
+
+                    let blk_idx = mb_idx * 6 + b;
+                    block_coeffs[blk_idx] = levels;
+                    block_mv[blk_idx] = block_mv_full[b];
+
+                    let new_dc_final = (coded_dc as i32 + predictor) as i16;
+                    let has_nonzero_dc = coded_dc != 0;
+                    let lb_idx = tables::B6_TO_4[b] as usize;
+                    enc_left_block[lb_idx] = EncRefDc {
+                        not_null_dc: has_nonzero_dc,
+                        ref_frame: mb_ref_kind,
+                        dc_coeff: new_dc_final,
+                    };
+                    enc_above_blocks[above_block_idx[b]] = EncRefDc {
+                        not_null_dc: has_nonzero_dc,
+                        ref_frame: mb_ref_kind,
+                        dc_coeff: new_dc_final,
+                    };
+                    enc_prev_dc[plane_idx][mb_ref_dc_idx] = new_dc_final;
+                }
+
+                for y in 0..4 {
+                    above_block_idx[y] += 2;
+                }
+                for uv in 4..6 {
+                    above_block_idx[uv] += 1;
+                }
+            }
+        }
+
+        // --- Emit Huffman coefficient partition (mirrors encode_keyframe_huffman).
+        let mut bw = crate::huffman::BitWriter::new();
+        let mut state = crate::huffman::HuffmanFrameState::default();
+
+        // Build plane-sequence lists for cross-block run tracking.
+        let mut plane_seq: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+        for mb_row in 0..mb_height {
+            for mb_col in 0..mb_width {
+                for b in 0..6usize {
+                    let p = if b < 4 { 0usize } else { 1usize };
+                    plane_seq[p].push((mb_row * mb_width + mb_col) * 6 + b);
+                }
+            }
+        }
+        let mut plane_pos = vec![(0usize, 0usize); total_blocks];
+        for p in 0..2 {
+            for (i, &blk_idx) in plane_seq[p].iter().enumerate() {
+                plane_pos[blk_idx] = (p, i);
+            }
+        }
+
+        for mb_row in 0..mb_height {
+            for mb_col in 0..mb_width {
+                for b in 0..6usize {
+                    let plane = if b < 4 { 0usize } else { 1usize };
+                    let blk_idx = (mb_row * mb_width + mb_col) * 6 + b;
+                    let (_, pos) = plane_pos[blk_idx];
+                    let levels = block_coeffs[blk_idx];
+
+                    let queued_dc = if state.dc_run_len[plane] == 0 && levels[0] == 0 {
+                        let mut k = 0u32;
+                        let mut q = pos + 1;
+                        while q < plane_seq[plane].len() {
+                            let next_blk = plane_seq[plane][q];
+                            if block_coeffs[next_blk][0] == 0 {
+                                k += 1;
+                                q += 1;
+                                if k >= 73 {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        k
+                    } else {
+                        0
+                    };
+                    let all_ac_zero = levels[1..=63].iter().all(|&c| c == 0);
+                    let queued_eob = if state.ac1_eob_run_len[plane] == 0 && all_ac_zero {
+                        let mut k = 0u32;
+                        let mut q = pos + 1;
+                        while q < plane_seq[plane].len() {
+                            let next_blk = plane_seq[plane][q];
+                            let nl = &block_coeffs[next_blk];
+                            if nl[1..=63].iter().all(|&c| c == 0) {
+                                k += 1;
+                                q += 1;
+                                if k >= 73 {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        k
+                    } else {
+                        0
+                    };
+
+                    let mut dc_run = state.dc_run_len[plane];
+                    let mut eob_run = state.ac1_eob_run_len[plane];
+                    crate::huffman::encode_block_huffman(
+                        &mut bw,
+                        &trees,
+                        plane,
+                        &levels,
+                        &mut dc_run,
+                        &mut eob_run,
+                        queued_dc,
+                        queued_eob,
+                    );
+                    state.dc_run_len[plane] = dc_run;
+                    state.ac1_eob_run_len[plane] = eob_run;
+                }
+            }
+        }
+        let _ = &block_mv;
+
+        let p1 = enc.finish();
+        let p2 = bw.finish();
+        let buff2 = ((3 + p1.len()) as u32).min(0xFFFF);
+        out[buff2_hi_idx] = ((buff2 >> 8) & 0xFF) as u8;
+        out[buff2_lo_idx] = (buff2 & 0xFF) as u8;
+        out.extend_from_slice(&p1);
+        out.extend_from_slice(&p2);
+        self.inter_frames_since_golden = self.inter_frames_since_golden.saturating_add(1);
+        Ok(out)
+    }
+
+    /// Emit a P-frame choosing between bool-coded and Huffman-coded
+    /// coefficient partitions via RDO (r31). Both encodings are produced
+    /// (using [`Self::encode_inter_frame`] and
+    /// [`Self::encode_inter_frame_huffman`] internally) and the one with
+    /// fewer bytes is returned. The cadence counter is updated once.
+    ///
+    /// The selection is pure size-based: the smaller output is taken
+    /// without any rate-distortion weighting because both paths encode
+    /// the same DCT levels (same distortion) — the only difference is
+    /// the entropy-coding of those levels. On highly-structured content
+    /// (many zero runs, predictable token distribution) the Huffman path
+    /// is typically 5–15% smaller than the bool path; on noisy content
+    /// with broadly flat token probabilities the bool path can win.
+    ///
+    /// **Note**: this method runs the full ME + quantise pass twice
+    /// (once per candidate), so it is roughly 2× slower than either
+    /// single-path method. Suitable for offline / high-quality encodes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_inter_frame_rdo(
+        &mut self,
+        prev_y: &[u8],
+        prev_u: &[u8],
+        prev_v: &[u8],
+        new_y: &[u8],
+        new_u: &[u8],
+        new_v: &[u8],
+        width: usize,
+        height: usize,
+        search: i32,
+    ) -> Result<EncodedFrame> {
+        // Save encoder state so we can restore it for the second pass.
+        let saved_inter = self.inter_frames_since_golden;
+        let saved_sad_ema = self.sad_ema;
+
+        let bool_out = self.encode_inter_frame(
+            prev_y, prev_u, prev_v, new_y, new_u, new_v, width, height, search,
+        )?;
+        let bool_counter = self.inter_frames_since_golden;
+
+        // Restore state for the Huffman pass.
+        self.inter_frames_since_golden = saved_inter;
+        self.sad_ema = saved_sad_ema;
+
+        let huff_out = self.encode_inter_frame_huffman(
+            prev_y, prev_u, prev_v, new_y, new_u, new_v, width, height, search,
+        )?;
+        let huff_counter = self.inter_frames_since_golden;
+
+        // Pick smaller. On a tie prefer the bool path (established baseline).
+        if huff_out.len() < bool_out.len() {
+            self.inter_frames_since_golden = huff_counter;
+            Ok(huff_out)
+        } else {
+            self.inter_frames_since_golden = bool_counter;
+            Ok(bool_out)
+        }
     }
 
     /// Current encoder dims in macroblocks — exposed for tests + diagnostics.

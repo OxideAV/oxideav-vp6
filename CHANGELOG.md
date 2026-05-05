@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **r31 — Scene-change golden refresh + Huffman inter encode + bool/Huffman RDO
+  (encoder).** Three encoder-only improvements:
+
+  1. **Scene-change-driven golden refresh.** `Vp6Encoder` gains two new
+     public fields: `scene_change_threshold: f32` (default `2.0`) and
+     internal `sad_ema: f32`. `encode_inter_frame_with_golden` now computes
+     the per-pixel normalised luma SAD of the new frame against the previous
+     frame. The SAD is compared against an EMA-smoothed running mean (α=0.1).
+     When `frame_sad_pp > scene_change_threshold × sad_ema`, a scene cut is
+     declared and the `golden_frame_flag` bit is set regardless of the
+     cadence counter — giving the decoder a fresh reference immediately on
+     scene cuts. The EMA is seeded on the first inter frame (with a minimum
+     floor of 1.0 so static-first-frame content doesn't permanently suppress
+     the detector). Setting `scene_change_threshold = 0.0` disables
+     scene-change detection entirely (cadence-only behaviour). New tests:
+     * `r31_scene_change_triggers_golden_refresh` — 3-frame sequence
+       (stripes key → stripes inter → checkerboard inter) asserts the
+       cadence counter resets to 1 on the scene-cut frame.
+     * `r31_scene_change_detection_disabled_at_threshold_zero` — same
+       sequence with threshold=0 asserts the counter reaches 2 (no refresh).
+
+  2. **Huffman inter encode.** New encoder method
+     `Vp6Encoder::encode_inter_frame_huffman(prev_*, new_*, ...)` emits a
+     P-frame whose coefficient partition (partition 2) is Huffman-coded
+     (`UseHuffman = 1`) while partition 1 (mode info + MVs) remains
+     bool-coded. The implementation mirrors `encode_inter_frame` for the ME
+     + mode-decision + MV-emission pass; coefficients are gathered into a
+     per-block table (same quantise/DC-predictor path) then emitted via
+     `encode_block_huffman` using trees built from the post-keyframe `0x80`
+     coefficient model baseline. On a 32×32 shifting-stripes fixture (QP 16,
+     search 8) the Huffman inter is 89 B vs 85 B for the bool path (1.05×)
+     — the tree overhead dominates on small frames; larger frames benefit
+     more. Our decoder and ffmpeg's vp6f decoder both consume the output
+     cleanly (tested by `r31_huffman_inter_roundtrip_own_decoder` and
+     `r31_ffmpeg_decodes_huffman_inter_frame`).
+
+  3. **Bool/Huffman RDO for inter frames.** New encoder method
+     `Vp6Encoder::encode_inter_frame_rdo(prev_*, new_*, ...)` runs both
+     `encode_inter_frame` (bool) and `encode_inter_frame_huffman` (Huffman)
+     and returns whichever output is smaller. Since both paths encode the
+     same DCT levels (same distortion), this is a pure size-based selection
+     with no PSNR cost. The RDO output is guaranteed to be ≤ the bool-only
+     output (verified by `r31_rdo_inter_not_larger_than_bool_inter`).
+     Round-trip PSNR ≥ 32 dB via our decoder on the shifting-stripes
+     fixture (`r31_rdo_inter_roundtrip_own_decoder`). Note: this runs the
+     full ME + quantise pass twice, so it is ~2× slower than either single
+     path; suitable for offline / high-quality encodes.
+
 - **r30 — PI controller + DCT-count intra cost + golden-aware
   intra-in-inter (encoder).** Three encoder-only refinements layered on
   r29's bitrate control + intra-in-inter RDO:

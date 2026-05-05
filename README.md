@@ -119,6 +119,25 @@ vs 306 B for intra-off — 23% smaller, 30.5 dB Y PSNR via our decoder
 (no MC-only baseline). On smooth-motion content the wire output is
 byte-identical with `allow_intra_in_inter = true` vs `false` — the
 heuristic correctly identifies that inter compensates fully.
+**r31 adds scene-change-driven golden refresh, Huffman inter encode, and
+bool/Huffman RDO.** Three encoder-only improvements:
+
+1. `Vp6Encoder::scene_change_threshold` (default `2.0`): when set > 0,
+   `encode_inter_frame_with_golden` computes the per-pixel luma SAD of the
+   new frame against the previous frame and compares it against an EMA
+   running mean (α=0.1). A SAD spike above `threshold × ema_sad` triggers a
+   golden refresh immediately, independent of the cadence counter. Set to
+   `0.0` to disable (cadence-only). On a scene-change fixture (stripes →
+   checkerboard) the counter resets correctly at the cut frame.
+2. `Vp6Encoder::encode_inter_frame_huffman(...)` — same ME + mode-decision
+   pipeline as `encode_inter_frame` but coefficient partition 2 is Huffman-
+   coded (`UseHuffman = 1`). Our decoder and ffmpeg both consume the output.
+   On a 32×32 shifting-stripes fixture (QP 16) Huffman is 89 B vs 85 B
+   bool (1.05× — tree overhead dominates on small frames).
+3. `Vp6Encoder::encode_inter_frame_rdo(...)` — runs both bool and Huffman
+   paths and returns the smaller output. Guaranteed ≤ bool-only. ~2× slower
+   (two full ME passes); suitable for offline encodes.
+
 **r30 promotes the rate controller to PI + adds DCT-count
 intra cost + lifts intra-in-inter into the golden-aware path.** Three
 encoder-only refinements layered on r29:
@@ -271,6 +290,20 @@ decoder; ffmpeg's vp6f decoder accepts the Huffman keyframe
   never grow unboundedly when `qp` is pinned at `qp_min`/`qp_max`. Set
   `ki = 0.0` to recover pre-r30 P-only behaviour. Pure no-op when
   `bitrate.is_none()`.
+
+- **Scene-change golden refresh** (r31+). `encode_inter_frame_with_golden`
+  detects SAD spikes via `scene_change_threshold` (default `2.0`) and
+  `sad_ema` (EMA α=0.1). A spike triggers a forced golden refresh regardless
+  of the cadence counter. Disable with `scene_change_threshold = 0.0`.
+
+- **Huffman inter encode** (r31+). `encode_inter_frame_huffman(...)` emits
+  P-frames with Huffman-coded coefficient partition (`UseHuffman = 1`) and
+  bool-coded mode/MV partition. Compatible with our decoder and ffmpeg's
+  vp6f decoder.
+
+- **Bool/Huffman inter RDO** (r31+). `encode_inter_frame_rdo(...)` runs both
+  bool and Huffman encode paths and returns the smaller output. Guaranteed ≤
+  bool-only at the cost of ~2× encode time. Suitable for offline encodes.
 
 - **Encoder Intra-in-inter RDO** (r29+, golden-aware in r30).
   Both `encode_inter_frame` and `encode_inter_frame_with_golden`
