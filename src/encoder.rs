@@ -263,6 +263,23 @@ pub struct Vp6Encoder {
     /// single-MV regardless (Inter4V references `RefFrame::Previous`
     /// only, so it has no role on a golden-ref MB).
     pub allow_fourmv: bool,
+    /// When `true` (default) the inter-frame encoder considers
+    /// [`tables::Vp56Mb::Intra`] as a per-MB candidate alongside the
+    /// inter modes. The PMBT tree in `tables.rs` lists `Intra` as a
+    /// reachable leaf from every prev_type, so the wire emission piggy-
+    /// backs on the existing [`encode_pmbt_tree`] walk. The decoder side
+    /// (decoder.rs:394) routes Intra MBs through `render_mb_intra`, so
+    /// reconstruction is correct as long as the encoder uses the
+    /// `RefKind::Current` DC predictor (mirror of
+    /// `mb::add_predictors_dc(scratch, RefKind::Current)`) and emits
+    /// keyframe-style coefficients (full pixel value, not residual).
+    ///
+    /// Intra-in-inter is the right choice on revealed-content MBs (an
+    /// area uncovered by motion where the residual is too costly to
+    /// encode) and on scene-change-style discontinuities. Setting this
+    /// to `false` reproduces pre-r29 behaviour where every inter MB is
+    /// either inter or skip.
+    pub allow_intra_in_inter: bool,
     /// Dimensions (in MBs) from the last encoded keyframe. Needed so
     /// [`Vp6Encoder::encode_skip_frame`] can produce a well-formed
     /// inter-frame header without requiring callers to re-supply them.
@@ -279,6 +296,74 @@ pub struct Vp6Encoder {
     /// [`Self::should_refresh_golden`] returns true and the encoder
     /// emits the `golden_frame_flag` bit.
     inter_frames_since_golden: u32,
+    /// Optional bitrate-control state. When `Some(...)` the encoder
+    /// adapts its `qp` between frames to track a target bytes-per-frame
+    /// budget. See [`BitrateControl`] for the controller shape and
+    /// [`Self::set_bitrate_target`] / [`Self::update_qp_after_frame`]
+    /// for the wiring.
+    pub bitrate: Option<BitrateControl>,
+}
+
+/// Bitrate-control state carried in [`Vp6Encoder::bitrate`]. Implements
+/// a simple proportional-with-EMA controller: after each frame the
+/// encoder reads `bytes_emitted`, computes a smoothed running average
+/// against `target_bytes_per_frame`, and nudges `qp` up (when over-
+/// shooting) or down (when under-shooting). The `kp` term is small so
+/// the controller is intentionally slow and stable — bursty content
+/// gets absorbed by smoothing rather than triggering a runaway QP swing.
+///
+/// Construction: callers usually go through
+/// [`Vp6Encoder::set_bitrate_target`] which derives sensible defaults
+/// from a `bits_per_second` + `fps` pair. For full control, build a
+/// `BitrateControl` directly.
+///
+/// Spec ref: VP6 has no spec-mandated rate controller — this is purely
+/// an encoder-side convenience. The wire format is unchanged; only the
+/// `qp` byte 0 emits varies frame-to-frame as the controller adapts.
+#[derive(Debug, Clone, Copy)]
+pub struct BitrateControl {
+    /// Target bytes per frame the encoder is trying to track. Computed
+    /// as `bits_per_second / (fps * 8)` when going through
+    /// [`Vp6Encoder::set_bitrate_target`].
+    pub target_bytes_per_frame: u32,
+    /// Lower bound on the adapted `qp` (best quality / largest frames).
+    /// Default `4`.
+    pub qp_min: u8,
+    /// Upper bound on the adapted `qp` (worst quality / smallest
+    /// frames). Default `60`.
+    pub qp_max: u8,
+    /// EMA smoothing factor for the running average of frame sizes,
+    /// in `[0, 1]`. Higher = more weight on the most recent frame
+    /// (faster but noisier response). Default `0.3`.
+    pub ema_alpha: f32,
+    /// Proportional gain on the size-error → QP-step mapping. Default
+    /// `0.5` — at this gain a 100% overshoot pushes QP up by ~3 steps,
+    /// which is large enough to converge in ~3-5 frames but small
+    /// enough not to oscillate.
+    pub kp: f32,
+    /// Smoothed running average of `bytes_emitted` from
+    /// [`Vp6Encoder::update_qp_after_frame`] calls. Internal state —
+    /// callers usually don't read this directly. Initialised to the
+    /// target on construction so the first frame's controller sees a
+    /// zero error.
+    pub ema_bytes: f32,
+}
+
+impl BitrateControl {
+    /// Construct a controller with sensible defaults for a target of
+    /// `target_bytes_per_frame` bytes. QP bounds + EMA + kp are at
+    /// their default values; the EMA seed is initialised to the target
+    /// so the first frame's update sees only the actual error.
+    pub fn new(target_bytes_per_frame: u32) -> Self {
+        Self {
+            target_bytes_per_frame,
+            qp_min: 4,
+            qp_max: 60,
+            ema_alpha: 0.3,
+            kp: 0.5,
+            ema_bytes: target_bytes_per_frame as f32,
+        }
+    }
 }
 
 impl Default for Vp6Encoder {
@@ -300,10 +385,12 @@ impl Default for Vp6Encoder {
             sub_version: 6,
             golden_refresh_period: 30,
             allow_fourmv: true,
+            allow_intra_in_inter: true,
             mb_width: 0,
             mb_height: 0,
             have_keyframe: false,
             inter_frames_since_golden: 0,
+            bitrate: None,
         }
     }
 }
@@ -318,11 +405,67 @@ impl Vp6Encoder {
             sub_version: 6,
             golden_refresh_period: 30,
             allow_fourmv: true,
+            allow_intra_in_inter: true,
             mb_width: 0,
             mb_height: 0,
             have_keyframe: false,
             inter_frames_since_golden: 0,
+            bitrate: None,
         }
+    }
+
+    /// Enable bitrate-targeting on this encoder. The controller derives
+    /// `target_bytes_per_frame = ceil(bits_per_second / (fps * 8))` and
+    /// initialises [`BitrateControl::ema_bytes`] to match, so the first
+    /// frame's controller call sees a zero-error baseline.
+    ///
+    /// After each `encode_*` call, callers must invoke
+    /// [`Self::update_qp_after_frame`] with the size of the just-emitted
+    /// frame for the controller to adapt `qp` for the *next* frame.
+    /// (Doing it at call-site rather than auto-wiring it inside each
+    /// encoder method keeps the surface explicit and avoids accidental
+    /// QP changes mid-pipeline.)
+    ///
+    /// Calling this with `bits_per_second = 0` or `fps = 0` is a no-op
+    /// and clears any previously-set target.
+    pub fn set_bitrate_target(&mut self, bits_per_second: u32, fps: u32) {
+        if bits_per_second == 0 || fps == 0 {
+            self.bitrate = None;
+            return;
+        }
+        let target = bits_per_second.div_ceil(fps * 8);
+        self.bitrate = Some(BitrateControl::new(target));
+    }
+
+    /// Notify the bitrate controller that a frame of `bytes_emitted`
+    /// bytes was just produced. Updates the EMA + nudges `qp` for the
+    /// next frame within `[qp_min, qp_max]`. No-op when
+    /// [`Self::bitrate`] is `None`.
+    ///
+    /// Controller shape (proportional with EMA smoothing):
+    /// 1. `ema_bytes := ema_alpha * bytes_emitted + (1 - ema_alpha) * ema_bytes`
+    /// 2. `error_ratio := (ema_bytes - target) / max(target, 1)`
+    /// 3. `qp_delta := kp * error_ratio * 8` (scaled so 100% overshoot
+    ///    nudges qp by ~`kp * 8`, i.e. ~4 at the default `kp = 0.5`)
+    /// 4. `new_qp := clamp(qp + round(qp_delta), qp_min, qp_max)`
+    ///
+    /// Returns the new `qp` for diagnostic purposes.
+    pub fn update_qp_after_frame(&mut self, bytes_emitted: u32) -> u8 {
+        let Some(ctl) = self.bitrate.as_mut() else {
+            return self.qp;
+        };
+        // EMA update.
+        let bytes_f = bytes_emitted as f32;
+        ctl.ema_bytes = ctl.ema_alpha * bytes_f + (1.0 - ctl.ema_alpha) * ctl.ema_bytes;
+        // Proportional QP nudge.
+        let target = ctl.target_bytes_per_frame.max(1) as f32;
+        let error_ratio = (ctl.ema_bytes - target) / target;
+        let qp_delta = (ctl.kp * error_ratio * 8.0).round() as i32;
+        let qp_min = ctl.qp_min.min(63);
+        let qp_max = ctl.qp_max.min(63).max(qp_min);
+        let new_qp = (self.qp as i32 + qp_delta).clamp(qp_min as i32, qp_max as i32) as u8;
+        self.qp = new_qp;
+        new_qp
     }
 
     /// Encode a single keyframe from row-major Y/U/V planes.
@@ -1539,11 +1682,51 @@ impl Vp6Encoder {
                 let cost_single = sad_single.saturating_add(lambda.saturating_mul(single_bits));
                 let cost_fourmv = sad_fourmv.saturating_add(lambda.saturating_mul(fourmv_bits));
 
-                let new_type = if self.allow_fourmv && fourmv_diverges && cost_fourmv < cost_single
-                {
-                    tables::Vp56Mb::Inter4V
+                let inter_best_type =
+                    if self.allow_fourmv && fourmv_diverges && cost_fourmv < cost_single {
+                        tables::Vp56Mb::Inter4V
+                    } else {
+                        single_type
+                    };
+                let inter_best_cost = if inter_best_type == tables::Vp56Mb::Inter4V {
+                    cost_fourmv
                 } else {
-                    single_type
+                    cost_single
+                };
+
+                // -- 3b. Intra-in-inter RDO. The MB-type tree allows
+                // `Vp56Mb::Intra` from any prev_type at any ctx; the
+                // decoder routes Intra MBs through `render_mb_intra`
+                // (no MC) and applies `add_predictors_dc(scratch,
+                // RefKind::Current)`. Intra is the right choice on a
+                // revealed-content MB (uncovered area where the inter
+                // residual is too costly to encode efficiently) and on
+                // scene-change-style discontinuities.
+                //
+                // Cost shape: SAD of original pixels against the per-MB
+                // mean as a cheap predictability proxy (high variance
+                // = many AC coefficients to encode either way; low
+                // variance + high inter SAD = revealed area where intra
+                // wins). The proxy underestimates the actual encode cost
+                // but is monotonic in MB difficulty and lets us pick
+                // intra when inter SAD is dramatically worse — exactly
+                // the case where intra refresh is the right call.
+                let mut intra_sad_proxy = 0u64;
+                let mut intra_bits = 0u64;
+                if self.allow_intra_in_inter {
+                    intra_sad_proxy = mb_intra_sad_proxy(new_y, width, mb_x, mb_y);
+                    // Intra coding has no MV bits but pays the PMBT-tree
+                    // depth cost (Intra is at depth 4 from InterNoVecPf
+                    // in the decoder's PMBT tree walk), so charge a
+                    // baseline of ~6 bits.
+                    intra_bits = 6;
+                }
+                let cost_intra = intra_sad_proxy.saturating_add(lambda.saturating_mul(intra_bits));
+
+                let new_type = if self.allow_intra_in_inter && cost_intra < inter_best_cost {
+                    tables::Vp56Mb::Intra
+                } else {
+                    inter_best_type
                 };
 
                 // -- 4. Emit MB-type into partition 1.
@@ -1678,12 +1861,29 @@ impl Vp6Encoder {
 
                 // -- 7. Per-block residual encoding into partition 2.
                 //
-                // For each of the 6 blocks: build the integer-pel MC
-                // prediction tile, compute the pixel residual, forward
-                // DCT (residual mode — no `-128` subtraction), quantise,
-                // run the RefKind::Previous DC predictor, and emit via
-                // the same `emit_block_coefs` state machine the keyframe
-                // path uses.
+                // Two sub-paths depending on `new_type`:
+                //   * Intra MBs (`Vp56Mb::Intra`): forward DCT on the
+                //     original tile (with the keyframe-style -128 bias
+                //     since the decoder's IDCT lands at pixel values
+                //     directly, not residuals), DC predictor uses
+                //     `RefKind::Current` (mirror of
+                //     `add_predictors_dc(scratch, RefKind::Current)`
+                //     gated by `tables::REFERENCE_FRAME[Intra] = Current`).
+                //   * Inter MBs (everything else): integer-pel MC
+                //     prediction tile, per-pixel residual, residual-mode
+                //     forward DCT (no `-128`), DC predictor uses
+                //     `RefKind::Previous`.
+                let mb_ref_kind = if new_type == tables::Vp56Mb::Intra {
+                    RefKind::Current
+                } else {
+                    RefKind::Previous
+                };
+                let mb_ref_dc_idx = match mb_ref_kind {
+                    RefKind::Current => 0usize,
+                    RefKind::Previous => 1usize,
+                    RefKind::Golden => 2usize,
+                    RefKind::None => 1usize,
+                };
                 for b in 0..6usize {
                     let pt = if b > 3 { 1 } else { 0 };
                     let plane_idx = tables::B2P[b] as usize;
@@ -1709,64 +1909,68 @@ impl Vp6Encoder {
                         &mut orig_tile,
                     );
 
-                    // -- (b) Materialise the integer-pel MC prediction.
-                    // For Inter4V (FOURMV) the per-block luma MVs differ
-                    //   and the chroma MVs are the round-shifted average
-                    //   of the 4 luma MVs (mirror of `decode_4mv`'s
-                    //   chroma derive). For single-MV inter
-                    //   (`InterDeltaPf` / `InterNoVecPf`) every entry of
-                    //   `block_mv_full` already holds the same MV.
-                    let mut mc_tile = [0i32; 64];
-                    sample_mc_tile(
-                        b,
-                        mb_row,
-                        mb_col,
-                        prev_y,
-                        prev_u,
-                        prev_v,
-                        width,
-                        uv_stride,
-                        height,
-                        uv_h,
-                        block_mv_full[b],
-                        &mut mc_tile,
-                    );
-
-                    // -- (c) Pixel residual.
-                    let mut residual = [0i32; 64];
-                    for i in 0..64 {
-                        residual[i] = orig_tile[i] - mc_tile[i];
+                    // -- (b) DCT input + scaling depends on Intra vs Inter.
+                    let mut coefs = [0i32; 64];
+                    if new_type == tables::Vp56Mb::Intra {
+                        // Intra: forward DCT directly on the original
+                        // tile (with -128 bias), mirror of the keyframe
+                        // path's `forward_dct8x8`.
+                        forward_dct8x8(&orig_tile, &mut coefs);
+                    } else {
+                        // Inter: materialise the MC prediction tile,
+                        // compute per-pixel residual, residual-mode DCT.
+                        let mut mc_tile = [0i32; 64];
+                        sample_mc_tile(
+                            b,
+                            mb_row,
+                            mb_col,
+                            prev_y,
+                            prev_u,
+                            prev_v,
+                            width,
+                            uv_stride,
+                            height,
+                            uv_h,
+                            block_mv_full[b],
+                            &mut mc_tile,
+                        );
+                        let mut residual = [0i32; 64];
+                        for i in 0..64 {
+                            residual[i] = orig_tile[i] - mc_tile[i];
+                        }
+                        forward_dct8x8_residual(&residual, &mut coefs);
                     }
 
-                    // -- (d) Forward DCT in residual mode (no -128 bias).
-                    let mut coefs = [0i32; 64];
-                    forward_dct8x8_residual(&residual, &mut coefs);
-
-                    // -- (e) Quantise DC.
+                    // -- (c) Quantise DC.
                     let new_dc = div_nearest(coefs[0], dequant_dc).clamp(-32768, 32767) as i16;
 
-                    // -- (f) Compute the decoder's predictor_dc for this
-                    // block under RefKind::Previous.
+                    // -- (d) Compute the decoder's predictor_dc for this
+                    // block. Only neighbours whose ref_frame matches
+                    // `mb_ref_kind` contribute (mirror of
+                    // `add_predictors_dc`'s `if rb.ref_frame == ref_kind`
+                    // gate). For Intra MBs this picks up the keyframe-
+                    // style `RefKind::Current` neighbours; for Inter MBs
+                    // it picks up `RefKind::Previous`.
                     let lb = enc_left_block[tables::B6_TO_4[b] as usize];
                     let ab = enc_above_blocks[above_block_idx[b]];
                     let mut count = 0i32;
                     let mut pdc = 0i32;
-                    if lb.ref_frame == RefKind::Previous {
+                    if lb.ref_frame == mb_ref_kind {
                         pdc += lb.dc_coeff as i32;
                         count += 1;
                     }
-                    if ab.ref_frame == RefKind::Previous {
+                    if ab.ref_frame == mb_ref_kind {
                         pdc += ab.dc_coeff as i32;
                         count += 1;
                     }
                     let predictor: i32 = match count {
-                        0 => enc_prev_dc[plane_idx][1] as i32, // 1 = Previous
+                        0 => enc_prev_dc[plane_idx][mb_ref_dc_idx] as i32,
                         2 => pdc / 2,
                         _ => pdc,
                     };
                     let coded_dc = (new_dc as i32 - predictor).clamp(-32768, 32767) as i16;
 
-                    // -- (g) Quantise AC coefficients in coeff_idx order.
+                    // -- (e) Quantise AC coefficients in coeff_idx order.
                     let mut ac_levels = [0i32; 64];
                     for coeff_idx in 1..64usize {
                         let pos = model.coeff_index_to_pos[coeff_idx] as usize;
@@ -1777,31 +1981,31 @@ impl Vp6Encoder {
 
                     let last_nz = find_last_nonzero(&ac_levels);
 
-                    // -- (h) Emit the block coefficient stream.
+                    // -- (f) Emit the block coefficient stream.
                     emit_block_coefs(
                         &mut enc2, &model, pt, coeff_ctx, coded_dc, &ac_levels, last_nz,
                     );
 
-                    // -- (i) Update per-block DC context with the
+                    // -- (g) Update per-block DC context with the
                     // reconstruction the decoder will land on. The
                     // decoder's `add_predictors_dc` stores `new_dc =
                     // coded_dc + predictor` back into both
                     // `left_block.dc_coeff` and `above_blocks[].dc_coeff`,
-                    // and into `prev_dc[plane][Previous]`.
+                    // and into `prev_dc[plane][ref_kind_index]`.
                     let new_dc_final = (coded_dc as i32 + predictor) as i16;
                     let has_nonzero_dc = coded_dc != 0;
                     let lb_idx = tables::B6_TO_4[b] as usize;
                     enc_left_block[lb_idx] = EncRefDc {
                         not_null_dc: has_nonzero_dc,
-                        ref_frame: RefKind::Previous,
+                        ref_frame: mb_ref_kind,
                         dc_coeff: new_dc_final,
                     };
                     enc_above_blocks[above_block_idx[b]] = EncRefDc {
                         not_null_dc: has_nonzero_dc,
-                        ref_frame: RefKind::Previous,
+                        ref_frame: mb_ref_kind,
                         dc_coeff: new_dc_final,
                     };
-                    enc_prev_dc[plane_idx][1] = new_dc_final;
+                    enc_prev_dc[plane_idx][mb_ref_dc_idx] = new_dc_final;
                 }
 
                 // Advance per-MB above-block indices the same way
@@ -2653,6 +2857,41 @@ fn motion_search_8x8(
     }
 
     (best_qx, best_qy)
+}
+
+/// Cheap intra-encoding-cost proxy for a 16x16 luma MB: SAD of the MB
+/// pixels against the MB mean. Equals `Σ |pixel - mean|`, which is
+/// roughly proportional to the AC energy the encoder would have to spend
+/// bits on if it picked Intra mode for this MB.
+///
+/// Used by [`Vp6Encoder::encode_inter_frame`] for the intra-vs-inter RDO
+/// — when the inter SAD is much higher than this proxy (revealed
+/// content, scene change), Intra wins. The proxy is a deliberate
+/// underestimate of the true encode cost (a real DCT+quantise+coeff-
+/// emit pass would be more accurate but ~2 orders of magnitude more
+/// expensive); the bias is OK because the comparison is monotonic in MB
+/// difficulty and we only flip to Intra when the inter cost is
+/// dramatically larger.
+fn mb_intra_sad_proxy(plane: &[u8], stride: usize, mb_x: i32, mb_y: i32) -> u64 {
+    let mut sum: u64 = 0;
+    for r in 0..16i32 {
+        let py = (mb_y + r) as usize;
+        for c in 0..16i32 {
+            let px = (mb_x + c) as usize;
+            sum += plane[py * stride + px] as u64;
+        }
+    }
+    let mean = (sum / 256) as i32;
+    let mut sad: u64 = 0;
+    for r in 0..16i32 {
+        let py = (mb_y + r) as usize;
+        for c in 0..16i32 {
+            let px = (mb_x + c) as usize;
+            let v = plane[py * stride + px] as i32;
+            sad += (v - mean).unsigned_abs() as u64;
+        }
+    }
+    sad
 }
 
 /// Bilinear luma sample at `(base_x + frac_x/8, base_y + frac_y/8)`

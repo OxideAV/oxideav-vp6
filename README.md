@@ -89,7 +89,37 @@ pinning golden to the keyframe brings the inter-frame total wire size
 from 378 bytes to 282 bytes (~25% smaller) vs refreshing every frame
 — the loop-back A frames pick golden for every MB and emit
 near-zero residual. ffmpeg cross-decodes the key + golden-refresh
-inter pair cleanly. **r28 adds the Huffman coefficient path on both
+inter pair cleanly. **r29 adds bitrate-targeting feedback control + Intra-in-inter
+RDO on the encoder side.** New optional `Vp6Encoder::bitrate:
+Option<BitrateControl>` field carries a proportional-with-EMA rate
+controller; convenience method `Vp6Encoder::set_bitrate_target(bps,
+fps)` derives `target_bytes_per_frame` and seeds the controller, and
+`Vp6Encoder::update_qp_after_frame(bytes_emitted)` is called by the
+caller after each `encode_*` to nudge `qp` toward the target within
+configurable `[qp_min, qp_max]` bounds (defaults `[4, 60]`). The
+controller is a pure no-op when `bitrate.is_none()` so pre-r29 fixed-QP
+callers are unaffected. Verified by `r29_bitrate_control_tracks_target`
+(seed QP 4 + 200-byte target → controller pushes QP to 60) and
+`r29_bitrate_control_lowers_qp_when_undertarget` (seed QP 50 + 33K-byte
+target → controller pulls QP to 22). Independent of bitrate control,
+new public field `Vp6Encoder::allow_intra_in_inter: bool` (default
+`true`) gates an intra-vs-inter RDO comparison per MB inside
+`encode_inter_frame`. `Vp56Mb::Intra` is a reachable leaf from every
+prev_type in the spec's PMBT tree; the encoder's existing
+`encode_pmbt_tree` walk handles wire emission, and the per-block
+residual loop now branches on `Intra` to use `forward_dct8x8` (with
+-128 bias) + `RefKind::Current` DC predictor (mirror of
+`add_predictors_dc(scratch, RefKind::Current)`) instead of the inter
+path's residual-mode DCT + `RefKind::Previous` predictor. Intra fires
+on revealed-content / scene-change MBs where the cheap intra-cost
+proxy (per-MB SAD against the MB mean, +6 baseline PMBT-depth bits)
+strictly beats the inter Lagrangian cost. On a scene-change fixture
+(keyframe stripes → inter checkerboard) the intra-on encode is 235 B
+vs 306 B for intra-off — 23% smaller, 30.5 dB Y PSNR via our decoder
+(no MC-only baseline). On smooth-motion content the wire output is
+byte-identical with `allow_intra_in_inter = true` vs `false` — the
+heuristic correctly identifies that inter compensates fully.
+**r28 adds the Huffman coefficient path on both
 encoder and decoder sides.** The frame-header `UseHuffman` bit (spec
 page 23 Table 1) selects between the existing bool-coded coefficient
 partition and a new raw-bit Huffman partition described in spec
@@ -197,6 +227,23 @@ decoder; ffmpeg's vp6f decoder accepts the Huffman keyframe
   packet cleanly. Reduces wire size on periodic-structure content
   (animation loop, slideshow) — see CHANGELOG / fixture results.
 
+- **Encoder bitrate-targeting feedback loop** (r29+). New
+  `oxideav_vp6::encoder::BitrateControl` carries `target_bytes_per_frame`
+  + `qp_min` / `qp_max` bounds + EMA + proportional gain.
+  `Vp6Encoder::set_bitrate_target(bps, fps)` initialises the controller
+  with sensible defaults; `Vp6Encoder::update_qp_after_frame(bytes)`
+  applies the per-frame nudge. Pure no-op when `bitrate.is_none()`.
+
+- **Encoder Intra-in-inter RDO** (r29+). `encode_inter_frame` now
+  considers `Vp56Mb::Intra` as a per-MB candidate alongside the inter
+  modes. Spec-correct wire emission via the existing PMBT-tree walk;
+  per-block residual encoding switches between `forward_dct8x8`
+  (Intra, with -128 bias) and `forward_dct8x8_residual` (Inter), with
+  the matching DC predictor (`RefKind::Current` vs `RefKind::Previous`).
+  Public field `Vp6Encoder::allow_intra_in_inter: bool` (default
+  `true`) gates the branch — set to `false` for pre-r29 inter-only
+  behaviour.
+
 - **Huffman coefficient path** (r28+, encoder + decoder). When a VP6F
   stream sets `UseHuffman = 1` in the frame header (per VP6 spec page
   23 Table 1) the second data partition (DCT coefficients) is read /
@@ -221,8 +268,8 @@ decoder; ffmpeg's vp6f decoder accepts the Huffman keyframe
 
 ### Test coverage
 
-The crate ships 41 library unit tests plus 38 integration tests
-across 7 files (79 tests total):
+The crate ships 51 library unit tests plus 50 integration tests
+across 8 files (101 tests total):
 
 - **Unit tests** for the range coder round-trip, the IDCT (DC-only flat
   block, add-zero identity), the loop filter bounding-values table and

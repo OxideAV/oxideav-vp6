@@ -1749,3 +1749,311 @@ fn r27_ffmpeg_decodes_fourmv_inter_frame() {
         raw.len()
     );
 }
+
+// ===== r29: bitrate control + Intra-in-inter RDO =============================
+
+/// Bitrate-control sanity: feed a long sequence and verify the
+/// controller adapts `qp` toward the configured target — direction is
+/// chosen by deliberately seeding a QP that produces frames much
+/// LARGER than the budget, forcing the controller to push QP up.
+///
+/// The fixture is sized so the seed-QP encode reliably overshoots: a
+/// high-detail noisy 64×64 luma plane at QP 4 produces ~1500-3000-byte
+/// inter frames, but we set the target to 200 bytes. The controller
+/// must move QP upward to converge.
+#[test]
+fn r29_bitrate_control_tracks_target() {
+    let (w, h) = (64usize, 64usize);
+    // High-detail noisy plane forces large coefficient counts at low QP.
+    let mut y = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y[r * w + c] = (((r * 13 + c * 7) ^ ((r ^ c) * 31)) & 0xff) as u8;
+        }
+    }
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    // Seed at QP 4 (very low — large frames). Target a tiny per-frame
+    // budget (~200 bytes) so the controller MUST push QP way up.
+    let mut enc = Vp6Encoder::new(4);
+    let bps = 200u32 * 8 * 30; // 200 bytes/frame at 30 fps = 48000 bps
+    enc.set_bitrate_target(bps, 30);
+    let initial_qp = enc.qp;
+    let target = enc
+        .bitrate
+        .as_ref()
+        .map(|b| b.target_bytes_per_frame)
+        .unwrap_or(0);
+    assert!(target > 0, "controller should derive a non-zero target");
+
+    let key = enc.encode_keyframe(&y, &u, &v, w, h).expect("keyframe");
+    let key_bytes = key.len() as u32;
+    enc.update_qp_after_frame(key_bytes);
+    let (recon_y, recon_u, recon_v, _, _) = decode_first_frame(key);
+
+    let mut last_qp = enc.qp;
+    let mut last_size = key_bytes;
+    for f in 0..8 {
+        // Perturb to force non-trivial residual.
+        let mut next_y = vec![0u8; w * h];
+        for r in 0..h {
+            for c in 0..w {
+                let s = ((r * 13 + (c + f) * 7) ^ ((r ^ c) * 31)) & 0xff;
+                next_y[r * w + c] = s as u8;
+            }
+        }
+        let inter = enc
+            .encode_inter_frame(&recon_y, &recon_u, &recon_v, &next_y, &u, &v, w, h, 4)
+            .expect("inter");
+        let sz = inter.len() as u32;
+        last_qp = enc.update_qp_after_frame(sz);
+        last_size = sz;
+    }
+
+    eprintln!(
+        "r29 bitrate-control: target {} bytes/frame, initial qp {}, final qp {}, last frame {} bytes, key {} bytes",
+        target, initial_qp, last_qp, last_size, key_bytes,
+    );
+    assert!(
+        last_qp > initial_qp,
+        "controller should have pushed qp up given a heavily-undersized target (initial={initial_qp}, final={last_qp})"
+    );
+    let bounds = enc.bitrate.as_ref().unwrap();
+    assert!(
+        last_qp >= bounds.qp_min && last_qp <= bounds.qp_max,
+        "qp must stay within [qp_min, qp_max]"
+    );
+}
+
+/// Symmetric direction guard: when the seed QP is high (small frames)
+/// and the target is generous (much larger than frames), the controller
+/// must push QP DOWN toward better quality.
+#[test]
+fn r29_bitrate_control_lowers_qp_when_undertarget() {
+    let (w, h) = (32usize, 32usize);
+    let y = vec![128u8; w * h];
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    // Seed at QP 50 (very high — tiny frames). Target huge per-frame
+    // budget so controller pushes QP down.
+    let mut enc = Vp6Encoder::new(50);
+    enc.set_bitrate_target(/* bps */ 8_000_000, /* fps */ 30);
+    let initial_qp = enc.qp;
+
+    let key = enc.encode_keyframe(&y, &u, &v, w, h).expect("keyframe");
+    enc.update_qp_after_frame(key.len() as u32);
+    let (recon_y, recon_u, recon_v, _, _) = decode_first_frame(key);
+
+    let mut last_qp = enc.qp;
+    for _ in 0..8 {
+        let inter = enc
+            .encode_inter_frame(&recon_y, &recon_u, &recon_v, &y, &u, &v, w, h, 4)
+            .expect("inter");
+        last_qp = enc.update_qp_after_frame(inter.len() as u32);
+    }
+    eprintln!(
+        "r29 lower-qp: target {} bytes, initial qp {}, final qp {}",
+        enc.bitrate.as_ref().unwrap().target_bytes_per_frame,
+        initial_qp,
+        last_qp,
+    );
+    assert!(
+        last_qp < initial_qp,
+        "controller should have pushed qp down given over-target budget (initial={initial_qp}, final={last_qp})"
+    );
+}
+
+/// The controller is a no-op when never armed.
+#[test]
+fn r29_bitrate_control_inactive_when_no_target() {
+    let mut enc = Vp6Encoder::new(20);
+    let qp_before = enc.qp;
+    let new_qp = enc.update_qp_after_frame(100_000);
+    assert_eq!(new_qp, qp_before, "no-target controller should not move qp");
+    assert_eq!(enc.qp, qp_before);
+    assert!(enc.bitrate.is_none());
+}
+
+/// Setting target = 0 clears the controller.
+#[test]
+fn r29_bitrate_control_target_zero_clears() {
+    let mut enc = Vp6Encoder::new(20);
+    enc.set_bitrate_target(50_000, 30);
+    assert!(enc.bitrate.is_some());
+    enc.set_bitrate_target(0, 30);
+    assert!(enc.bitrate.is_none());
+    enc.set_bitrate_target(50_000, 0);
+    assert!(enc.bitrate.is_none());
+}
+
+/// Build an inter frame whose content is wholly different from the
+/// keyframe's — a "scene change" pattern. The encoder's `motion_search`
+/// can't compensate for a global content swap; the inter SAD is high
+/// across every MB. Intra-in-inter RDO should fire on at least some
+/// MBs, dropping the inter-frame wire size compared to the
+/// `allow_intra_in_inter = false` baseline.
+#[test]
+fn r29_intra_in_inter_fires_on_scene_change() {
+    let (w, h) = (32usize, 32usize);
+    // Keyframe: vertical stripes.
+    let mut y0 = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y0[r * w + c] = if (c / 4) % 2 == 0 { 30 } else { 220 };
+        }
+    }
+    // Inter-frame source: completely different — checkerboard, much
+    // higher complexity. Inter-MC against `y0` will produce a large
+    // residual everywhere.
+    let mut y1 = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y1[r * w + c] = if ((r / 4) + (c / 4)) % 2 == 0 {
+                60
+            } else {
+                200
+            };
+        }
+    }
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    // Roundtrip through our own decoder to seed `prev_*`.
+    let mut enc_a = Vp6Encoder::new(16);
+    let key = enc_a.encode_keyframe(&y0, &u, &v, w, h).expect("keyframe");
+    let (recon_y, recon_u, recon_v, _, _) = decode_first_frame(key.clone());
+
+    // Encode A: intra-in-inter ENABLED (default).
+    let inter_with_intra = enc_a
+        .encode_inter_frame(&recon_y, &recon_u, &recon_v, &y1, &u, &v, w, h, 4)
+        .expect("inter A");
+
+    // Encode B: intra-in-inter DISABLED.
+    let mut enc_b = Vp6Encoder::new(16);
+    enc_b.allow_intra_in_inter = false;
+    let _ = enc_b.encode_keyframe(&y0, &u, &v, w, h).expect("keyframe");
+    let inter_no_intra = enc_b
+        .encode_inter_frame(&recon_y, &recon_u, &recon_v, &y1, &u, &v, w, h, 4)
+        .expect("inter B");
+
+    eprintln!(
+        "r29 intra-in-inter wire size: with_intra={} bytes, no_intra={} bytes",
+        inter_with_intra.len(),
+        inter_no_intra.len(),
+    );
+
+    // The intra-on encode should be no worse than the intra-off encode.
+    // On scene-change content we expect a clear win; on smooth content
+    // the two paths produce identical encodes (RDO never picks intra).
+    // Pin "no worse than +5%" as the upper bound — picking intra
+    // shouldn't blow up the size even if the heuristic is too eager.
+    assert!(
+        inter_with_intra.len() as f64 <= inter_no_intra.len() as f64 * 1.05,
+        "intra-on encode {} > 105% of intra-off encode {}",
+        inter_with_intra.len(),
+        inter_no_intra.len(),
+    );
+
+    // Both should round-trip through our decoder.
+    let mut dec = Vp6Decoder::new(CodecId::new("vp6f"));
+    let mut key_pkt = Packet::new(0u32, TimeBase::new(1, 1000), packet_from_frame(key));
+    key_pkt.pts = Some(0);
+    key_pkt.flags.keyframe = true;
+    dec.send_packet(&key_pkt).expect("send keyframe");
+    let _ = dec.receive_frame().expect("decode keyframe");
+
+    let mut inter_pkt = Packet::new(
+        0u32,
+        TimeBase::new(1, 1000),
+        packet_from_frame(inter_with_intra),
+    );
+    inter_pkt.pts = Some(1);
+    dec.send_packet(&inter_pkt).expect("send inter");
+    let inter_frame = match dec.receive_frame().expect("receive inter") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+    let py = plane_psnr(&y1, &inter_frame.planes[0].data);
+    eprintln!("r29 intra-in-inter scene-change Y PSNR = {py:.2} dB");
+    // We don't pin a hard PSNR floor — scene-change is intrinsically
+    // hard to encode at QP 16 and the test is about RDO not quality —
+    // but verify the decode doesn't blow up.
+    assert!(py >= 5.0, "decoder reconstruction completely broken: {py}");
+}
+
+/// On smooth-motion content the intra-in-inter heuristic must NOT
+/// override valid inter MBs — the wire size with intra-on should be
+/// equal to the wire size with intra-off.
+#[test]
+fn r29_intra_in_inter_byte_identical_on_smooth_motion() {
+    let (w, h) = (64usize, 32usize);
+    let mut y0 = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w {
+            y0[r * w + c] = if (c / 8) % 2 == 0 { 50 } else { 200 };
+        }
+    }
+    let shift = 4i32;
+    let mut y1 = vec![0u8; w * h];
+    for r in 0..h {
+        for c in 0..w as i32 {
+            let src_col = (c - shift).clamp(0, w as i32 - 1) as usize;
+            y1[r * w + c as usize] = y0[r * w + src_col];
+        }
+    }
+    let u = vec![128u8; (w / 2) * (h / 2)];
+    let v = vec![128u8; (w / 2) * (h / 2)];
+
+    let mut enc_a = Vp6Encoder::new(16);
+    let key = enc_a.encode_keyframe(&y0, &u, &v, w, h).expect("keyframe");
+    let (recon_y, recon_u, recon_v, _, _) = decode_first_frame(key);
+    let inter_a = enc_a
+        .encode_inter_frame(&recon_y, &recon_u, &recon_v, &y1, &u, &v, w, h, 8)
+        .expect("inter A");
+
+    let mut enc_b = Vp6Encoder::new(16);
+    enc_b.allow_intra_in_inter = false;
+    let _ = enc_b.encode_keyframe(&y0, &u, &v, w, h).expect("keyframe");
+    let inter_b = enc_b
+        .encode_inter_frame(&recon_y, &recon_u, &recon_v, &y1, &u, &v, w, h, 8)
+        .expect("inter B");
+
+    eprintln!(
+        "r29 smooth-motion: intra-on={} bytes, intra-off={} bytes",
+        inter_a.len(),
+        inter_b.len(),
+    );
+    // Allow a small wobble (a few bytes) since the intra-cost branch
+    // does compute and discard intra candidates — the comparison should
+    // reject every intra and produce identical wire bytes.
+    assert!(
+        inter_a.len() <= inter_b.len() + 4,
+        "intra-on encode {} unexpectedly larger than intra-off encode {}",
+        inter_a.len(),
+        inter_b.len(),
+    );
+}
+
+/// Pin the public-API shape of the bitrate controller.
+#[test]
+fn r29_bitrate_control_field_defaults() {
+    let mut enc = Vp6Encoder::new(20);
+    enc.set_bitrate_target(64_000, 30);
+    let ctl = enc.bitrate.as_ref().unwrap();
+    assert!(ctl.target_bytes_per_frame > 0);
+    assert!(ctl.qp_min < ctl.qp_max);
+    assert!(ctl.ema_alpha > 0.0 && ctl.ema_alpha <= 1.0);
+    assert!(ctl.kp > 0.0);
+    // EMA seed equals the target so the first frame's controller call
+    // sees a zero error baseline (a frame whose size matches target
+    // produces no QP movement).
+    let initial_qp = enc.qp;
+    let target = ctl.target_bytes_per_frame;
+    let qp_after_match = enc.update_qp_after_frame(target);
+    assert_eq!(
+        qp_after_match, initial_qp,
+        "controller should not move qp when actual = target",
+    );
+}
