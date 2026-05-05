@@ -25,7 +25,7 @@ pub mod range_coder;
 pub mod tables;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
-use oxideav_core::{CodecInfo, CodecRegistry, Decoder, DecoderFactory};
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder, DecoderFactory, RuntimeContext};
 
 pub use decoder::{Vp6Decoder, Vp6Variant};
 pub use encoder::Vp6Encoder;
@@ -68,7 +68,7 @@ pub fn vp6a_codec_id() -> CodecId {
 /// Two codec ids are registered:
 /// * `vp6f` — Flash Video codec-id 4, plain YUV 4:2:0.
 /// * `vp6a` — Flash Video codec-id 5, YUVA 4:2:0:4 with an alpha plane.
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("vp6_sw")
         .with_lossy(true)
         .with_intra_only(false)
@@ -89,4 +89,32 @@ pub fn register(reg: &mut CodecRegistry) {
             .decoder(make_decoder)
             .tags([CodecTag::fourcc(b"VP6A")]),
     );
+}
+
+/// Unified registration entry point: install the VP6 codec factories
+/// into the codec sub-registry of a [`RuntimeContext`].
+///
+/// This is the preferred entry point for new code — it matches the
+/// convention every sibling crate now follows. Direct callers that need
+/// only the codec sub-registry can keep using [`register_codecs`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+    use oxideav_core::{CodecId, CodecParameters, RuntimeContext};
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_VP6F));
+        let dec = ctx
+            .codecs
+            .make_decoder(&params)
+            .expect("vp6 decoder factory");
+        assert_eq!(dec.codec_id().as_str(), CODEC_ID_VP6F);
+    }
 }
