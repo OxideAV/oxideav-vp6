@@ -2632,11 +2632,8 @@ fn decode_frame_n(flv: &[u8], n: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
             let frame_bytes = &payload[1..]; // include adjuster
             let mut raw = Vec::with_capacity(frame_bytes.len());
             raw.extend_from_slice(frame_bytes);
-            let pkt = oxideav_core::Packet::new(
-                count as u32,
-                oxideav_core::TimeBase::new(1, 1000),
-                raw,
-            );
+            let pkt =
+                oxideav_core::Packet::new(count as u32, oxideav_core::TimeBase::new(1, 1000), raw);
             dec.send_packet(&pkt).expect("send_packet");
             if let Ok(oxideav_core::Frame::Video(vf)) = dec.receive_frame() {
                 if count == n {
@@ -2702,23 +2699,47 @@ fn r31_scene_change_triggers_golden_refresh() {
     enc.encode_keyframe(&y_stripes, &u, &v, w, h).expect("key");
     // Frame 1: inter against stripes → SAD ≈ 0 → seeds EMA, no cut
     enc.encode_inter_frame_with_golden(
-        &y_stripes, &u, &v, &golden_y, &golden_u, &golden_v,
-        &y_stripes2, &u, &v, w, h, 4,
-    ).expect("inter 1");
+        &y_stripes,
+        &u,
+        &v,
+        &golden_y,
+        &golden_u,
+        &golden_v,
+        &y_stripes2,
+        &u,
+        &v,
+        w,
+        h,
+        4,
+    )
+    .expect("inter 1");
     // At this point inter_frames_since_golden = 1 (no refresh fired)
     assert_eq!(
-        enc.inter_frames_since_golden(), 1,
+        enc.inter_frames_since_golden(),
+        1,
         "No refresh expected after near-identical frame"
     );
 
     // Frame 2: checkerboard — large SAD spike → scene cut fires
     enc.encode_inter_frame_with_golden(
-        &y_stripes2, &u, &v, &golden_y, &golden_u, &golden_v,
-        &y_checker, &u, &v, w, h, 4,
-    ).expect("inter 2");
+        &y_stripes2,
+        &u,
+        &v,
+        &golden_y,
+        &golden_u,
+        &golden_v,
+        &y_checker,
+        &u,
+        &v,
+        w,
+        h,
+        4,
+    )
+    .expect("inter 2");
     // Refresh fired: counter should be reset to 1 (first frame after refresh)
     assert_eq!(
-        enc.inter_frames_since_golden(), 1,
+        enc.inter_frames_since_golden(),
+        1,
         "Scene-change refresh should have reset counter to 1"
     );
 }
@@ -2752,16 +2773,17 @@ fn r31_scene_change_detection_disabled_at_threshold_zero() {
     let golden_v = v.clone();
     enc.encode_keyframe(&y_stripes, &u, &v, w, h).expect("key");
     enc.encode_inter_frame_with_golden(
-        &y_stripes, &u, &v, &golden_y, &golden_u, &golden_v,
-        &y_stripes, &u, &v, w, h, 4,
-    ).expect("inter 1");
+        &y_stripes, &u, &v, &golden_y, &golden_u, &golden_v, &y_stripes, &u, &v, w, h, 4,
+    )
+    .expect("inter 1");
     enc.encode_inter_frame_with_golden(
-        &y_stripes, &u, &v, &golden_y, &golden_u, &golden_v,
-        &y_checker, &u, &v, w, h, 4,
-    ).expect("inter 2");
+        &y_stripes, &u, &v, &golden_y, &golden_u, &golden_v, &y_checker, &u, &v, w, h, 4,
+    )
+    .expect("inter 2");
     // With scene-change detection disabled, no refresh fired — counter = 2
     assert_eq!(
-        enc.inter_frames_since_golden(), 2,
+        enc.inter_frames_since_golden(),
+        2,
         "Disabled scene-change should leave counter at 2"
     );
 }
@@ -2817,8 +2839,8 @@ fn r31_huffman_inter_roundtrip_own_decoder() {
 /// r31: ffmpeg decodes our Huffman inter frame.
 #[test]
 fn r31_ffmpeg_decodes_huffman_inter_frame() {
-    use std::process::Command;
     use std::io::Write;
+    use std::process::Command;
 
     if Command::new("ffmpeg")
         .arg("-version")
@@ -2859,7 +2881,16 @@ fn r31_ffmpeg_decodes_huffman_inter_frame() {
     let flv = build_two_tag_flv(&key, &inter);
 
     let mut child = Command::new("ffmpeg")
-        .args(["-hide_banner", "-i", "pipe:0", "-c:v", "rawvideo", "-f", "null", "-"])
+        .args([
+            "-hide_banner",
+            "-i",
+            "pipe:0",
+            "-c:v",
+            "rawvideo",
+            "-f",
+            "null",
+            "-",
+        ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -2958,7 +2989,9 @@ fn r31_rdo_inter_not_larger_than_bool_inter() {
 
     // Bool path
     let mut enc_bool = Vp6Encoder::new(16);
-    enc_bool.encode_keyframe(&y_prev, &u, &v, w, h).expect("key bool");
+    enc_bool
+        .encode_keyframe(&y_prev, &u, &v, w, h)
+        .expect("key bool");
     let bool_bytes = enc_bool
         .encode_inter_frame(&y_prev, &u, &v, &y_new, &u, &v, w, h, 8)
         .expect("bool inter")
@@ -2966,7 +2999,9 @@ fn r31_rdo_inter_not_larger_than_bool_inter() {
 
     // RDO path (fresh encoder, same key content)
     let mut enc_rdo = Vp6Encoder::new(16);
-    enc_rdo.encode_keyframe(&y_prev, &u, &v, w, h).expect("key rdo");
+    enc_rdo
+        .encode_keyframe(&y_prev, &u, &v, w, h)
+        .expect("key rdo");
     let rdo_bytes = enc_rdo
         .encode_inter_frame_rdo(&y_prev, &u, &v, &y_new, &u, &v, w, h, 8)
         .expect("rdo inter")
@@ -3006,14 +3041,18 @@ fn r31_huffman_vs_bool_inter_byte_ratio_documented() {
     }
 
     let mut enc_bool = Vp6Encoder::new(16);
-    enc_bool.encode_keyframe(&y_prev, &u, &v, w, h).expect("key bool");
+    enc_bool
+        .encode_keyframe(&y_prev, &u, &v, w, h)
+        .expect("key bool");
     let bool_bytes = enc_bool
         .encode_inter_frame(&y_prev, &u, &v, &y_new, &u, &v, w, h, 8)
         .expect("bool inter")
         .len();
 
     let mut enc_huff = Vp6Encoder::new(16);
-    enc_huff.encode_keyframe(&y_prev, &u, &v, w, h).expect("key huff");
+    enc_huff
+        .encode_keyframe(&y_prev, &u, &v, w, h)
+        .expect("key huff");
     let huff_bytes = enc_huff
         .encode_inter_frame_huffman(&y_prev, &u, &v, &y_new, &u, &v, w, h, 8)
         .expect("huffman inter")
@@ -3024,12 +3063,13 @@ fn r31_huffman_vs_bool_inter_byte_ratio_documented() {
     // The Huffman partition overhead (full table per frame) makes it
     // larger on small frames; on larger frames it typically wins.
     // We just assert both are sane (> 0) and the ratio is bounded.
-    assert!(bool_bytes > 0 && huff_bytes > 0, "frame sizes must be non-zero");
+    assert!(
+        bool_bytes > 0 && huff_bytes > 0,
+        "frame sizes must be non-zero"
+    );
     assert!(
         ratio < 3.0,
         "Huffman inter is {ratio:.2}× the bool inter — unexpectedly large"
     );
-    eprintln!(
-        "r31 Huffman vs bool inter ratio: {huff_bytes} B / {bool_bytes} B = {ratio:.2}×"
-    );
+    eprintln!("r31 Huffman vs bool inter ratio: {huff_bytes} B / {bool_bytes} B = {ratio:.2}×");
 }
