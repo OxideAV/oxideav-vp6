@@ -2860,8 +2860,7 @@ impl Vp6Encoder {
         let mut prev_type = tables::Vp56Mb::InterNoVecPf;
 
         let mut enc_left_block: [EncRefDc; 4] = [EncRefDc::default(); 4];
-        let mut enc_above_blocks: Vec<EncRefDc> =
-            vec![EncRefDc::default(); 4 * mb_width + 6];
+        let mut enc_above_blocks: Vec<EncRefDc> = vec![EncRefDc::default(); 4 * mb_width + 6];
         if 2 * mb_width + 2 < enc_above_blocks.len() {
             enc_above_blocks[2 * mb_width + 2].ref_frame = RefKind::Current;
         }
@@ -2909,7 +2908,16 @@ impl Vp6Encoder {
                     let bx = mb_x + if bi & 1 != 0 { 8 } else { 0 };
                     let by = mb_y + if bi & 2 != 0 { 8 } else { 0 };
                     let (bqx, bqy) = motion_search_8x8(
-                        new_y, prev_y, width, height, bx, by, q_dx, q_dy, block4_search, self.qp,
+                        new_y,
+                        prev_y,
+                        width,
+                        height,
+                        bx,
+                        by,
+                        q_dx,
+                        q_dy,
+                        block4_search,
+                        self.qp,
                     );
                     block_mvs[bi] = Mv {
                         x: bqx as i16,
@@ -2935,17 +2943,34 @@ impl Vp6Encoder {
                     let bx = mb_x + if bi & 1 != 0 { 8 } else { 0 };
                     let by = mb_y + if bi & 2 != 0 { 8 } else { 0 };
                     sad_single += sad8x8_qpel(
-                        new_y, prev_y, width, height, bx, by, single_mv.x as i32,
+                        new_y,
+                        prev_y,
+                        width,
+                        height,
+                        bx,
+                        by,
+                        single_mv.x as i32,
                         single_mv.y as i32,
                     );
                     sad_fourmv += sad8x8_qpel(
-                        new_y, prev_y, width, height, bx, by, block_mvs[bi].x as i32,
+                        new_y,
+                        prev_y,
+                        width,
+                        height,
+                        bx,
+                        by,
+                        block_mvs[bi].x as i32,
                         block_mvs[bi].y as i32,
                     );
                 }
                 let (ctx_val, candidate0, candidate1, new_pos) = enc_vector_predictors(
-                    &mb_info, mb_width, mb_height, mb_row, mb_col,
-                    tables::RefFrame::Previous, vector_candidate_pos,
+                    &mb_info,
+                    mb_width,
+                    mb_height,
+                    mb_row,
+                    mb_col,
+                    tables::RefFrame::Previous,
+                    vector_candidate_pos,
                 );
                 vector_candidate_pos = new_pos;
                 let ctx = ctx_val.clamp(0, 2) as usize;
@@ -2965,7 +2990,8 @@ impl Vp6Encoder {
                 for bi in 0..4usize {
                     if block_mvs[bi].x != 0 || block_mvs[bi].y != 0 {
                         fourmv_bits = fourmv_bits.saturating_add(mv_bit_cost_estimate(
-                            block_mvs[bi].x as i32, block_mvs[bi].y as i32,
+                            block_mvs[bi].x as i32,
+                            block_mvs[bi].y as i32,
                         ));
                     }
                 }
@@ -3079,7 +3105,10 @@ impl Vp6Encoder {
                 }
                 let _ = candidate1;
 
-                mb_info[mb_idx] = EncMbInfo { mb_type: new_type, mv: stored_mv };
+                mb_info[mb_idx] = EncMbInfo {
+                    mb_type: new_type,
+                    mv: stored_mv,
+                };
                 prev_type = new_type;
 
                 // Quantise residual coefficients — same logic as
@@ -3101,7 +3130,15 @@ impl Vp6Encoder {
 
                     let mut orig_tile = [0i32; 64];
                     sample_block_tile(
-                        b, mb_row, mb_col, new_y, new_u, new_v, width, uv_stride, &mut orig_tile,
+                        b,
+                        mb_row,
+                        mb_col,
+                        new_y,
+                        new_u,
+                        new_v,
+                        width,
+                        uv_stride,
+                        &mut orig_tile,
                     );
 
                     let mut coefs = [0i32; 64];
@@ -3110,8 +3147,18 @@ impl Vp6Encoder {
                     } else {
                         let mut mc_tile = [0i32; 64];
                         sample_mc_tile(
-                            b, mb_row, mb_col, prev_y, prev_u, prev_v, width, uv_stride, height,
-                            uv_h, block_mv_full[b], &mut mc_tile,
+                            b,
+                            mb_row,
+                            mb_col,
+                            prev_y,
+                            prev_u,
+                            prev_v,
+                            width,
+                            uv_stride,
+                            height,
+                            uv_h,
+                            block_mv_full[b],
+                            &mut mc_tile,
                         );
                         let mut residual = [0i32; 64];
                         for i in 0..64 {
@@ -3146,8 +3193,7 @@ impl Vp6Encoder {
                     for coeff_idx in 1..64usize {
                         let pos = model.coeff_index_to_pos[coeff_idx] as usize;
                         let perm = tables::IDCT_SCANTABLE[pos] as usize;
-                        levels[coeff_idx] =
-                            div_nearest(coefs[perm], dequant_ac).clamp(-2047, 2047);
+                        levels[coeff_idx] = div_nearest(coefs[perm], dequant_ac).clamp(-2047, 2047);
                     }
 
                     let blk_idx = mb_idx * 6 + b;
