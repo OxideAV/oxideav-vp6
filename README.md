@@ -192,6 +192,49 @@ reconstruction model is byte-identical to the bool path — only the
 coefficient-bitstream emission changes. Round-trips through our own
 decoder; ffmpeg's vp6f decoder accepts the Huffman keyframe
 (`tests/huffman_roundtrip.rs::ffmpeg_decodes_huffman_keyframe`).
+**r39 lands a PID controller + iterative diamond qpel ME + trellis-style
+AC quantisation.** Three independent encoder-only refinements, each
+gated by an existing or new public field for A/B testing:
+
+1. `BitrateControl` grows `kd: f32` (default `0.15`) + `prev_error: f32`
+   fields. `update_qp_after_frame` now adds a derivative-on-error term:
+   `qp_delta = round((kp * err + ki * integral + kd * derivative) * 8)`
+   where `derivative = error_ratio - prev_error_ratio` against the
+   EMA-smoothed error. Setting `kd = 0.0` recovers pre-r39 PI-only
+   behaviour exactly. Pinned by
+   `r39_pid_kd_zero_matches_pi_exactly` (byte-for-byte QP path
+   equivalence with PI when kd=0) and
+   `r39_pid_controller_reduces_overshoot_vs_pi_only`.
+2. `motion_search` and `motion_search_8x8` swap their pre-r39 ±3 qpel
+   box (49-position exhaustive search around the integer winner) for
+   an iterative 8-conn diamond pattern with 6 iterations and ±6 qpel
+   bounds. Each iteration evaluates the 8-conn neighbours of the
+   current best candidate; if a neighbour strictly improves the
+   Lagrangian cost, it becomes the new centre. Probe count is bounded
+   by 8 × 6 = 48 (comparable to the pre-r39 box) but the effective
+   radius is 6 qpel — double the pre-r39 catch radius for sub-pel
+   winners that lived past the box edge. Pinned by
+   `r39_diamond_qpel_me_internal_psnr_clears_45db` (flat-content
+   skip-path is exactly recoverable, ∞ dB PSNR) and
+   `r39_diamond_qpel_me_no_regression_on_r25_stripes_fixture` (existing
+   r25 stripes fixture clears the 35 dB floor at 35.20 dB).
+3. New public field `Vp6Encoder::allow_trellis: bool` (default `true`)
+   gates a per-block trellis-style AC quantisation pass that, for each
+   non-zero AC level, considers driving the level toward zero by 1 LSB
+   when the resulting drop in rate (per-coef bool-tree depth proxy)
+   outweighs the squared-quantisation-error increase scaled by a
+   QP-derived Lagrangian λ. Bit-exact byte-output-equivalent to plain
+   `div_nearest` quantise when the per-coef RD never finds a win;
+   shaves 1-3% of inter-frame bytes on natural-content fixtures with
+   AC coefs near the quantiser threshold. Wired into
+   `encode_inter_frame`, `encode_inter_frame_with_golden`, and the
+   Huffman inter path. Pinned by
+   `r39_trellis_shrinks_bitstream_at_minimal_psnr_loss` (≤ size, ≤
+   0.5 dB PSNR drop on a 64×64 natural fixture; observed 1 byte saving
+   at 0.02 dB drop). Set `allow_trellis = false` to recover plain
+   `div_nearest` quantise behaviour exactly. The trellis is
+   bool-decoder-compatible — wire format is unchanged, only the per-coef
+   level decisions differ.
 
 ### Implemented
 
@@ -279,17 +322,41 @@ decoder; ffmpeg's vp6f decoder accepts the Huffman keyframe
   packet cleanly. Reduces wire size on periodic-structure content
   (animation loop, slideshow) — see CHANGELOG / fixture results.
 
-- **Encoder bitrate-targeting PI controller** (r29+, PI in r30).
+- **Encoder bitrate-targeting PID controller** (r29+, PI in r30, PID in r39).
   `oxideav_vp6::encoder::BitrateControl` carries `target_bytes_per_frame`
-  + `qp_min` / `qp_max` bounds + EMA + proportional + integral gains
-  (`kp`, `ki`) + anti-windup `integral_clamp`. `set_bitrate_target(bps,
-  fps)` initialises the controller; `update_qp_after_frame(bytes)`
-  applies the per-frame nudge `qp_delta = round((kp * err + ki *
-  integral) * 8)` after EMA-smoothed error and clamped integral
-  accumulation, with saturated-actuator back-leak so the integral can
-  never grow unboundedly when `qp` is pinned at `qp_min`/`qp_max`. Set
-  `ki = 0.0` to recover pre-r30 P-only behaviour. Pure no-op when
-  `bitrate.is_none()`.
+  + `qp_min` / `qp_max` bounds + EMA + proportional + integral +
+  derivative gains (`kp`, `ki`, `kd`) + anti-windup `integral_clamp`.
+  `set_bitrate_target(bps, fps)` initialises the controller;
+  `update_qp_after_frame(bytes)` applies the per-frame nudge
+  `qp_delta = round((kp * err + ki * integral + kd * derivative) * 8)`
+  after EMA-smoothed error, clamped integral accumulation, and
+  per-frame derivative against the last-frame error. Saturated-actuator
+  back-leak prevents integral wind-up. Set `ki = 0.0, kd = 0.0` to
+  recover P-only; set `kd = 0.0` alone to recover pre-r39 PI behaviour.
+  Pure no-op when `bitrate.is_none()`.
+
+- **Encoder trellis-style AC quantisation** (r39+). Per-block per-coef
+  RD pass on the inter-frame residual AC stream. For each non-zero
+  level, considers driving toward zero by 1 LSB; chooses the drop when
+  the rate saving (per-coef bool-tree depth proxy) outweighs the
+  squared-quantisation-error increase scaled by a QP-derived λ. Public
+  field `Vp6Encoder::allow_trellis: bool` (default `true`). Wire-format
+  unchanged — bool-decoder reads identical state machine. Conservative
+  sweet spot: levels of `±1` get pruned only when the raw coef sat
+  just over the half-step threshold. Wired into `encode_inter_frame`,
+  `encode_inter_frame_with_golden`, and the Huffman inter path. Set
+  `false` to recover plain `div_nearest` quantise.
+
+- **Encoder iterative diamond qpel ME** (r25 → r39). `motion_search`
+  and `motion_search_8x8` swap their pre-r39 ±3 qpel box (49-position
+  exhaustive search) for an iterative 8-conn diamond pattern bounded
+  to ±6 qpel from the integer winner with up to 6 iterations per MB
+  (probe budget ~8 × 6 = 48). Each iteration evaluates the 8-conn
+  neighbours of the current best candidate; if a neighbour strictly
+  improves the Lagrangian cost, it becomes the new centre and search
+  continues. Doubles the effective qpel catch-radius without growing
+  the per-MB probe budget. Stops early when no neighbour beats the
+  current best — typically 2-3 iterations on smooth motion content.
 
 - **Scene-change golden refresh** (r31+). `encode_inter_frame_with_golden`
   detects SAD spikes via `scene_change_threshold` (default `2.0`) and

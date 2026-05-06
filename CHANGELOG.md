@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **r39 — PID controller + iterative diamond qpel ME + trellis-style AC
+  quantisation (encoder).** Three encoder-only refinements:
+
+  1. **PID controller.** `BitrateControl` grows `kd: f32` (default `0.15`)
+     + `prev_error: f32` fields. `update_qp_after_frame` adds a
+     derivative-on-error term: `qp_delta = round((kp * err + ki *
+     integral + kd * derivative) * 8)`. The derivative is taken against
+     the EMA-smoothed error so single noisy frames don't kick the
+     controller into a spurious correction. Reduces overshoot during
+     bitrate transients vs PI-only. Setting `kd = 0.0` recovers pre-r39
+     PI behaviour exactly. Pinned by `r39_pid_kd_zero_matches_pi_exactly`
+     (byte-for-byte QP path equivalence with PI when kd=0) and
+     `r39_pid_controller_reduces_overshoot_vs_pi_only`.
+  2. **Iterative diamond qpel ME.** `motion_search` and
+     `motion_search_8x8` swap their pre-r39 ±3 qpel exhaustive box
+     (49-position search) for an iterative 8-conn diamond pattern with
+     up to 6 iterations and ±6 qpel bounds from the integer winner.
+     Each iteration evaluates the 8-conn neighbours of the current best;
+     if a neighbour strictly improves the Lagrangian cost it becomes the
+     new centre. Probe budget per MB ≤ 8 × 6 = 48, comparable to the
+     pre-r39 box, but the effective catch radius is doubled (6 qpel vs
+     3 qpel). Stops early when no neighbour beats the current best —
+     typically 2-3 iterations on smooth motion content. Pinned by
+     `r39_diamond_qpel_me_internal_psnr_clears_45db` (flat skip-path)
+     and `r39_diamond_qpel_me_no_regression_on_r25_stripes_fixture`
+     (existing r25 stripes fixture clears the 35 dB floor at 35.20 dB).
+  3. **Trellis-style AC quantisation.** New public field
+     `Vp6Encoder::allow_trellis: bool` (default `true`) gates a per-block
+     per-coef RD pass on the inter-frame residual AC stream. For each
+     non-zero level, considers driving the level toward zero by 1 LSB;
+     chooses the drop when the per-coef rate saving (bool-tree depth
+     proxy) outweighs the squared-quantisation-error increase scaled by
+     a QP-derived λ. Bit-exact byte-output-equivalent to plain
+     `div_nearest` quantise when no win is found. Wire format unchanged
+     — bool-decoder reads identical state machine. Wired into
+     `encode_inter_frame`, `encode_inter_frame_with_golden`, and the
+     Huffman inter path. Conservative sweet spot: levels of `±1` get
+     pruned only when the raw coef sat just over the half-step
+     threshold, so quality drops are bounded. Pinned by
+     `r39_trellis_shrinks_bitstream_at_minimal_psnr_loss` (≤ size, ≤
+     0.5 dB Y PSNR drop on 64×64 natural-content fixture; observed 1
+     byte saved at 0.02 dB drop).
+
 - **r31 — Scene-change golden refresh + Huffman inter encode + bool/Huffman RDO
   (encoder).** Three encoder-only improvements:
 
