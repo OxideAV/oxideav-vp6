@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-vp6/compare/v0.0.6...v0.0.7) - 2026-05-06
+
+### Other
+
+- drop stale REGISTRARS / with_all_features intra-doc links
+- drop dead `linkme` dep
+- vp6 r39: PID controller + diamond qpel ME + trellis-style AC quantisation
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- rustfmt pass on tests/encoder_roundtrip.rs (r31 new tests)
+- rustfmt pass after r31 (line-length wraps in encoder.rs)
+- vp6 r31: scene-change golden refresh + Huffman inter encode + bool/Huffman RDO
+- r30 — PI controller + DCT-count intra cost + golden-aware intra-in-inter (encoder)
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-vp6/pull/502))
+
 ### Added
 
 - **r39 — PID controller + iterative diamond qpel ME + trellis-style AC
