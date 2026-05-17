@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **r73 — SATD-based qpel ME refinement (encoder).** Quarter-pel diamond
+  motion estimation in `motion_search` and `motion_search_8x8` now scores
+  candidate sub-pel offsets via SATD (Sum of Absolute Transformed
+  Differences using a 4×4 Hadamard kernel per tile) by default, instead
+  of plain SAD. SATD better predicts the post-DCT bit cost of the
+  residual because it captures frequency-domain energy distribution: a
+  residual whose pixel-domain SAD is low but whose AC bins are strongly
+  excited (e.g. a smooth shift mispredicted by one qpel step) gets a
+  higher SATD, pushing the diamond toward the candidate whose residual
+  is genuinely sparse in the transform domain. Integer-pel search stays
+  SAD-based (the integer-pel surface is multimodal and SAD's full-window
+  scan is cheap); SATD's value is concentrated in the qpel refinement
+  where the SAD surface is nearly flat. New public field
+  `Vp6Encoder::allow_satd_me: bool` (default `true`) gates the path;
+  setting to `false` recovers pre-r73 SAD-only diamond behaviour. Lambda
+  is scaled by `SATD_LAMBDA_SCALE = 4` so the cost ratio between
+  distortion and MV-bit rate stays the same under SATD as under SAD.
+  Wire format unchanged — only the chosen sub-pel MV may differ. Wired
+  into `encode_inter_frame`, `encode_inter_frame_with_golden`, and
+  `encode_inter_frame_huffman` via the shared ME helpers. New tests:
+  * `r73_allow_satd_me_default_and_disable` — pins the public field
+    default + disable contract.
+  * `r73_satd_qpel_internal_psnr_clears_45db_on_flat` — flat-content
+    skip-path still recovers near-losslessly under SATD.
+  * `r73_satd_qpel_no_regression_on_r25_stripes_fixture` — clears the
+    r25 35 dB floor on the translating-stripes fixture.
+  * `r73_satd_qpel_improves_or_matches_psnr_on_textured_motion` —
+    pins SATD-on within 0.05 dB of SAD-off on a textured-motion fixture,
+    confirming the metric swap doesn't hurt at fixture scale.
+  * `r73_satd_disable_decodes_cleanly_on_smooth_motion` — verifies the
+    SAD-only path is still reachable and produces decodable output.
+  Plus 6 unit tests pinning the Hadamard kernel (`r73_hadamard4x4_satd_*`
+  + `r73_satd8x8_qpel_zero_on_self` + `r73_satd16x16_qpel_zero_on_flat_match`).
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-vp6/compare/v0.0.6...v0.0.7) - 2026-05-06
 
 ### Other

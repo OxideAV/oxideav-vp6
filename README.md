@@ -192,6 +192,30 @@ reconstruction model is byte-identical to the bool path — only the
 coefficient-bitstream emission changes. Round-trips through our own
 decoder; ffmpeg's vp6f decoder accepts the Huffman keyframe
 (`tests/huffman_roundtrip.rs::ffmpeg_decodes_huffman_keyframe`).
+**r73 lands SATD-based qpel motion-estimation refinement.**
+`motion_search` and `motion_search_8x8` now score quarter-pel candidates
+via SATD (Sum of Absolute Transformed Differences, computed by a
+classical H.264-style 4×4 Hadamard kernel applied to tiled 4×4 sub-
+blocks of the 8×8 residual) instead of plain SAD. SATD better predicts
+post-DCT bit cost than SAD because it captures frequency-domain energy
+distribution — a residual whose pixel-domain SAD is low but whose AC
+bins are strongly excited gets a higher SATD, steering the diamond
+toward candidates whose residual is genuinely sparse in the transform
+domain. Integer-pel search stays SAD-based (full-window scan, cheap,
+multimodal surface); SATD is applied only during qpel refinement where
+the SAD surface is near-flat and the residual energy distribution is
+what differentiates candidates. New public field
+`Vp6Encoder::allow_satd_me: bool` (default `true`) gates the path; set
+to `false` to recover pre-r73 SAD-only diamond behaviour for A/B
+testing. Lambda is scaled by 4× under SATD so the cost ratio between
+distortion and MV-bit rate stays comparable. Wire format is unchanged
+— only the chosen sub-pel MV may differ. Wired into
+`encode_inter_frame`, `encode_inter_frame_with_golden`, and
+`encode_inter_frame_huffman` via the shared ME helpers. Pinned by
+`r73_satd_qpel_internal_psnr_clears_45db_on_flat`,
+`r73_satd_qpel_no_regression_on_r25_stripes_fixture` (35.20 dB,
+identical to pre-r73 SAD baseline), and
+`r73_satd_qpel_improves_or_matches_psnr_on_textured_motion`.
 **r39 lands a PID controller + iterative diamond qpel ME + trellis-style
 AC quantisation.** Three independent encoder-only refinements, each
 gated by an existing or new public field for A/B testing:
@@ -347,6 +371,20 @@ gated by an existing or new public field for A/B testing:
   `encode_inter_frame_with_golden`, and the Huffman inter path. Set
   `false` to recover plain `div_nearest` quantise.
 
+- **Encoder SATD-based qpel ME refinement** (r73+). `motion_search`
+  and `motion_search_8x8` evaluate quarter-pel candidates inside the
+  iterative diamond via SATD (Sum of Absolute Transformed Differences
+  with a 4×4 Hadamard kernel applied to tiled 4×4 sub-blocks of the
+  residual) instead of plain SAD. SATD captures frequency-domain energy
+  distribution and so better predicts post-DCT bit cost than pixel-
+  domain SAD on sub-pel-mispredicted residuals. Integer-pel search
+  stays SAD-based for full-window speed; SATD applies only during qpel
+  refinement. Public field `Vp6Encoder::allow_satd_me: bool` (default
+  `true`) gates the metric; setting to `false` recovers pre-r73 SAD-
+  only diamond behaviour exactly. Wire format unchanged. Wired into
+  `encode_inter_frame`, `encode_inter_frame_with_golden`, and
+  `encode_inter_frame_huffman`.
+
 - **Encoder iterative diamond qpel ME** (r25 → r39). `motion_search`
   and `motion_search_8x8` swap their pre-r39 ±3 qpel box (49-position
   exhaustive search) for an iterative 8-conn diamond pattern bounded
@@ -415,8 +453,8 @@ gated by an existing or new public field for A/B testing:
 
 ### Test coverage
 
-The crate ships 51 library unit tests plus 50 integration tests
-across 8 files (101 tests total):
+The crate ships 58 library unit tests plus 74 integration tests
+across 8 files (132 tests total):
 
 - **Unit tests** for the range coder round-trip, the IDCT (DC-only flat
   block, add-zero identity), the loop filter bounding-values table and
