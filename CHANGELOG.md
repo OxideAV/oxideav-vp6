@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-vp6/compare/v0.0.7...v0.0.8) - 2026-05-17
+
+### Other
+
+- vp6 r73: SATD-based qpel ME refinement (encoder)
+
 ### Added
 
 - **r73 — SATD-based qpel ME refinement (encoder).** Quarter-pel diamond
