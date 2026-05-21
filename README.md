@@ -5,18 +5,34 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Orphan-rebuild scaffold (2026-05-18).** The prior implementation was
-retired under the workspace
-[clean-room policy](https://github.com/OxideAV/oxideav/blob/master/docs/IMPLEMENTOR_ROUND.md):
-multiple source files acknowledged that their implementations were
-direct ports of an external library's VP6 codebase — which violates
-the clean-room provenance requirement even though VP6 has no public
-written specification. Master history was fully erased per the Hat-3
-cold-enforcement procedure.
+**Clean-room rebuild — round 1 (2026-05-21).** The orphan-rebuild
+scaffold from 2026-05-18 is being replaced incrementally by parsers
+sourced exclusively from
+[On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
+(document version 1.02, August 2006). No third-party VP6
+implementation is consulted at any stage.
 
-The implementation will be re-built against fresh reverse-engineering
-of real VP6 bitstreams (byte traces only, no external library source)
-in a future clean-room round.
+### What round 1 lands
+
+- `Vp6FrameHeader::parse` — frame-header raw-bit prefix:
+  - Table 1 (`FrameType`, `DctQMask`, `MultiStream`)
+  - Table 2 R(n) fields (`Vp3VersionNo`, `VpProfile`, `Reserved`,
+    conditional `Buff2Offset`)
+- Typed `CodingProfile` (Simple / Advanced / Reserved) and
+  `Vp3Version` (VP6.0 / 6.1 / 6.2 / Other) enums.
+- `Error::Truncated` for short-input failures.
+
+### What round 1 does NOT land
+
+- Anything downstream of the BoolCoder switch in the frame header
+  (`VFragments`, `HFragments`, scaling, filter selectors,
+  `UseHuffman`). Blocked on a DOCS-GAP against spec §7.3 — the
+  `Split = 1 + (((Range-1) * Probability) >> 7)` formula collapses
+  the prob-128 (`b(n)`) decoder path to always-0 and overflows when
+  `Probability > 128`. The fix is either a confirmation that `>> 7`
+  is correct alongside an encoder-side mapping explanation, or a
+  correction to `>> 8` (matching the VPx-family arithmetic coder
+  pattern). See the crate-root docs for the full report.
 
 ## License
 
