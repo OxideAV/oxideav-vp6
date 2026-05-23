@@ -4,7 +4,7 @@
 //! the [`oxideav`](https://github.com/OxideAV/oxideav) framework.
 //!
 //! **Status:** clean-room rebuild in progress (orphan-rebuild scaffold
-//! from 2026-05-18; round 1 below). The crate previously contained a
+//! from 2026-05-18; rounds 1–2 below). The crate previously contained a
 //! direct-port implementation that was retired under the workspace
 //! clean-room provenance policy. The rebuild reads only:
 //!
@@ -16,8 +16,6 @@
 //!
 //! ## Round 1 surface
 //!
-//! What this round lands:
-//!
 //! * [`Vp6FrameHeader`] — parser for the raw-bit prefix of a VP6
 //!   frame header (spec §9 Table 1 plus Table 2's four R(n) fields).
 //!   Covers `FrameType`, `DctQMask`, `MultiStream`, `Vp3VersionNo`,
@@ -27,14 +25,30 @@
 //!   can distinguish "I ran out of bytes" from "this code path isn't
 //!   wired up yet".
 //!
-//! What this round deliberately does **not** land:
+//! ## Round 2 surface
+//!
+//! * [`DequantContext`] — per-frame inverse-quantization context (spec
+//!   §15). Resolves the DC and AC scalar quantizer factors from the
+//!   header's `DctQMask` via the two 64-entry tables
+//!   ([`DC_QUANTIZATION_TABLE`] / [`AC_QUANTIZATION_TABLE`]) and
+//!   dequantizes a block's coefficients with a per-coefficient
+//!   multiply. This layer is **independent of the BoolCoder** — the
+//!   quantizer factor depends only on the already-parsed raw-bit
+//!   `DctQMask` — so it advances past the round-1 surface without
+//!   touching the contested §7.3 `Split` formula.
+//!
+//! What rounds 1–2 deliberately do **not** land:
 //!
 //! * Any field downstream of the BoolCoder switch in the frame header
-//!   (`VFragments`/`HFragments`/scaling/filter selectors/`UseHuffman`).
-//! * The BoolCoder primitive itself.
+//!   (`VFragments`/`HFragments`/scaling/filter selectors/`UseHuffman`),
+//!   mode/MV decoding, and DCT-token decoding — every one of these is
+//!   `b(n)`/`B(x)`/`T` BoolCoder-coded.
+//! * The BoolCoder primitive itself (the `VP6_DecodeBool` bit decoder).
+//!   Its initialization (`VP6_StartDecode`) and normalization are
+//!   unambiguous, but the per-bit `Split` step is blocked.
 //!
-//! See the `DOCS-GAP` section below for the spec ambiguity blocking
-//! that step.
+//! See the `DOCS-GAP` section below for the spec defect blocking that
+//! step.
 //!
 //! ## DOCS-GAP: spec §7.3 BoolCoder Split formula
 //!
@@ -69,19 +83,29 @@
 //! valid probabilities), which is the formula used in other binary
 //! arithmetic coders in the VPx family.
 //!
-//! We deliberately **do not** "guess" the fix per the workspace
-//! "ask for docs, don't fish" rule. Round 2 is blocked on a docs
-//! patch clarifying the Split formula — either confirming `>> 7` is
-//! correct (and explaining the encoder-side mapping that makes it
-//! work) or correcting it to `>> 8`.
+//! This is a spec **defect**, not a silence: §7.3 gives an explicit
+//! formula, but that formula is provably self-contradictory against
+//! the spec's own `b(x)` fixed-prob-128 raw-bit reads. We deliberately
+//! **do not** "guess" the `>> 8` fix per the workspace "ask for docs,
+//! don't fish" rule. The BoolCoder-coded layers (frame-header tail,
+//! mode/MV decoding, DCT-token decoding) stay blocked on a docs patch
+//! clarifying the Split formula — either confirming `>> 7` is correct
+//! (and explaining the encoder-side mapping that makes it work) or
+//! correcting it to `>> 8`.
+//!
+//! Round 2 worked **around** the block by landing the inverse-
+//! quantization layer (spec §15, [`DequantContext`]), which is driven
+//! solely by the raw-bit `DctQMask` and never calls `VP6_DecodeBool`.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
 
 use oxideav_core::RuntimeContext;
 
+pub mod dequant;
 pub mod frame_header;
 
+pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
 
 /// Crate-local error type.

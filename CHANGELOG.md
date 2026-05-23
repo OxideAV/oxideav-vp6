@@ -6,6 +6,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 2, 2026-05-23)
+
+- `DequantContext` — per-frame inverse-quantization context (spec
+  §15). Resolves the DC and AC scalar quantizer factors from the
+  frame header's `DctQMask` (already parsed by round 1) via the two
+  64-entry tables `DC_QUANTIZATION_TABLE` / `AC_QUANTIZATION_TABLE`,
+  and dequantizes a block of coefficients via `dequantize_block` /
+  `dequantize_coeff`. Transcribed verbatim from
+  `docs/video/vp6/vp6_format.pdf` §15. This layer reads only the
+  raw-bit `DctQMask` and never calls the BoolCoder, so it advances
+  the decoder without depending on the §7.3 `Split` defect.
+- 9 unit tests over the dequant tables and context: table sizes,
+  spec endpoints, monotonicity, factor resolution, 6-bit mask
+  clamping, DC-vs-AC selection, sign/extreme-magnitude handling, and
+  full-block coverage of all 64 coefficients (the test for index 63
+  guards against the §15 pseudocode's `i < 63` off-by-one).
+
+### Spec note (clean-room round 2)
+
+- §15's dequantization pseudocode `for(i=1;i<63;i++)` leaves
+  coefficient 63 un-dequantized, contradicting the §15 prose ("each
+  of its 64 coefficients", "all 63 of the AC coefficients"). The
+  prose is internally consistent (64 = 1 DC + 63 AC); the pseudocode
+  bound is a clear off-by-one. We follow the prose and dequantize all
+  64 coefficients.
+
 ### Added (clean-room round 1, 2026-05-21)
 
 - `Vp6FrameHeader::parse` — raw-bit prefix parser covering spec §9
