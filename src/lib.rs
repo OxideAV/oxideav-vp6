@@ -123,6 +123,27 @@
 //!   MV) combine the same clip with motion compensation against a
 //!   reference reconstruction buffer; they are blocked on the BoolCoder
 //!   for MV decoding upstream.
+//!
+//! ## Round 5 surface
+//!
+//! * [`interp`] — the spec §11.4 fractional-pixel motion-compensation
+//!   interpolation filters: the bilinear 2-tap kernel ([`interp::bilinear_point`])
+//!   and 4-tap bicubic kernel ([`interp::bicubic_point`]) with their full
+//!   tap tables ([`interp::BILINEAR_LUMA_FILTERS`],
+//!   [`interp::BILINEAR_CHROMA_FILTERS`], [`interp::BICUBIC_FILTER_SET`]),
+//!   their separable two-pass 8x8 block applicators
+//!   ([`interp::bilinear_block`] / [`interp::bicubic_block`]), and the
+//!   §11.4 `Var16Point` prediction-block variance metric
+//!   ([`interp::var_16_point`]) used by the Advanced-Profile filter
+//!   selector. These produce the interpolated sub-pixel prediction
+//!   samples that §17.4 reconstruction consumes. Given a reference buffer,
+//!   stride and fractional phase the kernels are pure integer pixel
+//!   arithmetic — they never call `VP6_DecodeBool`, so this stage (like
+//!   §15, §16 and §17.1) advances the decoder without touching the
+//!   contested §7.3 `Split` formula. The motion vector that *selects* the
+//!   phase and source is BoolCoder-gated upstream; the filter-selection
+//!   *size* threshold is also deferred on an undefined `MAX_MV_EXTENT`
+//!   constant (see the [`interp`] module DOCS-GAP note).
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -132,11 +153,16 @@ use oxideav_core::RuntimeContext;
 pub mod dequant;
 pub mod frame_header;
 pub mod idct;
+pub mod interp;
 pub mod reconstruct;
 
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
 pub use idct::idct_block;
+pub use interp::{
+    bicubic_block, bicubic_point, bilinear_block, bilinear_point, var_16_point, BICUBIC_FILTER_SET,
+    BICUBIC_VP61_INDEX, BILINEAR_CHROMA_FILTERS, BILINEAR_LUMA_FILTERS,
+};
 pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};
 
 /// Crate-local error type.

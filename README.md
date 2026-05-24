@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 4 (2026-05-24).** The orphan-rebuild
+**Clean-room rebuild — round 5 (2026-05-24).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -64,7 +64,33 @@ implementation is consulted at any stage.
   reconstruction buffer; they are blocked on the BoolCoder for MV
   decoding upstream.
 
-### What rounds 1–4 do NOT land
+### What round 5 lands
+
+- `interp` — the spec §11.4 fractional-pixel motion-compensation
+  interpolation filters. The bilinear 2-tap kernel (`bilinear_point`) and
+  4-tap bicubic kernel (`bicubic_point`), their full tap tables
+  (`BILINEAR_LUMA_FILTERS` `[4][2]`, `BILINEAR_CHROMA_FILTERS` `[8][2]`,
+  `BICUBIC_FILTER_SET` `[17][8][4]`), their separable two-pass 8x8 block
+  applicators (`bilinear_block` / `bicubic_block`), and the §11.4
+  `Var16Point` prediction-block variance metric (`var_16_point`) used by
+  the Advanced-Profile filter selector. Each tap set sums to 128 and the
+  kernels descale by `(Σ + 64) >> 7`; the bicubic kernel clips its
+  output to `0..=255` per §11.4.2.
+- These produce the interpolated sub-pixel prediction samples that §17.4
+  reconstruction consumes. Given a reference buffer, stride and fractional
+  phase the kernels are pure integer pixel arithmetic and read **no
+  BoolCoder bits**, so — like §15 dequant, §16 IDCT and §17.1 intra
+  reconstruction — this stage advances the decoder without touching the
+  contested §7.3 `Split` formula. The motion vector that *selects* the
+  filter phase and source position is BoolCoder-gated upstream.
+- **DOCS-GAP (selector only):** §11.4's Advanced-Profile filter-size
+  selector reads `FilterMvSizeThresh = ((MAX_MV_EXTENT >> 1) + 1) << 2`,
+  but `MAX_MV_EXTENT` is never assigned a numeric value anywhere in the
+  document. The per-point kernels, tap tables and the variance half of
+  the selector are fully specified and landed; the size-threshold
+  selector is deferred until the constant is supplied.
+
+### What rounds 1–5 do NOT land
 
 - Anything downstream of the BoolCoder switch in the frame header
   (`VFragments`, `HFragments`, scaling, filter selectors,

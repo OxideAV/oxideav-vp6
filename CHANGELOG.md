@@ -6,6 +6,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 5, 2026-05-24)
+
+- `interp` module — the spec §11.4 fractional-pixel motion-compensation
+  interpolation filters. Bilinear 2-tap kernel (`bilinear_point`) and
+  4-tap bicubic kernel (`bicubic_point`); the full tap tables
+  `BILINEAR_LUMA_FILTERS` `[4][2]`, `BILINEAR_CHROMA_FILTERS` `[8][2]`,
+  `BICUBIC_FILTER_SET` `[17][8][4]` (`BICUBIC_VP61_INDEX = 16` selects
+  the VP6.1 coefficient set); separable two-pass 8x8 block applicators
+  `bilinear_block` / `bicubic_block`; and the §11.4 `Var16Point`
+  prediction-block variance metric `var_16_point` used by the
+  Advanced-Profile filter selector. Each tap set sums to 128; the
+  per-point descale is `(Σ taps + 64) >> 7` and the bicubic kernel clips
+  to `0..=255` per §11.4.2. Transcribed verbatim from
+  `docs/video/vp6/vp6_format.pdf` §11.4. Produces the interpolated
+  sub-pixel prediction samples that §17.4 reconstruction consumes;
+  BoolCoder-independent like §15/§16/§17.1 so it advances past round 4
+  without touching the contested §7.3 `Split` formula.
+- 20 unit tests over the §11.4 stage: tap-sum invariants, phase-0
+  identity, table dimensions, bilinear/bicubic flat-source and identity
+  kernels, bicubic overshoot clipping, separable block applicators
+  (whole-pixel copy, flat-source all-phases, horizontal-matches-point),
+  and the `Var16Point` variance metric (flat-is-zero, two-level
+  closed-form, even-row/even-column sampling).
+
+### DOCS-GAP (round 5)
+
+- §11.4's Advanced-Profile filter-*size* selector reads
+  `FilterMvSizeThresh = ((MAX_MV_EXTENT >> 1) + 1) << 2` but
+  `MAX_MV_EXTENT` is never assigned a numeric value in the document.
+  The per-point kernels, tap tables and the variance half of the
+  selector are fully specified and landed; the size-threshold selector
+  is deferred until the constant is supplied.
+
 ### Added (clean-room round 4, 2026-05-24)
 
 - `reconstruct_intra_block` / `intra_block_to_pixels` — the spec §17.1
