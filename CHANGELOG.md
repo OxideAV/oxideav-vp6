@@ -6,6 +6,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 3, 2026-05-24)
+
+- `idct_block` — the spec §16 inverse DCT transform: a separable,
+  fixed-point integer IDCT (14-bit precision; seven Q16 cosine
+  constants `xC1S7`…`xC7S1`) that converts an 8x8 block of dequantized
+  coefficients in raster order back to pixel / pixel-difference values
+  via a row pass followed by a column pass (the column pass applies the
+  transform's `>> 4` output descale). Transcribed verbatim from
+  `docs/video/vp6/vp6_format.pdf` §16. Like the §15 dequant layer this
+  stage reads no BoolCoder bits — it consumes the output of
+  `DequantContext::dequantize_block` — so it advances the decoder
+  without depending on the §7.3 `Split` defect.
+- 8 unit tests over the IDCT: exact cosine-constant transcription,
+  all-zero passthrough, DC-only flatness (with the expected uniform
+  value recomputed term-by-term), negative-DC sign preservation, that
+  every one of the 64 input coefficients participates in the
+  butterfly, that an AC-only block is non-flat, and that purely
+  horizontal / vertical AC inputs produce no vertical / horizontal
+  variation respectively (separability check).
+
+### Spec note (clean-room round 3)
+
+- The §16 column-pass pseudocode renders the `_Bd` assignment with an
+  unbalanced parenthesis (`_Bd = ((xC4S4 * (_B - _D)>>16)` — one `(`
+  short of closing the product before `>>16`). The row pass gives the
+  same quantity correctly as `((xC4S4 * (_B - _D))>>16)`, and the two
+  passes are structurally identical butterflies, so this is a document
+  transcription artefact, not a semantic difference; `idct_block` uses
+  the balanced form in both passes.
+
 ### Added (clean-room round 2, 2026-05-23)
 
 - `DequantContext` — per-frame inverse-quantization context (spec

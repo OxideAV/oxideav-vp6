@@ -96,6 +96,18 @@
 //! Round 2 worked **around** the block by landing the inverse-
 //! quantization layer (spec §15, [`DequantContext`]), which is driven
 //! solely by the raw-bit `DctQMask` and never calls `VP6_DecodeBool`.
+//!
+//! ## Round 3 surface
+//!
+//! * [`idct_block`] — the spec §16 inverse DCT transform. A separable,
+//!   fixed-point integer IDCT (14-bit precision, seven Q16 cosine
+//!   constants) that converts an 8x8 block of dequantized coefficients
+//!   in raster order back to pixel / pixel-difference values via a row
+//!   pass and a column pass. Like the §15 dequant layer it is
+//!   **BoolCoder-independent** — it consumes the output of
+//!   [`DequantContext::dequantize_block`] and never calls
+//!   `VP6_DecodeBool` — so it advances past round 2 without touching
+//!   the contested §7.3 `Split` formula.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -104,9 +116,11 @@ use oxideav_core::RuntimeContext;
 
 pub mod dequant;
 pub mod frame_header;
+pub mod idct;
 
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
+pub use idct::idct_block;
 
 /// Crate-local error type.
 ///

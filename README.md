@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 2 (2026-05-23).** The orphan-rebuild
+**Clean-room rebuild — round 3 (2026-05-24).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -33,7 +33,20 @@ implementation is consulted at any stage.
   `DctQMask`), so it advances past round 1 without touching the
   blocked §7.3 `Split` formula.
 
-### What rounds 1–2 do NOT land
+### What round 3 lands
+
+- `idct_block` — the spec §16 inverse DCT transform: a separable,
+  fixed-point integer IDCT (14-bit precision, seven Q16 cosine
+  constants) that turns an 8x8 block of dequantized coefficients in
+  raster order back to pixel / pixel-difference values via a row pass
+  and a column pass.
+- This stage is the natural successor to dequant (§15 → §16): it
+  consumes `DequantContext::dequantize_block`'s output and, like that
+  layer, reads **no BoolCoder bits**, so it lands without touching the
+  blocked §7.3 `Split` formula. Clamping and the intra `+128` level
+  shift belong to §17 frame reconstruction, a later round.
+
+### What rounds 1–3 do NOT land
 
 - Anything downstream of the BoolCoder switch in the frame header
   (`VFragments`, `HFragments`, scaling, filter selectors,
