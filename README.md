@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 3 (2026-05-24).** The orphan-rebuild
+**Clean-room rebuild — round 4 (2026-05-24).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -46,7 +46,25 @@ implementation is consulted at any stage.
   blocked §7.3 `Split` formula. Clamping and the intra `+128` level
   shift belong to §17 frame reconstruction, a later round.
 
-### What rounds 1–3 do NOT land
+### What round 4 lands
+
+- `reconstruct_intra_block` / `intra_block_to_pixels` — the spec §17.1
+  intra-block reconstruction step. For each of the 64 post-IDCT samples
+  in raster order: `OutputValue = InputValue + 128`, then inclusive
+  clip to `0..=255`. Inverts the encoder-side level shift that §17.1
+  documents ("prior to encoding the value 128 is subtracted from all
+  data samples").
+- This is the natural successor to the §16 IDCT for the intra-coded
+  path. Like the §15 dequant and §16 IDCT layers it reads **no
+  BoolCoder bits** — it operates on a finished post-IDCT 8x8 block — so
+  it advances the decoder past round 3 without touching the contested
+  §7.3 `Split` formula.
+- The remaining §17.2–§17.4 cases (zero MV, full-pixel MV, sub-pixel MV)
+  combine the same clip with motion compensation against a reference
+  reconstruction buffer; they are blocked on the BoolCoder for MV
+  decoding upstream.
+
+### What rounds 1–4 do NOT land
 
 - Anything downstream of the BoolCoder switch in the frame header
   (`VFragments`, `HFragments`, scaling, filter selectors,

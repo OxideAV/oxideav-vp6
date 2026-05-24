@@ -108,6 +108,21 @@
 //!   [`DequantContext::dequantize_block`] and never calls
 //!   `VP6_DecodeBool` — so it advances past round 2 without touching
 //!   the contested §7.3 `Split` formula.
+//!
+//! ## Round 4 surface
+//!
+//! * [`reconstruct_intra_block`] — the spec §17.1 intra block
+//!   reconstruction step: per-sample `OutputValue = InputValue + 128`
+//!   followed by an inclusive clip to `0..=255`. Inverts the
+//!   encoder-side level shift that §17.1 documents (`prior to encoding
+//!   the value 128 is subtracted from all data samples`). The natural
+//!   successor to the §16 IDCT for the intra-coded path; like §15
+//!   and §16 it is **BoolCoder-independent** so it advances the decoder
+//!   past round 3 without touching the contested §7.3 `Split` formula.
+//!   The remaining §17.2–§17.4 cases (zero MV, full-pixel MV, sub-pixel
+//!   MV) combine the same clip with motion compensation against a
+//!   reference reconstruction buffer; they are blocked on the BoolCoder
+//!   for MV decoding upstream.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -117,10 +132,12 @@ use oxideav_core::RuntimeContext;
 pub mod dequant;
 pub mod frame_header;
 pub mod idct;
+pub mod reconstruct;
 
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
 pub use idct::idct_block;
+pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};
 
 /// Crate-local error type.
 ///

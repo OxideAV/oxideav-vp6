@@ -6,6 +6,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 4, 2026-05-24)
+
+- `reconstruct_intra_block` / `intra_block_to_pixels` — the spec §17.1
+  intra-block reconstruction step. For each of the 64 post-IDCT samples
+  in raster order: `OutputValue = InputValue + 128`, then inclusive
+  clip to `0..=255` (per §17.1's `If OutputValue < 0 { 0 } else if
+  OutputValue > 255 { 255 }`). Inverts the encoder-side level shift
+  §17.1 documents (the encoder subtracts 128 from every sample before
+  the forward DCT). Transcribed verbatim from
+  `docs/video/vp6/vp6_format.pdf` §17.1. The natural successor to the
+  §16 IDCT for the intra path; like §15 and §16 it reads no BoolCoder
+  bits, so it advances past round 3 without touching the contested
+  §7.3 `Split` formula.
+- `INTRA_DC_LEVEL_SHIFT` / `PIXEL_MIN` / `PIXEL_MAX` public constants
+  so the matching encoder-side path can share the single source of
+  truth for `128` and `0..=255`.
+- 10 unit tests over the §17.1 stage: level-shift constant value,
+  pixel-range constants, all-zero block reconstructs to flat mid-grey
+  (128), in-range positive inputs pass through with no clip, in-range
+  negatives pass through with no clip, far-negative inputs clip to 0,
+  far-positive inputs clip to 255, inclusive-boundary behaviour at
+  `-128` / `-129` / `127` / `128`, per-sample independence (no
+  inter-sample state), wrapper-vs-dual-buffer parity, and an
+  integration test that drives the §17.1 stage from a real `idct_block`
+  output (DC-only flat block stays flat after reconstruction).
+
 ### Added (clean-room round 3, 2026-05-24)
 
 - `idct_block` — the spec §16 inverse DCT transform: a separable,
