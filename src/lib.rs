@@ -168,6 +168,31 @@
 //!   contested §7.3 `Split` formula. Note the inter path applies **no**
 //!   `+128` intra level shift (§17.1 only): the prediction already
 //!   carries the DC.
+//!
+//! ## Round 7 surface
+//!
+//! * [`loopfilter`] — the spec §11.3 prediction loop filter. Implements
+//!   the 4-tap `(1, -3, 3, -1)` deblocking filter applied to prediction
+//!   blocks that straddle 8x8 boundaries in the reference frame, with
+//!   the quantizer-indexed `Bound()` soft-clip that preserves real
+//!   reference-frame edges while smoothing block-boundary
+//!   discontinuities. Surfaces the
+//!   [`loopfilter::PREDICTION_LOOP_FILTER_LIMIT_VALUES`] 64-entry
+//!   quantizer-indexed limit table, the
+//!   [`loopfilter::boundary_x`] / [`loopfilter::boundary_y`] block-edge
+//!   offset calculations (`(8 - (mV & 7)) & 7`), the
+//!   [`loopfilter::bound`] soft-clip, the per-edge
+//!   [`loopfilter::prediction_loop_filter_function`] applicator, and the
+//!   [`loopfilter::filter_vertical_boundary`] /
+//!   [`loopfilter::filter_horizontal_boundary`] 2-D wrappers. Per the
+//!   spec the deringing variant is "not currently supported by the
+//!   decoder" so only the deblocking filter is implemented; Simple
+//!   Profile disables the loop filter entirely (caller-side gate). Like
+//!   §15/§16/§17.1/§11.4/§17.2–§17.4 this stage reads **no BoolCoder
+//!   bits** — given a whole-sample-aligned MV, a prediction buffer and
+//!   the frame's `DctQMask`, every step is pure integer pixel arithmetic
+//!   — so it advances the decoder without touching the contested §7.3
+//!   `Split` formula.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -179,6 +204,7 @@ pub mod frame_header;
 pub mod idct;
 pub mod inter;
 pub mod interp;
+pub mod loopfilter;
 pub mod reconstruct;
 
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
@@ -191,6 +217,10 @@ pub use inter::{
 pub use interp::{
     bicubic_block, bicubic_point, bilinear_block, bilinear_point, var_16_point, BICUBIC_FILTER_SET,
     BICUBIC_VP61_INDEX, BILINEAR_CHROMA_FILTERS, BILINEAR_LUMA_FILTERS,
+};
+pub use loopfilter::{
+    bound, boundary_x, boundary_y, filter_horizontal_boundary, filter_vertical_boundary,
+    prediction_loop_filter_function, PREDICTION_LOOP_FILTER_LIMIT_VALUES,
 };
 pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};
 

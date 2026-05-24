@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 6 (2026-05-24).** The orphan-rebuild
+**Clean-room rebuild — round 7 (2026-05-25).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -124,7 +124,50 @@ implementation is consulted at any stage.
   drives the fetch/interpolation phase is decoded upstream, behind the
   BoolCoder.
 
-### What rounds 1–6 do NOT land
+### What round 7 lands
+
+- `loopfilter` — the spec §11.3 prediction loop filter. VP6 has no
+  traditional in-loop deblocking filter on the reconstruction buffer;
+  instead, when a non-zero motion vector produces a prediction block
+  that straddles an 8x8 boundary in the reference frame, the samples
+  on either side of that boundary in the **prediction** signal are
+  deblocked into a temporary buffer before §11.4 fractional-pixel
+  interpolation runs.
+- `PREDICTION_LOOP_FILTER_LIMIT_VALUES[64]` — the quantizer-indexed
+  `FLimit` table (`[0]=30`, `[63]=1`, monotonically non-increasing),
+  selected by the frame's raw-bit `DctQMask`.
+- `boundary_x` / `boundary_y` — the §11.3 `(8 - (mV & 7)) & 7`
+  block-edge offset calculation that locates the straddling boundary
+  inside the prediction block from the whole-sample-aligned MV
+  components (`mV >> MvShift`, already provided by round 6's
+  `inter::whole_sample_aligned`).
+- `bound(FLimit, FiltVal)` — the §11.3 soft-clip: linear passthrough
+  in `|FiltVal| < FLimit`, symmetric taper toward `0` across
+  `[FLimit, 2*FLimit)`, hard zero at `|FiltVal| >= 2*FLimit`. The taper
+  is what preserves real reference-frame edges (large cross-boundary
+  gradient → zeroed filter response) while smoothing block-boundary
+  discontinuities (small gradient relative to the limit → linear
+  smoothing).
+- `prediction_loop_filter_function(buf, boundary_offset, step, pitch,
+  points, current_quantizer_index)` — the per-edge applicator
+  implementing the §11.3 `(1, -3, 3, -1)` 4-tap filter with `+ 4 ) >> 3`
+  rounding-and-descale, the `Bound()` soft-clip and the per-sample
+  `Clamp0To255` writes on `Src[-Step]` and `Src[0]`.
+- `filter_vertical_boundary` / `filter_horizontal_boundary` — 2D
+  wrappers that select `step=1, pitch=stride` (vertical) or
+  `step=stride, pitch=1` (horizontal) and sweep the 8-sample edge.
+- Per the spec, only the deblocking filter is implemented; the
+  deringing variant carries the spec's own "not currently supported by
+  the decoder (see Table 3)" rider.
+- Like §15/§16/§17.1/§11.4/§17.2–§17.4 this stage reads **no BoolCoder
+  bits** — given a whole-sample-aligned MV, a prediction buffer and
+  the frame's `DctQMask`, every step is pure integer pixel arithmetic
+  — so it advances the decoder past round 6 without touching the
+  contested §7.3 `Split` formula. `UseLoopFilter` itself is a raw-bit
+  frame-header field; the per-profile gate (disabled in Simple Profile,
+  read from the header in Advanced) is a caller-side concern.
+
+### What rounds 1–7 do NOT land
 
 - Anything downstream of the BoolCoder switch in the frame header
   (`VFragments`, `HFragments`, scaling, filter selectors,

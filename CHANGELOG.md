@@ -6,6 +6,64 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 7, 2026-05-25)
+
+- `loopfilter` module — the spec §11.3 prediction loop filter.
+  Implements the 4-tap `(1, -3, 3, -1)` deblocking filter that VP6
+  applies to prediction blocks straddling 8x8 boundaries in the
+  reference frame (instead of an in-loop reconstruction-buffer
+  filter). Surfaces:
+  - `PREDICTION_LOOP_FILTER_LIMIT_VALUES[64]` — the
+    quantizer-indexed `FLimit` table (`[0]=30`, `[63]=1`, monotonically
+    non-increasing), indexed by the frame's raw-bit `DctQMask`.
+  - `boundary_x` / `boundary_y` — the `(8 - (mV & 7)) & 7` block-edge
+    offset calculation that locates the straddling boundary inside
+    the prediction block from the whole-sample-aligned MV components
+    (`mV >> MvShift`, provided by round 6's
+    `inter::whole_sample_aligned`).
+  - `bound(FLimit, FiltVal)` — the soft-clip: linear passthrough in
+    `|FiltVal| < FLimit`, symmetric taper across
+    `[FLimit, 2*FLimit)`, hard zero at `|FiltVal| >= 2*FLimit`. The
+    taper preserves real reference-frame edges and smooths
+    quantization-induced block-boundary discontinuities.
+  - `prediction_loop_filter_function` — the per-edge applicator
+    implementing the §11.3 `(1, -3, 3, -1)` filter with `+ 4 ) >> 3`
+    round-and-descale, the `Bound()` soft-clip, and the
+    `Clamp0To255` writes on the two boundary-adjacent samples.
+  - `filter_vertical_boundary` / `filter_horizontal_boundary` —
+    2-D wrappers that select `step=1, pitch=stride` (vertical) or
+    `step=stride, pitch=1` (horizontal) and sweep the 8-sample
+    edge.
+- Per the spec, only the deblocking variant is implemented; the
+  deringing variant carries the spec's own "not currently supported
+  by the decoder (see Table 3)" rider.
+- Transcribed verbatim from `docs/video/vp6/vp6_format.pdf` §11.3
+  (On2 Technologies, document version 1.02, August 2006). Like
+  §15/§16/§17.1/§11.4/§17.2–§17.4 it reads no BoolCoder bits, so it
+  advances past round 6 without touching the contested §7.3 `Split`
+  formula. `UseLoopFilter` is a raw-bit frame-header field; the
+  per-profile gate (disabled in Simple Profile, read from the header
+  in Advanced) is a caller-side concern.
+- 26 unit tests over the §11.3 stage: the 64-entry limit table
+  (length, endpoints, monotonicity, six mid-table spot values);
+  `boundary_x` / `boundary_y` for aligned-MV (zero), non-aligned
+  positive, sign-mirror identity, and an exhaustive `in 0..=7`
+  range sweep across `-64..=64`; `abs` and `clamp_0_to_255`
+  pseudocode equivalence; the `Bound` soft-clip in all four
+  spec branches (zero-in/zero-out, saturation at `±2·FLimit`,
+  small-positive passthrough, small-negative passthrough,
+  taper-band linearity, sign symmetry); the applicator's
+  flat-input no-change, small-step smoothing, large-step edge
+  preservation, high-quantizer preserves-more-than-low; the
+  `Clamp0To255` clip-path invariant under a 5⁴ pixel sweep and a
+  wider 256·5³ sweep; multi-row vertical-boundary and
+  multi-column horizontal-boundary sweeps with closed-form
+  expected values; the "must not mutate reference in place"
+  caller-temp-copy pattern; and an integration test combining
+  `inter::whole_sample_aligned` with `boundary_x` to verify the
+  8x8-aligned-MV → no-boundary identity and the
+  one-sample-past-boundary case.
+
 ### Added (clean-room round 6, 2026-05-24)
 
 - `inter` module — the spec §17.2–§17.4 inter-block reconstruction
