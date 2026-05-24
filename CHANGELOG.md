@@ -6,6 +6,70 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 8, 2026-05-25)
+
+- `umv` module — the spec §11.5 Unrestricted Motion Vector (UMV)
+  border extension. VP6 permits motion vectors that address prediction
+  blocks beyond the borders of the decoded image; before any inter
+  block is reconstructed against a reference frame, that reference
+  frame's reconstruction buffer is extended by 48 sample points in all
+  four directions, with the borders filled by edge replication.
+  Surfaces:
+  - `UMV_BORDER_SIZE` — the 48-sample constant the spec mandates
+    ("the reconstruction buffers are extended by 48 sample points in
+    all directions").
+  - `extended_stride(width)` / `extended_height(height)` /
+    `origin_offset(stride)` — geometry helpers for the extended buffer
+    layout (`stride = width + 2 * 48`, `rows = height + 2 * 48`, and
+    the original-image origin sits at `48 * stride + 48` in the
+    linear buffer).
+  - `extend_border(buf, width, height)` — the in-place §11.5
+    applicator. Performs the extension in the spec-mandated order:
+    first horizontal (every original-image row's left and right
+    48-sample borders take the row's leftmost / rightmost
+    original-column value), then vertical (each top / bottom border
+    row is a row-wide copy of the topmost / bottommost
+    horizontally-extended row). The "first in x, then in y" ordering
+    is what makes the four 48×48 corner quadrants uniform at the
+    corresponding corner-pixel value of the original image, per the
+    spec's Figure 13.
+  - `build_extended_buffer(image, width, height)` — convenience that
+    allocates a `Vec<u8>` of the right size, copies the raster-order
+    `image` plane into the inner rectangle, runs `extend_border`, and
+    returns `(buf, stride, origin)` ready to hand to
+    `inter::fetch_prediction_block`.
+- Transcribed verbatim from `docs/video/vp6/vp6_format.pdf` §11.5
+  (On2 Technologies, document version 1.02, August 2006). Like
+  §15/§16/§17.1/§11.4/§17.2–§17.4/§11.3 it reads no BoolCoder bits,
+  so it advances past round 7 without touching the contested §7.3
+  `Split` formula.
+- 26 unit tests over the §11.5 stage: the 48-sample border constant;
+  `extended_stride` / `extended_height` for a range of input sizes
+  including `1×1`, `16×16`, common SD/HD frame sizes (`320×240`,
+  `640×480`, `1920×1080`); `origin_offset` at the top-left inner
+  corner of two strides; `build_extended_buffer` geometry
+  consistency, inner-image preservation, and length matches across
+  five common frame sizes; left-border and right-border row
+  replication with per-row distinct edge values; top-border and
+  bottom-border row replication; all four 48×48 corner quadrants
+  uniform at the corresponding corner pixel of the original image
+  (the "first in x, then in y" ordering test); `extend_border`
+  idempotency when called twice; degenerate `1×1` (whole extended
+  buffer uniform), `8×1` (every extended-buffer row reproduces the
+  source row), and `1×6` (every extended-buffer column reproduces
+  the source column) shapes; the inner image left untouched after
+  border extension; and four `should_panic` tests covering input
+  validation (`width = 0`, `height = 0`, buffer too small,
+  `image.len()` mismatch). Plus four integration tests with
+  `crate::inter::fetch_prediction_block`: zero-MV fetch at the
+  origin reproduces the inner image's top-left 8×8 block;
+  negative-x MV fetch into the left border reads the leftmost
+  original column for each row; negative-y MV fetch into the top
+  border reads the topmost original row for each column; and a
+  combined `±UMV_BORDER_SIZE` MV magnitude check at both the
+  top-left and bottom-right corner quadrants demonstrates that
+  fetches at the maximum border extent remain in-bounds.
+
 ### Added (clean-room round 7, 2026-05-25)
 
 - `loopfilter` module — the spec §11.3 prediction loop filter.

@@ -193,6 +193,34 @@
 //!   the frame's `DctQMask`, every step is pure integer pixel arithmetic
 //!   — so it advances the decoder without touching the contested §7.3
 //!   `Split` formula.
+//!
+//! ## Round 8 surface
+//!
+//! * [`umv`] — the spec §11.5 Unrestricted Motion Vector (UMV) border
+//!   extension. Surfaces the [`umv::UMV_BORDER_SIZE`] constant (48,
+//!   per spec), [`umv::extended_stride`] / [`umv::extended_height`] /
+//!   [`umv::origin_offset`] geometry helpers, the in-place
+//!   [`umv::extend_border`] applicator, and the
+//!   [`umv::build_extended_buffer`] convenience constructor that
+//!   allocates a UMV-bordered buffer, copies the original image into
+//!   the inner rectangle, and fills the borders. The extension is pure
+//!   edge replication in the spec-mandated "first in x, then in y"
+//!   order: every original-image row's 48 left-border samples take
+//!   the row's leftmost-original-column value and the 48 right-border
+//!   samples take the rightmost-original-column value; each of the 48
+//!   top- and bottom-border rows is then a row-wide copy of the
+//!   topmost / bottommost horizontally-extended row, which makes the
+//!   four 48×48 corner quadrants uniform at the corresponding
+//!   corner-pixel value of the original image. The result lets
+//!   [`inter::fetch_prediction_block`] and the §11.4 interpolation
+//!   filters fetch any sample position within `±48` of the image
+//!   boundary as if the original image's edge samples extended
+//!   indefinitely — the well-defined "clamp" semantics a UMV fetch
+//!   needs. Like §15/§16/§17.1/§11.4/§17.2–§17.4/§11.3 this stage
+//!   reads **no BoolCoder bits** — it is pure pixel arithmetic on an
+//!   already-reconstructed frame buffer — so it advances the decoder
+//!   past round 7 without touching the contested §7.3 `Split`
+//!   formula.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -206,6 +234,7 @@ pub mod inter;
 pub mod interp;
 pub mod loopfilter;
 pub mod reconstruct;
+pub mod umv;
 
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
@@ -223,6 +252,10 @@ pub use loopfilter::{
     prediction_loop_filter_function, PREDICTION_LOOP_FILTER_LIMIT_VALUES,
 };
 pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};
+pub use umv::{
+    build_extended_buffer, extend_border, extended_height, extended_stride, origin_offset,
+    UMV_BORDER_SIZE,
+};
 
 /// Crate-local error type.
 ///

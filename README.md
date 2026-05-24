@@ -167,7 +167,47 @@ implementation is consulted at any stage.
   frame-header field; the per-profile gate (disabled in Simple Profile,
   read from the header in Advanced) is a caller-side concern.
 
-### What rounds 1–7 do NOT land
+### What round 8 lands
+
+- `umv` — the spec §11.5 Unrestricted Motion Vector (UMV) border
+  extension. VP6 permits motion vectors that address prediction blocks
+  beyond the borders of the decoded image; before any inter block is
+  reconstructed against a reference frame, that reference frame's
+  reconstruction buffer is extended by 48 sample points in all four
+  directions, with the borders filled by pure edge replication. The
+  result is that an out-of-image fetch reads the original image's
+  nearest edge sample — the well-defined "clamp" semantics
+  `inter::fetch_prediction_block` and the §11.4 interpolation filters
+  expect (and that `inter`'s round-6 commentary explicitly defers to
+  the §11.5 border).
+- `UMV_BORDER_SIZE` — the 48-sample constant the spec mandates
+  ("the reconstruction buffers are extended by 48 sample points in all
+  directions").
+- `extended_stride(width)` / `extended_height(height)` /
+  `origin_offset(stride)` — geometry helpers for the extended buffer
+  layout: `stride = width + 2*48`, `rows = height + 2*48`, and the
+  original-image origin sits at `48 * stride + 48` in the linear
+  buffer.
+- `extend_border(buf, width, height)` — the in-place §11.5 applicator.
+  Performs the extension in the spec-mandated order: first horizontal
+  (every original-image row's left and right 48-sample borders take
+  the row's leftmost / rightmost original-column value), then vertical
+  (each top / bottom border row is a row-wide copy of the topmost /
+  bottommost horizontally-extended row). The "first in x, then in y"
+  ordering is what makes the four 48×48 corner quadrants uniform at
+  the corresponding corner-pixel value of the original image, per the
+  spec's Figure 13.
+- `build_extended_buffer(image, width, height)` — convenience that
+  allocates a `Vec<u8>` of the right size, copies the raster-order
+  `image` plane into the inner rectangle, runs `extend_border`, and
+  returns `(buf, stride, origin)` ready to hand to
+  `inter::fetch_prediction_block`.
+- Like §15/§16/§17.1/§11.4/§17.2–§17.4/§11.3 this stage reads **no
+  BoolCoder bits** — it is pure edge-replication pixel arithmetic on
+  an already-reconstructed frame buffer — so it advances the decoder
+  past round 7 without touching the contested §7.3 `Split` formula.
+
+### What rounds 1–8 do NOT land
 
 - Anything downstream of the BoolCoder switch in the frame header
   (`VFragments`, `HFragments`, scaling, filter selectors,
