@@ -6,6 +6,50 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 6, 2026-05-24)
+
+- `inter` module — the spec §17.2–§17.4 inter-block reconstruction
+  stage. `reconstruct_inter_block` / `inter_block_to_pixels` apply
+  §17's shared recombination formula
+  `OutputValue = PredictionValue + PredictionError` followed by an
+  inclusive clip to `0..=255`. One function for all three inter cases:
+  §17.2 (zero MV), §17.3 (full-pixel MV) and §17.4 (fractional MV)
+  share byte-identical recombination pseudocode and differ only in how
+  the 8x8 prediction block is *sourced*. No `+128` intra level shift
+  applies — the prediction already carries the DC.
+- `fetch_prediction_block` — the §17.2/§17.3 integer-offset prediction
+  fetch: a straight copy of an 8x8 region from a reference
+  reconstruction buffer at an integer `(dx, dy)` offset (`(0, 0)` for
+  §17.2's zero vector, the integer whole-sample MV for §17.3). §17.4
+  sources its prediction from the round-5 §11.4 filters
+  (`bilinear_block` / `bicubic_block`) instead.
+- `MvShift::{Luma, Chroma}` plus `whole_sample_aligned`, `luma_frac`
+  and `chroma_frac` — the §11.4 motion-vector decomposition:
+  `WholeSampleAligned = MvComponent >> MvShift` (arithmetic shift, so
+  negative MVs floor toward `-inf`) and the low-`MvShift`-bit
+  fractional phase. `MvShift` is 2 for luma (¼-pixel precision, 4
+  phases) and 3 for chroma (⅛-pixel precision, 8 phases) per §11.4's
+  `// Mvshift is 2 for luma blocks and 3 for chroma blocks` comment.
+  Phase counts mirror the `BILINEAR_LUMA_FILTERS[4]` /
+  `BILINEAR_CHROMA_FILTERS[8]` row counts. Transcribed verbatim from
+  `docs/video/vp6/vp6_format.pdf` §11.4 and §17.
+- BoolCoder-independent like §15/§16/§17.1/§11.4, so it advances past
+  round 5 without touching the contested §7.3 `Split` formula. The
+  motion vector that drives the fetch/interpolation phase is decoded
+  upstream, behind the BoolCoder.
+- 22 unit tests over the §17.2–§17.4 stage: `MvShift::bits` /
+  `phase_count` / `frac_mask` spec values, whole/fractional MV split for
+  positive luma, positive chroma, negative luma (arithmetic shift floor)
+  and exact-whole-pixel MVs; `fetch_prediction_block` for zero vector
+  (co-located copy), positive integer offset, negative integer offset
+  and round-trip through `whole_sample_aligned`; `reconstruct_inter_block`
+  for zero residual (prediction passes through), positive residual,
+  negative residual, overflow clip to 255, underflow clip to 0,
+  inclusive-boundary behaviour at 0/255, per-sample independence,
+  wrapper-vs-dual-buffer parity, the **no-intra-level-shift** invariant
+  (a pinned distinction against §17.1); plus end-to-end §17.2 (fetch +
+  recombine) and §17.4 (§11.4 bilinear → recombine) integration tests.
+
 ### Added (clean-room round 5, 2026-05-24)
 
 - `interp` module — the spec §11.4 fractional-pixel motion-compensation

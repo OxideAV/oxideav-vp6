@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 5 (2026-05-24).** The orphan-rebuild
+**Clean-room rebuild — round 6 (2026-05-24).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -90,7 +90,41 @@ implementation is consulted at any stage.
   the selector are fully specified and landed; the size-threshold
   selector is deferred until the constant is supplied.
 
-### What rounds 1–5 do NOT land
+### What round 6 lands
+
+- `reconstruct_inter_block` / `inter_block_to_pixels` — the spec
+  §17.2–§17.4 inter-block reconstruction step. For each of the 64
+  samples: `OutputValue = PredictionValue + PredictionError`, then
+  inclusive clip to `0..=255`. One function for all three inter cases:
+  §17.2 (zero motion vector), §17.3 (full-pixel-aligned motion vector)
+  and §17.4 (fractional-pixel motion vector) share the byte-identical
+  recombination pseudocode — they differ only in how the 8x8 prediction
+  block is *sourced*. No `+128` intra level shift here: the prediction
+  already carries the DC.
+- `fetch_prediction_block` — the §17.2/§17.3 integer-offset prediction
+  fetch. A straight copy of an 8x8 region from a reference reconstruction
+  buffer at an integer `(dx, dy)` offset: `(0, 0)` for the §17.2 zero
+  vector (co-located), the integer whole-sample offset for §17.3 (full
+  pixel). §17.4 instead sources its prediction from the round-5 §11.4
+  filters (`bilinear_block` / `bicubic_block`).
+- `MvShift::{Luma, Chroma}` plus `whole_sample_aligned`, `luma_frac` and
+  `chroma_frac` — the §11.4 motion-vector decomposition:
+  `WholeSampleAligned = MvComponent >> MvShift` (arithmetic shift floors
+  negatives) plus the low-`MvShift`-bit fractional phase. `MvShift` is 2
+  for luma (¼-pixel precision, 4 phases) and 3 for chroma (⅛-pixel
+  precision, 8 phases), matching the `BILINEAR_LUMA_FILTERS[4]` /
+  `BILINEAR_CHROMA_FILTERS[8]` row counts.
+- This stage is the natural successor to §17.1 (intra) and §11.4
+  (interpolation): it composes them into the full inter recombination.
+  Like the §15 dequant, §16 IDCT, §17.1 intra and §11.4 interpolation
+  layers it reads **no BoolCoder bits** — given an already-decoded MV, a
+  reference buffer and the IDCT residual, every step is pure integer
+  pixel arithmetic — so it advances the decoder past round 5 without
+  touching the contested §7.3 `Split` formula. The motion vector that
+  drives the fetch/interpolation phase is decoded upstream, behind the
+  BoolCoder.
+
+### What rounds 1–6 do NOT land
 
 - Anything downstream of the BoolCoder switch in the frame header
   (`VFragments`, `HFragments`, scaling, filter selectors,

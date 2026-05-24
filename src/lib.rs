@@ -144,6 +144,30 @@
 //!   phase and source is BoolCoder-gated upstream; the filter-selection
 //!   *size* threshold is also deferred on an undefined `MAX_MV_EXTENT`
 //!   constant (see the [`interp`] module DOCS-GAP note).
+//!
+//! ## Round 6 surface
+//!
+//! * [`inter`] — the spec §17.2–§17.4 inter-block reconstruction stage.
+//!   [`reconstruct_inter_block`] applies §17's shared recombination
+//!   (`OutputValue = PredictionValue + PredictionError`, inclusive clip
+//!   to `0..=255`) — one function for all three inter cases because the
+//!   spec's recombination pseudocode is byte-identical across §17.2
+//!   (zero vector), §17.3 (full-pixel vector) and §17.4 (fractional
+//!   vector); the cases differ only in how the prediction block is
+//!   sourced. [`fetch_prediction_block`] is the §17.2/§17.3 integer copy
+//!   from a reference reconstruction buffer (zero MV = co-located,
+//!   full-pixel MV = integer offset); §17.4 sources its prediction from
+//!   the round-5 [`interp`] filters instead. [`MvShift`],
+//!   [`whole_sample_aligned`], [`luma_frac`] and [`chroma_frac`]
+//!   implement the §11.4 motion-vector decomposition (`MvX >> MvShift`
+//!   whole part + low-bit fractional phase; `MvShift` is 2 for luma /
+//!   3 for chroma). Like §15/§16/§17.1/§11.4 this stage reads **no
+//!   BoolCoder bits** — given an already-decoded MV, a reference buffer
+//!   and the IDCT residual, every step is pure integer pixel
+//!   arithmetic — so it advances the decoder without touching the
+//!   contested §7.3 `Split` formula. Note the inter path applies **no**
+//!   `+128` intra level shift (§17.1 only): the prediction already
+//!   carries the DC.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -153,12 +177,17 @@ use oxideav_core::RuntimeContext;
 pub mod dequant;
 pub mod frame_header;
 pub mod idct;
+pub mod inter;
 pub mod interp;
 pub mod reconstruct;
 
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
 pub use idct::idct_block;
+pub use inter::{
+    chroma_frac, fetch_prediction_block, inter_block_to_pixels, luma_frac, reconstruct_inter_block,
+    whole_sample_aligned, MvShift,
+};
 pub use interp::{
     bicubic_block, bicubic_point, bilinear_block, bilinear_point, var_16_point, BICUBIC_FILTER_SET,
     BICUBIC_VP61_INDEX, BILINEAR_CHROMA_FILTERS, BILINEAR_LUMA_FILTERS,
