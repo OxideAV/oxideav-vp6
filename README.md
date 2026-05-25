@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 7 (2026-05-25).** The orphan-rebuild
+**Clean-room rebuild — round 9 (2026-05-25).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -207,7 +207,59 @@ implementation is consulted at any stage.
   an already-reconstructed frame buffer — so it advances the decoder
   past round 7 without touching the contested §7.3 `Split` formula.
 
-### What rounds 1–8 do NOT land
+### What round 9 lands
+
+- `scan` — the spec §12.1 default zig-zag scan order. Surfaces:
+  - `DEFAULT_SCAN_ORDER[64]` — the verbatim
+    `default_dequant_table[64]` from §12.1 / Figure 14: at zig-zag
+    position `i` the corresponding raster position is
+    `DEFAULT_SCAN_ORDER[i]`. The decoder uses this to convert
+    entropy-stage coefficients (which arrive in zig-zag order) back
+    to raster order before §15 inverse quantization and §16 inverse
+    DCT.
+  - `DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG[64]` — the const-time
+    inverse permutation, for the encoder side.
+  - `zigzag_to_raster_block` / `raster_to_zigzag_block` — block
+    applicators that drive the permutation across all 64 coefficients
+    of an 8×8 block.
+- Spec invariants enforced by the test suite: `DEFAULT_SCAN_ORDER[0]
+  == 0` (DC always first), `DEFAULT_SCAN_ORDER[63] == 63`
+  (highest-frequency last), table is a permutation of `0..64`, and
+  the inverse table is its true inverse.
+- `dc_pred` — the spec §14 DC coefficient prediction stage. Surfaces:
+  - `DcPredictionContext` — per-plane state holding the
+    per-reference-bucket "last decoded DC value" the spec mandates.
+    `DcPredictionContext::new` returns a freshly-zeroed seed and
+    `reset_at_frame_start` re-applies it per §14's "At the
+    beginning of each frame this last decoded DC value is set to
+    zero for each prediction frame type."
+  - `predict` / `predict_and_record` — compute the §14 predictor for
+    one block (the four-row predictor table: neither neighbour →
+    per-bucket last-DC seed; only left → L; only above → A; both →
+    `(L + A + Sign(L + A)) / 2`), and (for `predict_and_record`)
+    record the post-`DcDelta` reconstructed DC as the new last-DC
+    seed.
+  - `ReferenceBucket::{Intra, InterLast, InterGolden}` — the three
+    "prediction frame types" §14 distinguishes; cross-bucket
+    neighbours are disqualified per the spec's same-reference-frame
+    and intra-vs-inter rules.
+  - `average_both_neighbours` / `dc_sign` — direct helpers for
+    callers wanting to drive the §14 §3-`Sign` formula manually.
+- Like §15/§16/§17.1/§11.4/§17.2–§17.4/§11.3/§11.5 these stages read
+  **no BoolCoder bits** — the scan permutation is constant and the
+  DC predictor is pure integer bookkeeping over already-decoded
+  neighbour DC values and reference tags — so they advance the
+  decoder past round 8 without touching the contested §7.3 `Split`
+  formula. Together with rounds 2–6 they make the per-block
+  reconstruction pipeline §14→§15→§16→§17.1 complete given a
+  caller-supplied `DcDelta` (the §13.2 token that supplies the delta
+  is itself BoolCoder-gated and remains deferred until the §7.3
+  DOCS-GAP is resolved).
+- The §12.2 per-frame *custom* scan-order updates and their
+  `ScanOrderUpdateFlag` / `CoeffBandUpdateFlag` / `NewCoeffBand`
+  fields (Table 17) are BoolCoder-coded and remain deferred.
+
+### What rounds 1–9 do NOT land
 
 - Anything downstream of the BoolCoder switch in the frame header
   (`VFragments`, `HFragments`, scaling, filter selectors,

@@ -6,6 +6,74 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 9, 2026-05-25)
+
+- `scan` module — the spec §12.1 default zig-zag scan order. Reads no
+  BoolCoder bits and is the natural predecessor to §15 inverse
+  quantization and §16 inverse DCT in the per-block decode pipeline.
+  Surfaces:
+  - `DEFAULT_SCAN_ORDER[64]` — the verbatim `default_dequant_table[64]`
+    from §12.1 / Figure 14 mapping zig-zag positions back to raster
+    positions for the 8×8 block.
+  - `DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG[64]` — the const-evaluated
+    inverse permutation for the encoder side.
+  - `zigzag_to_raster_block` / `raster_to_zigzag_block` — block
+    applicators that drive the permutation across all 64 coefficients.
+- `dc_pred` module — the spec §14 DC coefficient prediction stage.
+  Reads no BoolCoder bits; the DC delta the predictor is added to is
+  what §13.2 BoolCoder-decodes, but the predictor itself is pure
+  integer bookkeeping over already-decoded neighbour DC values.
+  Surfaces:
+  - `DcPredictionContext` — per-plane state holding the
+    per-reference-bucket "last decoded DC value". `new` /
+    `reset_at_frame_start` apply the spec's per-frame zero seed ("At
+    the beginning of each frame this last decoded DC value is set to
+    zero for each prediction frame type").
+  - `predict` / `predict_and_record` — the §14 predictor for one
+    block, implementing the four-row predictor table (`L`, `A`,
+    `(L + A + Sign(L+A)) / 2`, last-DC seed) plus the
+    same-reference-frame and intra-vs-inter neighbour-disqualification
+    rules.
+  - `ReferenceBucket::{Intra, InterLast, InterGolden}` — the three
+    distinct "prediction frame types" §14 distinguishes (the §4
+    "intra / previous-frame inter / golden-frame inter" trichotomy
+    collapsed into one enum since both rules — same-reference and
+    intra-vs-inter — partition the same bucket space).
+  - `average_both_neighbours` / `dc_sign` — direct helpers exposing
+    the §14 §3-`Sign` averaging formula and §3 `Sign()` so callers
+    can drive the predictor manually.
+- Transcribed verbatim from `docs/video/vp6/vp6_format.pdf` §12.1
+  (default zig-zag) and §14 (DC prediction), On2 Technologies,
+  document version 1.02, August 2006. Like
+  §15/§16/§17.1/§11.4/§17.2–§17.4/§11.3/§11.5, both stages advance
+  the decoder past round 8 without touching the contested §7.3
+  `Split` formula.
+- 46 unit tests over the §12.1 + §14 stages:
+  - **scan (15 tests):** table length; DC-first invariant; high-freq
+    last invariant; permutation completeness (every raster position
+    hit exactly once); 11 spot-value checks against the spec listing;
+    Figure 14's first-three-diagonals zig-zag traversal pattern; the
+    inverse table's length, mutual-inverse property, and
+    permutation-completeness; both block applicators' identity-under-
+    seeded-input semantics; raster→zig-zag→raster and
+    zig-zag→raster→zig-zag round-trips on non-trivial inputs; DC-only
+    block lands at raster 0; highest-frequency-only block lands at
+    raster 63.
+  - **dc_pred (31 tests):** §3 `Sign()` three-branch + extreme-value
+    behaviour; the two-neighbour averaging formula across all four
+    sign permutations of `(L, A)` plus zero-sum and mixed-sign cases;
+    exhaustive 41×41-grid match against the formula computed
+    independently; sign-symmetry of the predictor; context
+    zero-seeding at `new()`/`default()`; the §14 four predictor rows
+    (neither / left-only / above-only / both) for positive and
+    negative neighbour DC; the same-reference-frame rule for both
+    left- and above-mismatched neighbours and both-mismatched; the
+    intra-vs-inter and inter-last-vs-inter-golden bucket isolation
+    rules; the last-DC seed update / read / per-frame reset; a
+    cross-block worked example over a 2×3 intra grid exercising all
+    four predictor scenarios in one test; defensive extreme-input
+    panic-freedom.
+
 ### Added (clean-room round 8, 2026-05-25)
 
 - `umv` module — the spec §11.5 Unrestricted Motion Vector (UMV)

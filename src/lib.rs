@@ -221,12 +221,51 @@
 //!   already-reconstructed frame buffer — so it advances the decoder
 //!   past round 7 without touching the contested §7.3 `Split`
 //!   formula.
+//!
+//! ## Round 9 surface
+//!
+//! * [`scan`] — the spec §12.1 default zig-zag scan order. Surfaces
+//!   the 64-entry [`scan::DEFAULT_SCAN_ORDER`] table (Figure 14 /
+//!   `default_dequant_table[64]`) that the decoder uses to convert
+//!   tokens from zig-zag order back to raster order before §15
+//!   inverse quantization and §16 inverse DCT, the inverse
+//!   [`scan::DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG`] permutation for the
+//!   encoder side, and the [`scan::zigzag_to_raster_block`] /
+//!   [`scan::raster_to_zigzag_block`] block applicators. The §12.2
+//!   per-frame *custom* scan-order updates are
+//!   `ScanOrderUpdateFlag`-gated (BoolCoder-coded, see Table 17) and
+//!   stay deferred until the §7.3 DOCS-GAP is resolved.
+//! * [`dc_pred`] — the spec §14 DC coefficient prediction stage. A
+//!   [`dc_pred::DcPredictionContext`] per plane holds the per-
+//!   reference-frame "last decoded DC value" that §14 mandates, with
+//!   `DcPredictionContext::new` / `reset_at_frame_start` applying the
+//!   spec's per-frame zero seed ("At the beginning of each frame this
+//!   last decoded DC value is set to zero for each prediction frame
+//!   type"). [`dc_pred::DcPredictionContext::predict`] /
+//!   [`dc_pred::DcPredictionContext::predict_and_record`] compute the
+//!   §14 predictor for one block: the predictor table's four rows
+//!   (neither neighbour → per-bucket last-DC seed; only left → L;
+//!   only above → A; both → `(L + A + Sign(L+A)) / 2` truncated
+//!   toward zero), with the same-reference-frame and intra-vs-inter
+//!   neighbour-disqualification rules implemented inline.
+//!   [`dc_pred::ReferenceBucket`] enumerates the three prediction
+//!   frame types (Intra, InterLast, InterGolden) the spec
+//!   distinguishes. Together with the §12.1 scan permutation this
+//!   leaves the per-block DC reconstruction pipeline §15→§16→§17.1
+//!   already-complete from prior rounds without depending on the §7.3
+//!   `Split` formula: the `DcDelta` token whose value is added on top
+//!   of the predictor is what the BoolCoder-gated §13.2 stage
+//!   produces, but the predictor itself is BoolCoder-independent. Like
+//!   §15/§16/§17.1/§11.4/§17.2–§17.4/§11.3/§11.5 this stage advances
+//!   the decoder past round 8 without touching the contested §7.3
+//!   `Split` formula.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
 
 use oxideav_core::RuntimeContext;
 
+pub mod dc_pred;
 pub mod dequant;
 pub mod frame_header;
 pub mod idct;
@@ -234,8 +273,12 @@ pub mod inter;
 pub mod interp;
 pub mod loopfilter;
 pub mod reconstruct;
+pub mod scan;
 pub mod umv;
 
+pub use dc_pred::{
+    average_both_neighbours, sign as dc_sign, DcPredictionContext, Neighbour, ReferenceBucket,
+};
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
 pub use idct::idct_block;
@@ -252,6 +295,10 @@ pub use loopfilter::{
     prediction_loop_filter_function, PREDICTION_LOOP_FILTER_LIMIT_VALUES,
 };
 pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};
+pub use scan::{
+    raster_to_zigzag_block, zigzag_to_raster_block, DEFAULT_SCAN_ORDER,
+    DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG,
+};
 pub use umv::{
     build_extended_buffer, extend_border, extended_height, extended_stride, origin_offset,
     UMV_BORDER_SIZE,
