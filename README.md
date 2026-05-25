@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 11 (2026-05-25).** The orphan-rebuild
+**Clean-room rebuild — round 12 (2026-05-26).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -347,7 +347,52 @@ implementation is consulted at any stage.
   it advances the decoder past round 10 without touching the contested
   §7.3 `Split` formula.
 
-### What rounds 1–11 do NOT land
+### What round 12 lands
+
+- `huffman` — the spec §7.2 Huffman tree construction and traversal
+  primitives. VP6 supports **two** entropy schemes (§7): the
+  BoolCoder (§7.3) used in partition 1 for mode/MV decisions, and
+  the Huffman coder (§7.2) used as an alternate DCT-token scheme
+  when the frame header's `UseHuffman` flag is set. The Huffman
+  coder reads one whole raw bit per tree branch (`R(1)`; §3
+  nomenclature) rather than a sub-bit `B(prob)` BoolCoder bit, so
+  this stage is **independent of the §7.3 `Split` formula DOCS-GAP**.
+- Surfaces:
+  - `HuffNode` — the spec's `HUFF_NODE { Symbol, Prob, Left, Right }`
+    struct with the `-1` sentinels for internal-vs-leaf (page 13);
+    `INTERNAL_SYMBOL` (`-1`) and `NO_CHILD` (`-1`) constants
+    document the spec's marker convention.
+  - `create_huffman_tree` — the verbatim §7.2.1 `VP6_CreateHuffmanTree`
+    builder. `N-1` bottom-up merge rounds over a stable-sorted leaf
+    list; the returned `Vec<HuffNode>` has length `2N-1` with the
+    root at index `2N-2`, matching the spec's *"Huffman tree root
+    node is at position 2\*N-2 in SortList"* terminating comment.
+    Rejects zero probabilities (§7: *"the value 0 is explicitly
+    forbidden, so the valid range is 1 ≤ Node Probability ≤ 255"*)
+    and `N < 2` inputs.
+  - `decode_symbol` — the verbatim §7.2 `VP6_HuffmanDecodeSymbol`
+    walk, parameterised over an external `FnMut() -> u8` raw-bit
+    oracle so the actual byte-stream `R(1)` reader can land
+    independently. Per §7 *"0 indicates left, 1 indicates right"*.
+  - `tree_depth` / `codeword_for` — convenience walkers used in the
+    test suite to verify shape invariants (skewed inputs give
+    dominant symbols shorter codewords; balanced inputs give
+    uniform-depth trees) and to drive the round-trip test.
+- Stability invariant: §7.2.1 twice asks for "*ascending probability
+  order maintaining relative order of nodes having equal probability*"
+  — a *stable* sort, which is what `slice::sort_by_key` provides.
+  Equal-probability inputs preserve their original relative ordering
+  in the leaf zone, so encoder and decoder agree on the resulting
+  tree shape from the probability vector alone.
+- Like §15/§16/§17/§11/§12.1/§14/§10/§13 this stage reads **no
+  BoolCoder bits** — every step is pure integer arithmetic over the
+  supplied probability vector — so it advances the decoder past
+  round 11 without touching the contested §7.3 `Split` formula.
+- The §13.3.3.2 AC zero-run probability conversion (a separate
+  transform that feeds another Huffman tree) and the actual `R(1)`
+  byte-stream reader are deferred for later rounds.
+
+### What rounds 1–12 do NOT land
 
 - Anything downstream of the BoolCoder switch in the frame header
   (`VFragments`, `HFragments`, scaling, filter selectors,

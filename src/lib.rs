@@ -248,6 +248,33 @@
 //!   §15/§16/§17.1/§11.4/§17.2–§17.4/§11.3/§11.5/§12.1/§14 this
 //!   module reads no BoolCoder bits.
 //!
+//! ## Round 12 surface
+//!
+//! * [`huffman`] — the spec §7.2 Huffman tree construction and
+//!   traversal primitives (`HUFF_NODE`, `VP6_CreateHuffmanTree`,
+//!   `VP6_HuffmanDecodeSymbol`). VP6 supports two entropy schemes (§7):
+//!   the BoolCoder (§7.3) used in partition 1 for mode/MV decisions,
+//!   and the Huffman coder (§7.2) used as an alternate DCT-token
+//!   scheme when `UseHuffman` is set. The Huffman coder reads one
+//!   whole raw bit per tree branch (`R(1)`; §3 nomenclature) rather
+//!   than a sub-bit `B(prob)` BoolCoder bit, so it is **independent
+//!   of the §7.3 `Split` formula DOCS-GAP**. Surfaces: [`huffman::HuffNode`]
+//!   (the spec's `HUFF_NODE { Symbol, Prob, Left, Right }` with `-1`
+//!   sentinels for internal-vs-leaf); [`huffman::create_huffman_tree`]
+//!   (the verbatim §7.2.1 builder — `N-1` bottom-up merge rounds over
+//!   a stable-sorted leaf list, root at index `2N-2`); [`huffman::decode_symbol`]
+//!   (the verbatim §7.2 walk, parameterised over an external
+//!   `FnMut() -> u8` raw-bit oracle so the byte-stream `R(1)` reader
+//!   can land independently); plus [`huffman::tree_depth`] /
+//!   [`huffman::codeword_for`] convenience helpers for inspecting
+//!   the constructed tree. Like §15/§16/§17/§11/§12.1/§14/§10/§13
+//!   this module reads **no BoolCoder bits** — every operation is
+//!   pure integer arithmetic over the supplied probability vector —
+//!   so it advances the decoder past round 11 without touching the
+//!   contested §7.3 `Split` formula. The §13.3.3.2 AC zero-run
+//!   probability conversion and the actual `R(1)` byte-stream reader
+//!   stay deferred for later rounds.
+//!
 //! ## Round 9 surface
 //!
 //! * [`scan`] — the spec §12.1 default zig-zag scan order. Surfaces
@@ -294,6 +321,7 @@ use oxideav_core::RuntimeContext;
 pub mod dc_pred;
 pub mod dequant;
 pub mod frame_header;
+pub mod huffman;
 pub mod idct;
 pub mod inter;
 pub mod interp;
@@ -309,6 +337,10 @@ pub use dc_pred::{
 };
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
+pub use huffman::{
+    codeword_for, create_huffman_tree, decode_symbol, tree_depth, HuffNode, HuffmanError,
+    INTERNAL_SYMBOL, NO_CHILD,
+};
 pub use idct::idct_block;
 pub use inter::{
     chroma_frac, fetch_prediction_block, inter_block_to_pixels, luma_frac, reconstruct_inter_block,

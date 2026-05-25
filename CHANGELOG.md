@@ -6,6 +6,56 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 12, 2026-05-26)
+
+- `huffman` module — the spec §7.2 Huffman tree construction and
+  traversal primitives (`HUFF_NODE`, `VP6_CreateHuffmanTree`,
+  `VP6_HuffmanDecodeSymbol`). VP6 supports two entropy schemes (§7):
+  the BoolCoder (§7.3) used in partition 1 for mode/MV decisions
+  and the Huffman coder (§7.2) used as an alternate DCT-token
+  scheme when the frame header's `UseHuffman` flag is set. The
+  Huffman coder reads one whole raw bit per tree branch (`R(1)`;
+  §3 nomenclature) rather than a sub-bit `B(prob)` BoolCoder bit,
+  so this stage is **independent of the §7.3 `Split` formula
+  DOCS-GAP**. Surfaces:
+  - `HuffNode` — the spec's `HUFF_NODE { Symbol, Prob, Left, Right }`
+    struct (page 13) with `-1` sentinels for the internal-node and
+    no-child markers; the `INTERNAL_SYMBOL` / `NO_CHILD` constants
+    name the spec's convention.
+  - `create_huffman_tree` — the verbatim §7.2.1 builder. `N-1`
+    bottom-up merge rounds over a stable-sorted leaf list (the
+    `slice::sort_by_key` invariant matches §7.2.1's repeated
+    "*maintaining relative order of nodes having equal
+    probability*" requirement). Returns a `Vec<HuffNode>` of length
+    exactly `2N-1` with the root at index `2N-2`. Rejects zero
+    probabilities (§7 forbids `0`) and `N < 2` inputs via the new
+    `HuffmanError` enum.
+  - `decode_symbol` — the verbatim §7.2 `VP6_HuffmanDecodeSymbol`
+    walk. Parameterised over an external `FnMut() -> u8` raw-bit
+    oracle so the byte-stream `R(1)` reader can land independently;
+    per §7 *"0 indicates left, 1 indicates right"*.
+  - `tree_depth` / `codeword_for` — pure-walker helpers that recover
+    a symbol's codeword length and bit pattern, used by the
+    round-trip and shape-invariant tests.
+- Tests (15): empty / mismatched-length / zero-prob input
+  validation; the two-symbol degenerate tree's exact geometry
+  (`SortList[0..2]` = leaves, `SortList[2]` = root with both
+  children); the `2N-1` length / `N-1` internal-node-count /
+  leaf-symbol-set invariants across `N = 2..=12`; the spec's
+  stable-sort invariant under equal probabilities; round-trip
+  decode of every leaf in the §13 keyframe-baseline Huffman tree
+  (driven by `dct_token_bool_tree_to_huff_probs` on all-128 node
+  probabilities); plus shape checks (balanced inputs give
+  uniform-depth trees; skewed inputs give dominant symbols shorter
+  codewords than rare symbols).
+- Like §15/§16/§17/§11/§12.1/§14/§10/§13 this stage reads no
+  BoolCoder bits — every operation is pure integer arithmetic over
+  the supplied probability vector — so it advances the decoder
+  past round 11 without touching the contested §7.3 `Split`
+  formula. The §13.3.3.2 AC zero-run probability conversion and
+  the actual `R(1)` byte-stream reader stay deferred for later
+  rounds.
+
 ### Added (clean-room round 11, 2026-05-25)
 
 - `tokens` module — the spec §13 DCT-coefficient token static
