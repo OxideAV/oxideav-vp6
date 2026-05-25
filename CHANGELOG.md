@@ -6,6 +6,52 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 11, 2026-05-25)
+
+- `tokens` module — the spec §13 DCT-coefficient token static
+  surface (the BoolCoder-independent half of coefficient decoding).
+  Reads no BoolCoder bits; the §13 `VP6_DecodeToken` traversal and
+  per-frame probability-update bitstream that consume the surface
+  stay deferred behind the §7.3 `Split` DOCS-GAP. Surfaces:
+  - `DctToken` — the twelve Table 18 tokens (`ZERO_TOKEN`,
+    `ONE_TOKEN`..`FOUR_TOKEN`, `DCT_VAL_CATEGORY1`..`6`,
+    `DCT_EOB_TOKEN`) as a `#[repr(u8)]` enum on the canonical
+    0..=11 index, with per-token `min_value` / `max_value` /
+    `extra_bits` (Table 18 "# of extrabits, incl. sign") and the
+    verbatim `extra_bit_probs` "Arithmetic Encoding the Extra
+    Bits" column.
+  - `TreeNode` — the eleven Table 20 coding-tree node names on the
+    canonical 0..=10 index (the index into a node probability
+    vector consulted by the Figure 15 traversal).
+  - `baseline_dc_probs` / `baseline_ac_probs` — the all-128
+    keyframe initialisers for `DcProbs[2][11]` and
+    `AcProbs[2][3][6][11]` (§13.2 / §13.3).
+  - `VP6_DC_UPDATE_PROBS[2][11]` — the verbatim `VP6_DcUpdateProbs`
+    per-node update-flag probability bank (§13.2).
+  - `AC_UPDATE_PROBS[3][2][6][11]` — the verbatim `AcUpdateProbs`
+    per-node update-flag probability bank (§13.3).
+  - `DC_NODE_EQS[5][3][2]` — the verbatim `DcNodeEqs` slope/constant
+    linear-equation table (Table 27), including the EOB dummy row
+    that forces the EOB node to 1.
+  - `dc_probs_to_node_contexts` — the pure-integer §13.2 conversion
+    expanding a `DcProbs[2][11]` bank into the
+    `DcNodeContexts[2][3][11]` per-context trees the §13.2.1
+    arithmetic DC decoder consults (linear equation on nodes
+    0..5 clipped to 1..=255, pass-through on nodes 5..11).
+  - `dct_token_bool_tree_to_huff_probs` — the verbatim §13.1
+    `DCTTokenBoolTreeToHuffProbs` transform converting an 11-entry
+    node-probability vector into the 12-entry Huffman probability
+    set the §13.2.2 / §13.3.2 Huffman decoders use.
+- Re-exports of all of the above plus the supporting count
+  constants (`NUM_DCT_TOKENS`, `NUM_TREE_NODES`, `NUM_PLANES`,
+  `NUM_DC_CONTEXTS`, `NUM_AC_PREC_CONTEXTS`, `NUM_AC_BANDS`,
+  `NUM_DC_NODE_EQS`) from the crate root.
+- 25 unit tests pinning the Table 18/19/20/27 values, the all-128
+  baselines, both update-flag banks, the DC node-context conversion
+  (dummy-EOB-to-1, node 5..11 pass-through, hand-computed baseline
+  expansion, 1..=255 clipping), and the §13.1 Huffman-prob
+  transform (hand-computed against the all-128 listing).
+
 ### Added (clean-room round 10, 2026-05-25)
 
 - `modes` module — the spec §10 macroblock coding-mode static

@@ -1,0 +1,1082 @@
+//! VP6 DCT-coefficient token static surface (spec §13).
+//!
+//! VP6 codes quantized DCT coefficients with a set of twelve **tokens**
+//! (spec §13 Table 18) decoded from a fixed binary tree (Figure 15).
+//! The arithmetic decoder walks the tree node-by-node, reading one
+//! `B(prob)` BoolCoder bit at each internal node; the Huffman path
+//! converts the same node probabilities into a 12-entry Huffman
+//! probability set. Both paths share the per-node baseline probability
+//! banks (`DcProbs` / `AcProbs`), the per-frame update-flag probability
+//! tables (`VP6_DcUpdateProbs` / `AcUpdateProbs`), and — for DC — a
+//! pure-integer `DcProbs → DcNodeContexts` conversion driven by the
+//! `DcNodeEqs` linear-equation table.
+//!
+//! This module surfaces the **BoolCoder-independent** half of §13:
+//!
+//! * [`DctToken`] — the twelve Table 18 tokens, the spec's canonical
+//!   `0..=11` indexing, and each token's `(min, extra_bits)` extrabit
+//!   geometry plus the per-extrabit arithmetic-coding probability
+//!   vector ([`DctToken::extra_bit_probs`]).
+//! * [`TreeNode`] — the eleven Table 20 internal-node names with the
+//!   spec's canonical `0..=10` indexing (the index into a node
+//!   probability vector).
+//! * [`baseline_dc_probs`] / [`baseline_ac_probs`] — the all-128
+//!   keyframe initialisers for `DcProbs[2][11]` and
+//!   `AcProbs[2][3][6][11]` (§13.2 / §13.3: "At each key frame every
+//!   probability value … is set to 128").
+//! * [`VP6_DC_UPDATE_PROBS`] — the verbatim `VP6_DcUpdateProbs[2][11]`
+//!   per-node update-flag probability bank (§13.2).
+//! * [`AC_UPDATE_PROBS`] — the verbatim `AcUpdateProbs[3][2][6][11]`
+//!   per-node update-flag probability bank (§13.3).
+//! * [`DC_NODE_EQS`] — the verbatim `DcNodeEqs[5][3][2]` slope/constant
+//!   linear-equation table (§13.2 Table 27).
+//! * [`dc_probs_to_node_contexts`] — the pure-integer §13.2 conversion
+//!   that expands a `DcProbs[2][11]` bank into the
+//!   `DcNodeContexts[2][3][11]` array the §13.2.1 arithmetic DC decoder
+//!   consults (one tree per left/above zero-DC context).
+//! * [`dct_token_bool_tree_to_huff_probs`] — the verbatim §13.1
+//!   `DCTTokenBoolTreeToHuffProbs` transform that converts an 11-entry
+//!   node-probability vector into the 12-entry Huffman probability set
+//!   used by the §13.2.2 / §13.3.2 Huffman token decoders.
+//!
+//! ## What this module does NOT land
+//!
+//! The §13 *token traversal* (`VP6_DecodeToken`) reads `B(prob)`
+//! BoolCoder bits at each tree node, plus per-token extrabits via
+//! `B(...)`, and the AC zero-run decode of §13.3.3 reads further
+//! BoolCoder bits. Every one of those reads depends on the §7.3
+//! `Split` formula, which is blocked by a DOCS-GAP (see the crate-root
+//! docs `## DOCS-GAP` section). The per-frame probability *update*
+//! bitstream (§13.2 Table 22–24 / §13.3 Table 31–35) is likewise
+//! BoolCoder-gated and stays deferred.
+//!
+//! What we *do* land is everything that does not call the BoolCoder:
+//! the enum surfaces, the static probability banks, the slope/constant
+//! `DcNodeEqs` table, and the two pure-integer conversions
+//! (`DcProbs → DcNodeContexts` and the node-tree → Huffman-prob
+//! transform). With these in place, the only piece of §13 still pending
+//! the §7.3 fix is the BoolCoder reads of the traversal itself.
+//!
+//! ## Provenance
+//!
+//! Sourced exclusively from `docs/video/vp6/vp6_format.pdf` §13 (On2
+//! Technologies, document version 1.02, August 2006). No third-party
+//! VP6 implementation has been consulted.
+
+use core::fmt;
+
+/// Number of DCT coefficient tokens (§13 Table 18).
+///
+/// Twelve: `ZERO_TOKEN`, `ONE_TOKEN`, `TWO_TOKEN`, `THREE_TOKEN`,
+/// `FOUR_TOKEN`, `DCT_VAL_CATEGORY1`..`6`, and `DCT_EOB_TOKEN`. The
+/// spec's `MAX_ENTROPY_TOKENS` is this value.
+pub const NUM_DCT_TOKENS: usize = 12;
+
+/// Number of internal probability nodes per coding-tree vector
+/// (§13 Table 20: "a single dimensional vector with 11 entries").
+///
+/// The fourth dimension of `AcProbs`, the second of `DcProbs`, the
+/// third of `DcNodeContexts`, and the input length of both §13
+/// conversions all equal this.
+pub const NUM_TREE_NODES: usize = 11;
+
+/// Number of colour planes the §13 probability banks distinguish
+/// (Table 21 / Table 28): index 0 = Y, index 1 = U or V.
+pub const NUM_PLANES: usize = 2;
+
+/// Number of DC node contexts (§13.2 Table 26): the left/above
+/// predicted-DC-zero situation — both zero (0), exactly one non-zero
+/// (1), both non-zero (2).
+pub const NUM_DC_CONTEXTS: usize = 3;
+
+/// Number of AC "preceding coefficient" contexts (§13.3 Table 29):
+/// preceding decoded coefficient was 0 (0), 1 (1), or > 1 (2).
+pub const NUM_AC_PREC_CONTEXTS: usize = 3;
+
+/// Number of AC coefficient bands (§13.3 Table 30): coefficient 1 (0),
+/// 2–4 (1), 5–10 (2), 11–21 (3), 22–36 (4), 37–63 (5).
+pub const NUM_AC_BANDS: usize = 6;
+
+/// Number of linear-equation rows in `DcNodeEqs` (§13.2): the first
+/// five tree nodes get a slope/constant equation; nodes 5–10 use the
+/// transmitted probability directly.
+pub const NUM_DC_NODE_EQS: usize = 5;
+
+/// VP6 DCT coefficient tokens (spec §13 Table 18).
+///
+/// The discriminant matches the canonical `0..=11` index the spec uses
+/// when indexing token arrays (e.g. as the second index of
+/// `DcHuffProbs[2][12]`, or as the `token` value the Figure 15
+/// traversal resolves). The declaration order follows Table 18's `Ind`
+/// column verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum DctToken {
+    /// `ZERO_TOKEN`. Coefficient value 0. Index 0. In AC and
+    /// Huffman-DC positions it carries a zero-run extrabit suffix
+    /// (§13 Table 19); in arithmetic DC it is a plain zero.
+    Zero = 0,
+    /// `ONE_TOKEN`. Coefficient magnitude 1; one extra bit (sign).
+    /// Index 1.
+    One = 1,
+    /// `TWO_TOKEN`. Coefficient magnitude 2; one extra bit (sign).
+    /// Index 2.
+    Two = 2,
+    /// `THREE_TOKEN`. Coefficient magnitude 3; one extra bit (sign).
+    /// Index 3.
+    Three = 3,
+    /// `FOUR_TOKEN`. Coefficient magnitude 4; one extra bit (sign).
+    /// Index 4.
+    Four = 4,
+    /// `DCT_VAL_CATEGORY1`. Magnitude 5–6; two extra bits. Index 5.
+    Category1 = 5,
+    /// `DCT_VAL_CATEGORY2`. Magnitude 7–10; three extra bits. Index 6.
+    Category2 = 6,
+    /// `DCT_VAL_CATEGORY3`. Magnitude 11–18; four extra bits. Index 7.
+    Category3 = 7,
+    /// `DCT_VAL_CATEGORY4`. Magnitude 19–34; five extra bits. Index 8.
+    Category4 = 8,
+    /// `DCT_VAL_CATEGORY5`. Magnitude 35–66; six extra bits. Index 9.
+    Category5 = 9,
+    /// `DCT_VAL_CATEGORY6`. Magnitude 67–2114; twelve extra bits.
+    /// Index 10.
+    Category6 = 10,
+    /// `DCT_EOB_TOKEN`. End-of-block marker. Index 11. Forbidden in
+    /// the DC position (§13.2).
+    EndOfBlock = 11,
+}
+
+impl DctToken {
+    /// All twelve tokens in canonical (Table 18) index order.
+    pub const ALL: [DctToken; NUM_DCT_TOKENS] = [
+        DctToken::Zero,
+        DctToken::One,
+        DctToken::Two,
+        DctToken::Three,
+        DctToken::Four,
+        DctToken::Category1,
+        DctToken::Category2,
+        DctToken::Category3,
+        DctToken::Category4,
+        DctToken::Category5,
+        DctToken::Category6,
+        DctToken::EndOfBlock,
+    ];
+
+    /// Canonical `0..=11` spec index (matches the enum discriminant).
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Inverse of [`DctToken::index`]: build a token from the spec's
+    /// `0..=11` integer. Returns `None` for out-of-range values.
+    #[inline]
+    pub const fn from_index(i: usize) -> Option<Self> {
+        match i {
+            0 => Some(Self::Zero),
+            1 => Some(Self::One),
+            2 => Some(Self::Two),
+            3 => Some(Self::Three),
+            4 => Some(Self::Four),
+            5 => Some(Self::Category1),
+            6 => Some(Self::Category2),
+            7 => Some(Self::Category3),
+            8 => Some(Self::Category4),
+            9 => Some(Self::Category5),
+            10 => Some(Self::Category6),
+            11 => Some(Self::EndOfBlock),
+            _ => None,
+        }
+    }
+
+    /// Smallest magnitude this token can encode (§13 Table 18 `Min`).
+    ///
+    /// `ZERO_TOKEN` is 0; `EOB_TOKEN` carries no value and returns 0.
+    #[inline]
+    pub const fn min_value(self) -> u16 {
+        match self {
+            Self::Zero => 0,
+            Self::One => 1,
+            Self::Two => 2,
+            Self::Three => 3,
+            Self::Four => 4,
+            Self::Category1 => 5,
+            Self::Category2 => 7,
+            Self::Category3 => 11,
+            Self::Category4 => 19,
+            Self::Category5 => 35,
+            Self::Category6 => 67,
+            Self::EndOfBlock => 0,
+        }
+    }
+
+    /// Largest magnitude this token can encode (§13 Table 18 `Max`).
+    ///
+    /// `EOB_TOKEN` carries no value and returns 0.
+    #[inline]
+    pub const fn max_value(self) -> u16 {
+        match self {
+            Self::Zero => 0,
+            Self::One => 1,
+            Self::Two => 2,
+            Self::Three => 3,
+            Self::Four => 4,
+            Self::Category1 => 6,
+            Self::Category2 => 10,
+            Self::Category3 => 18,
+            Self::Category4 => 34,
+            Self::Category5 => 66,
+            Self::Category6 => 2114,
+            Self::EndOfBlock => 0,
+        }
+    }
+
+    /// Number of extra bits (including sign) the token's value field
+    /// occupies (§13 Table 18 `#Extra Bits`).
+    ///
+    /// `ZERO_TOKEN` and `EOB_TOKEN` carry no per-token magnitude
+    /// extrabits in the §13.2.1 / §13.3.1 traversal sense (their
+    /// suffixes are the zero-run / block-run codes of §13.3.3 /
+    /// §13.4), so this returns 0 for both.
+    #[inline]
+    pub const fn extra_bits(self) -> usize {
+        match self {
+            Self::Zero => 0,
+            Self::One => 1,
+            Self::Two => 1,
+            Self::Three => 1,
+            Self::Four => 1,
+            Self::Category1 => 2,
+            Self::Category2 => 3,
+            Self::Category3 => 4,
+            Self::Category4 => 5,
+            Self::Category5 => 6,
+            Self::Category6 => 12,
+            Self::EndOfBlock => 0,
+        }
+    }
+
+    /// The per-extrabit arithmetic-coding probabilities (§13 Table 18,
+    /// "Arithmetic Encoding the Extra Bits"), verbatim.
+    ///
+    /// This is the spec's `TokenSetExtrabits[token].Probs` field, which
+    /// §13.2.1 defines as "an array made from concatenating the choices
+    /// in field 'Arithmetic Encoding the Extra Bits'". Tokens with no
+    /// value field (`ZERO_TOKEN`, `EOB_TOKEN`) return an empty slice.
+    ///
+    /// **Length note (spec discrepancy):** for every token except
+    /// `DCT_VAL_CATEGORY6` this list's length equals
+    /// [`DctToken::extra_bits`] (the "# of extrabits, incl. sign"
+    /// column), and its final entry is `B(128)` — the sign prior.
+    /// `DCT_VAL_CATEGORY6` lists **11** probabilities against an
+    /// `extra_bits` of **12**: its magnitude spans 67..=2114 (2048
+    /// values → 11 magnitude bits) plus a sign. The §13.2.1 magnitude
+    /// loop (`BitsCount = ExtraBits - 1; … Probs[BitsCount] …`) would
+    /// read `Probs[11]` for `CATEGORY6`, one past this 11-entry array,
+    /// before the separate `SignBit = b(1)`. Reconciling that off-by-
+    /// one is part of the **deferred** `VP6_DecodeToken` traversal
+    /// (BoolCoder-gated by the §7.3 DOCS-GAP); this accessor reports
+    /// the two table columns exactly as printed, leaving the traversal
+    /// to interpret them once unblocked.
+    #[inline]
+    pub const fn extra_bit_probs(self) -> &'static [u8] {
+        match self {
+            Self::Zero | Self::EndOfBlock => &[],
+            // Single sign bit, fixed prior 128.
+            Self::One | Self::Two | Self::Three | Self::Four => &[128],
+            Self::Category1 => &[159, 128],
+            Self::Category2 => &[165, 145, 128],
+            Self::Category3 => &[173, 148, 140, 128],
+            Self::Category4 => &[176, 155, 140, 135, 128],
+            Self::Category5 => &[180, 157, 141, 134, 130, 128],
+            Self::Category6 => &[254, 254, 243, 230, 196, 177, 153, 140, 133, 129, 128],
+        }
+    }
+}
+
+impl fmt::Display for DctToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Zero => "ZERO_TOKEN",
+            Self::One => "ONE_TOKEN",
+            Self::Two => "TWO_TOKEN",
+            Self::Three => "THREE_TOKEN",
+            Self::Four => "FOUR_TOKEN",
+            Self::Category1 => "DCT_VAL_CATEGORY1",
+            Self::Category2 => "DCT_VAL_CATEGORY2",
+            Self::Category3 => "DCT_VAL_CATEGORY3",
+            Self::Category4 => "DCT_VAL_CATEGORY4",
+            Self::Category5 => "DCT_VAL_CATEGORY5",
+            Self::Category6 => "DCT_VAL_CATEGORY6",
+            Self::EndOfBlock => "DCT_EOB_TOKEN",
+        };
+        f.write_str(name)
+    }
+}
+
+/// VP6 DC/AC coding-tree internal node names (spec §13 Table 20).
+///
+/// The discriminant is the index into an 11-entry node probability
+/// vector (`DcProbs[plane]`, `AcProbs[plane][prec][band]`,
+/// `DcNodeContexts[plane][ctx]`). The Figure 15 traversal reads
+/// `B(prob[node])` at each of these nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum TreeNode {
+    /// `ZERO_CONTEXT_NODE`. Root of Figure 15: 0-branch = the
+    /// coefficient is zero. Index 0.
+    Zero = 0,
+    /// `EOB_CONTEXT_NODE`. Under the zero branch: 0-branch = EOB.
+    /// Index 1. (DC forbids EOB, so the DC conversion forces this to
+    /// 1 via the `DcNodeEqs` dummy row.)
+    EndOfBlock = 1,
+    /// `ONE_CONTEXT_NODE`. Index 2.
+    One = 2,
+    /// `LOW_VAL_CONTEXT_NODE`. Index 3.
+    LowVal = 3,
+    /// `TWO_CONTEXT_NODE`. Index 4.
+    Two = 4,
+    /// `THREE_CONTEXT_NODE`. Index 5.
+    Three = 5,
+    /// `HIGH_LOW_CONTEXT_NODE`. Index 6.
+    HighLow = 6,
+    /// `CAT_ONE_CONTEXT_NODE`. Index 7.
+    CatOne = 7,
+    /// `CAT_THREEFOUR_CONTEXT_NODE`. Index 8.
+    CatThreeFour = 8,
+    /// `CAT_THREE_CONTEXT_NODE`. Index 9.
+    CatThree = 9,
+    /// `CAT_FIVE_CONTEXT_NODE`. Index 10.
+    CatFive = 10,
+}
+
+impl TreeNode {
+    /// All eleven nodes in canonical (Table 20) index order.
+    pub const ALL: [TreeNode; NUM_TREE_NODES] = [
+        TreeNode::Zero,
+        TreeNode::EndOfBlock,
+        TreeNode::One,
+        TreeNode::LowVal,
+        TreeNode::Two,
+        TreeNode::Three,
+        TreeNode::HighLow,
+        TreeNode::CatOne,
+        TreeNode::CatThreeFour,
+        TreeNode::CatThree,
+        TreeNode::CatFive,
+    ];
+
+    /// Canonical `0..=10` spec index (matches the enum discriminant).
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Inverse of [`TreeNode::index`]: build a node from the spec's
+    /// `0..=10` integer. Returns `None` for out-of-range values.
+    #[inline]
+    pub const fn from_index(i: usize) -> Option<Self> {
+        match i {
+            0 => Some(Self::Zero),
+            1 => Some(Self::EndOfBlock),
+            2 => Some(Self::One),
+            3 => Some(Self::LowVal),
+            4 => Some(Self::Two),
+            5 => Some(Self::Three),
+            6 => Some(Self::HighLow),
+            7 => Some(Self::CatOne),
+            8 => Some(Self::CatThreeFour),
+            9 => Some(Self::CatThree),
+            10 => Some(Self::CatFive),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for TreeNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Zero => "ZERO_CONTEXT_NODE",
+            Self::EndOfBlock => "EOB_CONTEXT_NODE",
+            Self::One => "ONE_CONTEXT_NODE",
+            Self::LowVal => "LOW_VAL_CONTEXT_NODE",
+            Self::Two => "TWO_CONTEXT_NODE",
+            Self::Three => "THREE_CONTEXT_NODE",
+            Self::HighLow => "HIGH_LOW_CONTEXT_NODE",
+            Self::CatOne => "CAT_ONE_CONTEXT_NODE",
+            Self::CatThreeFour => "CAT_THREEFOUR_CONTEXT_NODE",
+            Self::CatThree => "CAT_THREE_CONTEXT_NODE",
+            Self::CatFive => "CAT_FIVE_CONTEXT_NODE",
+        };
+        f.write_str(name)
+    }
+}
+
+/// The keyframe baseline `DcProbs[2][11]` bank.
+///
+/// §13.2: "At each key frame (I frame) every probability value in this
+/// array of DC Probabilities is set to 128." The bank persists from a
+/// keyframe to each subsequent interframe and is updated in-place by
+/// the §13.2 Table 22–24 BoolCoder bitstream (deferred).
+#[inline]
+pub const fn baseline_dc_probs() -> [[u8; NUM_TREE_NODES]; NUM_PLANES] {
+    [[128; NUM_TREE_NODES]; NUM_PLANES]
+}
+
+/// The keyframe baseline `AcProbs[2][3][6][11]` bank.
+///
+/// §13.3: "At each key frame (I frame) every probability value in this
+/// array of AC Probabilities is set to 128." The bank persists from a
+/// keyframe to each subsequent interframe and is updated in-place by
+/// the §13.3 Table 31–35 BoolCoder bitstream (deferred).
+#[inline]
+pub const fn baseline_ac_probs(
+) -> [[[[u8; NUM_TREE_NODES]; NUM_AC_BANDS]; NUM_AC_PREC_CONTEXTS]; NUM_PLANES] {
+    [[[[128; NUM_TREE_NODES]; NUM_AC_BANDS]; NUM_AC_PREC_CONTEXTS]; NUM_PLANES]
+}
+
+/// `VP6_DcUpdateProbs[2][11]` — the per-node update-flag probabilities
+/// for the §13.2 DC coding-tree-node update bitstream (Table 24's
+/// `NewNodeProbFlag` is read as `B(VP6_DcUpdateProbs[plane][node])`).
+///
+/// First dimension: plane (Y = 0, UV = 1). Second dimension: tree node
+/// (Table 20 index 0..=10). Verbatim from §13.2.
+pub const VP6_DC_UPDATE_PROBS: [[u8; NUM_TREE_NODES]; NUM_PLANES] = [
+    [146, 255, 181, 207, 232, 243, 238, 251, 244, 250, 249],
+    [179, 255, 214, 240, 250, 255, 244, 255, 255, 255, 255],
+];
+
+/// `AcUpdateProbs[3][2][6][11]` — the per-node update-flag
+/// probabilities for the §13.3 AC coding-tree-node update bitstream
+/// (Table 35's `NewNodeProbFlag` is read as
+/// `B(AcUpdateProbs[prec][plane][band][node])`).
+///
+/// Dimension order, per §13.3: `[prec][plane][band][node]` where
+/// `prec` is the Table 29 preceding-coefficient context, `plane` is
+/// the Table 28 plane index, `band` is the Table 30 band index, and
+/// `node` is the Table 20 node index. Verbatim from §13.3.
+pub const AC_UPDATE_PROBS: [[[[u8; NUM_TREE_NODES]; NUM_AC_BANDS]; NUM_PLANES];
+    NUM_AC_PREC_CONTEXTS] = [
+    [
+        // preceded by 0
+        [
+            [227, 246, 230, 247, 244, 255, 255, 255, 255, 255, 255],
+            [255, 255, 209, 231, 231, 249, 249, 253, 255, 255, 255],
+            [255, 255, 225, 242, 241, 251, 253, 255, 255, 255, 255],
+            [255, 255, 241, 253, 252, 255, 255, 255, 255, 255, 255],
+            [255, 255, 248, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [240, 255, 248, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 240, 253, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+    ],
+    [
+        // preceded by 1
+        [
+            [206, 203, 227, 239, 247, 255, 253, 255, 255, 255, 255],
+            [207, 199, 220, 236, 243, 252, 252, 255, 255, 255, 255],
+            [212, 219, 230, 243, 244, 253, 252, 255, 255, 255, 255],
+            [236, 237, 247, 252, 253, 255, 255, 255, 255, 255, 255],
+            [240, 240, 248, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [230, 233, 249, 255, 255, 255, 255, 255, 255, 255, 255],
+            [238, 238, 250, 255, 255, 255, 255, 255, 255, 255, 255],
+            [248, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+    ],
+    [
+        // preceded by > 1
+        [
+            [225, 239, 227, 231, 244, 253, 243, 255, 255, 253, 255],
+            [232, 234, 224, 228, 242, 249, 242, 252, 251, 251, 255],
+            [235, 249, 238, 240, 251, 255, 249, 255, 253, 253, 255],
+            [249, 253, 251, 250, 255, 255, 255, 255, 255, 255, 255],
+            [251, 250, 249, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [243, 244, 250, 250, 255, 255, 255, 255, 255, 255, 255],
+            [249, 248, 250, 253, 255, 255, 255, 255, 255, 255, 255],
+            [253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+    ],
+];
+
+/// `DcNodeEqs[5][3][2]` — the slope/constant linear-equation table the
+/// §13.2 `DcProbs → DcNodeContexts` conversion applies to the first
+/// five tree nodes (§13.2 Table 27).
+///
+/// First dimension: the first five Table 20 nodes (0 = Zero,
+/// 1 = EOB — an *unused dummy* row that maps any input to 1,
+/// 2 = One, 3 = LowVal, 4 = Two). Second dimension: the Table 26 DC
+/// node context (0 = both-zero, 1 = one-non-zero, 2 = both-non-zero).
+/// Third dimension: 0 = slope, 1 = constant. Constants can be negative,
+/// so the entries are `i32`. Verbatim from §13.2.
+pub const DC_NODE_EQS: [[[i32; 2]; NUM_DC_CONTEXTS]; NUM_DC_NODE_EQS] = [
+    [[122, 133], [133, 51], [142, -16]], // Zero Node
+    [[0, 1], [0, 1], [0, 1]],            // UNUSED DUMMY (EOB)
+    [[78, 171], [169, 71], [221, -30]],  // One Node
+    [[139, 117], [214, 44], [246, -3]],  // Low Val Node
+    [[168, 79], [210, 38], [203, 17]],   // Two Node (2, 3 or 4)
+];
+
+/// Convert a `DcProbs[2][11]` bank into the `DcNodeContexts[2][3][11]`
+/// array per the §13.2 pseudo-code.
+///
+/// For each plane and each of the three DC node contexts, the first
+/// five nodes are passed through their `DcNodeEqs` line
+/// (`Temp = ((DcProbs[p][n] * slope + 128) >> 8) + constant`, clipped
+/// to `1..=255`); nodes 5..=10 copy the transmitted probability
+/// unchanged. The result is the per-context node-probability tree the
+/// §13.2.1 arithmetic DC decoder consults.
+///
+/// This is pure integer arithmetic (no BoolCoder), exactly as the §13.2
+/// listing specifies.
+pub fn dc_probs_to_node_contexts(
+    dc_probs: &[[u8; NUM_TREE_NODES]; NUM_PLANES],
+) -> [[[u8; NUM_TREE_NODES]; NUM_DC_CONTEXTS]; NUM_PLANES] {
+    let mut out = [[[0u8; NUM_TREE_NODES]; NUM_DC_CONTEXTS]; NUM_PLANES];
+    for (plane_in, plane_out) in dc_probs.iter().zip(out.iter_mut()) {
+        for (ctx, ctx_out) in plane_out.iter_mut().enumerate() {
+            for (node, slot) in ctx_out.iter_mut().enumerate() {
+                if node < NUM_DC_NODE_EQS {
+                    // Tree nodes 0..5: apply the linear equation.
+                    let slope = DC_NODE_EQS[node][ctx][0];
+                    let constant = DC_NODE_EQS[node][ctx][1];
+                    let prob = plane_in[node] as i32;
+                    let temp = ((((prob * slope) + 128) >> 8) + constant).clamp(1, 255);
+                    *slot = temp as u8;
+                } else {
+                    // Tree nodes 5..11: pass the transmitted probability
+                    // through unchanged.
+                    *slot = plane_in[node];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Convert an 11-entry node-probability vector into the 12-entry
+/// Huffman probability set per the §13.1 `DCTTokenBoolTreeToHuffProbs`
+/// transform.
+///
+/// Used by the §13.2.2 / §13.3.2 Huffman token decoders to derive a
+/// Huffman probability table directly from a BoolCoder coding-tree
+/// node vector. The output is indexed by [`DctToken::index`]. Pure
+/// integer arithmetic (no BoolCoder), exactly as the §13.1 listing
+/// specifies.
+pub fn dct_token_bool_tree_to_huff_probs(node_prob: &[u8; NUM_TREE_NODES]) -> [u8; NUM_DCT_TOKENS] {
+    // Work in u32 to mirror the spec's intermediate `Prob` / `Prob1`
+    // chaining; each `>> 8` keeps values within 0..=255 so the final
+    // narrowing to u8 is lossless.
+    let np = |i: usize| node_prob[i] as u32;
+    let mut huff = [0u32; NUM_DCT_TOKENS];
+
+    huff[DctToken::EndOfBlock.index()] = (np(0) * np(1)) >> 8;
+    huff[DctToken::Zero.index()] = (np(0) * (255 - np(1))) >> 8;
+
+    let mut prob = 255 - np(0);
+    huff[DctToken::One.index()] = (prob * np(2)) >> 8;
+
+    prob = (prob * (255 - np(2))) >> 8;
+    let mut prob1 = (prob * np(3)) >> 8;
+    huff[DctToken::Two.index()] = (prob1 * np(4)) >> 8;
+
+    prob1 = (prob1 * (255 - np(4))) >> 8;
+    huff[DctToken::Three.index()] = (prob1 * np(5)) >> 8;
+    huff[DctToken::Four.index()] = (prob1 * (255 - np(5))) >> 8;
+
+    prob = (prob * (255 - np(3))) >> 8;
+    prob1 = (prob * np(6)) >> 8;
+    huff[DctToken::Category1.index()] = (prob1 * np(7)) >> 8;
+    huff[DctToken::Category2.index()] = (prob1 * (255 - np(7))) >> 8;
+
+    prob = (prob * (255 - np(6))) >> 8;
+    prob1 = (prob * np(8)) >> 8;
+    huff[DctToken::Category3.index()] = (prob1 * np(9)) >> 8;
+    huff[DctToken::Category4.index()] = (prob1 * (255 - np(9))) >> 8;
+
+    prob = (prob * (255 - np(8))) >> 8;
+    huff[DctToken::Category5.index()] = (prob * np(10)) >> 8;
+    huff[DctToken::Category6.index()] = (prob * (255 - np(10))) >> 8;
+
+    let mut out = [0u8; NUM_DCT_TOKENS];
+    for (slot, value) in out.iter_mut().zip(huff.iter()) {
+        *slot = *value as u8;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------- DctToken enum surface --------
+
+    #[test]
+    fn dct_token_indices_match_table_18_order() {
+        assert_eq!(DctToken::Zero.index(), 0);
+        assert_eq!(DctToken::One.index(), 1);
+        assert_eq!(DctToken::Two.index(), 2);
+        assert_eq!(DctToken::Three.index(), 3);
+        assert_eq!(DctToken::Four.index(), 4);
+        assert_eq!(DctToken::Category1.index(), 5);
+        assert_eq!(DctToken::Category2.index(), 6);
+        assert_eq!(DctToken::Category3.index(), 7);
+        assert_eq!(DctToken::Category4.index(), 8);
+        assert_eq!(DctToken::Category5.index(), 9);
+        assert_eq!(DctToken::Category6.index(), 10);
+        assert_eq!(DctToken::EndOfBlock.index(), 11);
+    }
+
+    #[test]
+    fn dct_token_from_index_round_trip() {
+        for (i, token) in DctToken::ALL.iter().enumerate() {
+            assert_eq!(DctToken::from_index(i), Some(*token));
+            assert_eq!(token.index(), i);
+        }
+        assert_eq!(DctToken::from_index(12), None);
+        assert_eq!(DctToken::from_index(usize::MAX), None);
+    }
+
+    #[test]
+    fn dct_token_all_length_matches_constant() {
+        assert_eq!(DctToken::ALL.len(), NUM_DCT_TOKENS);
+    }
+
+    #[test]
+    fn dct_token_min_max_match_table_18() {
+        // (token, min, max) verbatim from Table 18.
+        let cases = [
+            (DctToken::Zero, 0u16, 0u16),
+            (DctToken::One, 1, 1),
+            (DctToken::Two, 2, 2),
+            (DctToken::Three, 3, 3),
+            (DctToken::Four, 4, 4),
+            (DctToken::Category1, 5, 6),
+            (DctToken::Category2, 7, 10),
+            (DctToken::Category3, 11, 18),
+            (DctToken::Category4, 19, 34),
+            (DctToken::Category5, 35, 66),
+            (DctToken::Category6, 67, 2114),
+        ];
+        for (token, min, max) in cases {
+            assert_eq!(token.min_value(), min, "{token} min");
+            assert_eq!(token.max_value(), max, "{token} max");
+        }
+    }
+
+    #[test]
+    fn dct_token_extra_bits_match_table_18() {
+        let cases = [
+            (DctToken::Zero, 0usize),
+            (DctToken::One, 1),
+            (DctToken::Two, 1),
+            (DctToken::Three, 1),
+            (DctToken::Four, 1),
+            (DctToken::Category1, 2),
+            (DctToken::Category2, 3),
+            (DctToken::Category3, 4),
+            (DctToken::Category4, 5),
+            (DctToken::Category5, 6),
+            (DctToken::Category6, 12),
+            (DctToken::EndOfBlock, 0),
+        ];
+        for (token, bits) in cases {
+            assert_eq!(token.extra_bits(), bits, "{token}");
+        }
+    }
+
+    #[test]
+    fn dct_token_probs_list_length_tracks_extra_bits_except_cat6() {
+        // For every value-bearing token *except* CATEGORY6 the verbatim
+        // "Arithmetic Encoding the Extra Bits" column length equals the
+        // "# of extrabits (incl. sign)" column. CATEGORY6 lists 11
+        // probabilities against an extra-bits count of 12 (the §13.2.1
+        // traversal off-by-one documented on `extra_bit_probs`).
+        for token in DctToken::ALL.iter() {
+            match token {
+                DctToken::Zero | DctToken::EndOfBlock => {
+                    assert!(token.extra_bit_probs().is_empty(), "{token}");
+                }
+                DctToken::Category6 => {
+                    assert_eq!(token.extra_bits(), 12);
+                    assert_eq!(token.extra_bit_probs().len(), 11);
+                }
+                _ => {
+                    assert_eq!(token.extra_bit_probs().len(), token.extra_bits(), "{token}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dct_token_extra_bit_probs_match_table_18() {
+        assert_eq!(DctToken::One.extra_bit_probs(), &[128]);
+        assert_eq!(DctToken::Two.extra_bit_probs(), &[128]);
+        assert_eq!(DctToken::Three.extra_bit_probs(), &[128]);
+        assert_eq!(DctToken::Four.extra_bit_probs(), &[128]);
+        assert_eq!(DctToken::Category1.extra_bit_probs(), &[159, 128]);
+        assert_eq!(DctToken::Category2.extra_bit_probs(), &[165, 145, 128]);
+        assert_eq!(DctToken::Category3.extra_bit_probs(), &[173, 148, 140, 128]);
+        assert_eq!(
+            DctToken::Category4.extra_bit_probs(),
+            &[176, 155, 140, 135, 128]
+        );
+        assert_eq!(
+            DctToken::Category5.extra_bit_probs(),
+            &[180, 157, 141, 134, 130, 128]
+        );
+        assert_eq!(
+            DctToken::Category6.extra_bit_probs(),
+            &[254, 254, 243, 230, 196, 177, 153, 140, 133, 129, 128]
+        );
+        // Every value-bearing token ends with the fixed sign prior 128.
+        for token in DctToken::ALL.iter() {
+            if let Some(last) = token.extra_bit_probs().last() {
+                assert_eq!(*last, 128, "{token} sign prior");
+            }
+        }
+    }
+
+    #[test]
+    fn dct_token_min_plus_extra_range_covers_max() {
+        // The value field (extra_bits minus the sign bit) must span
+        // [min, max]. e.g. CATEGORY3: 11 + (2^3 - 1) = 18 = max.
+        for token in DctToken::ALL.iter() {
+            if matches!(token, DctToken::Zero | DctToken::EndOfBlock) {
+                continue;
+            }
+            let value_bits = token.extra_bits() - 1; // minus sign
+            let span = (1u32 << value_bits) - 1;
+            assert_eq!(
+                token.min_value() as u32 + span,
+                token.max_value() as u32,
+                "{token} range"
+            );
+        }
+    }
+
+    // -------- TreeNode enum surface --------
+
+    #[test]
+    fn tree_node_indices_match_table_20_order() {
+        assert_eq!(TreeNode::Zero.index(), 0);
+        assert_eq!(TreeNode::EndOfBlock.index(), 1);
+        assert_eq!(TreeNode::One.index(), 2);
+        assert_eq!(TreeNode::LowVal.index(), 3);
+        assert_eq!(TreeNode::Two.index(), 4);
+        assert_eq!(TreeNode::Three.index(), 5);
+        assert_eq!(TreeNode::HighLow.index(), 6);
+        assert_eq!(TreeNode::CatOne.index(), 7);
+        assert_eq!(TreeNode::CatThreeFour.index(), 8);
+        assert_eq!(TreeNode::CatThree.index(), 9);
+        assert_eq!(TreeNode::CatFive.index(), 10);
+    }
+
+    #[test]
+    fn tree_node_from_index_round_trip() {
+        for (i, node) in TreeNode::ALL.iter().enumerate() {
+            assert_eq!(TreeNode::from_index(i), Some(*node));
+            assert_eq!(node.index(), i);
+        }
+        assert_eq!(TreeNode::from_index(11), None);
+        assert_eq!(TreeNode::from_index(usize::MAX), None);
+    }
+
+    #[test]
+    fn tree_node_all_length_matches_constant() {
+        assert_eq!(TreeNode::ALL.len(), NUM_TREE_NODES);
+    }
+
+    // -------- baseline banks --------
+
+    #[test]
+    fn baseline_dc_probs_all_128() {
+        let dc = baseline_dc_probs();
+        assert_eq!(dc.len(), NUM_PLANES);
+        for plane in dc.iter() {
+            assert_eq!(plane.len(), NUM_TREE_NODES);
+            assert!(plane.iter().all(|&p| p == 128));
+        }
+    }
+
+    #[test]
+    fn baseline_ac_probs_all_128() {
+        let ac = baseline_ac_probs();
+        assert_eq!(ac.len(), NUM_PLANES);
+        let mut count = 0;
+        for plane in ac.iter() {
+            assert_eq!(plane.len(), NUM_AC_PREC_CONTEXTS);
+            for prec in plane.iter() {
+                assert_eq!(prec.len(), NUM_AC_BANDS);
+                for band in prec.iter() {
+                    assert_eq!(band.len(), NUM_TREE_NODES);
+                    assert!(band.iter().all(|&p| p == 128));
+                    count += band.len();
+                }
+            }
+        }
+        // 2 * 3 * 6 * 11 = 396 entries.
+        assert_eq!(count, 2 * 3 * 6 * 11);
+    }
+
+    // -------- update-flag probability banks --------
+
+    #[test]
+    fn vp6_dc_update_probs_dimensions_and_spot_values() {
+        assert_eq!(VP6_DC_UPDATE_PROBS.len(), NUM_PLANES);
+        for row in VP6_DC_UPDATE_PROBS.iter() {
+            assert_eq!(row.len(), NUM_TREE_NODES);
+        }
+        // First and last of each plane row (§13.2 listing).
+        assert_eq!(VP6_DC_UPDATE_PROBS[0][0], 146);
+        assert_eq!(VP6_DC_UPDATE_PROBS[0][10], 249);
+        assert_eq!(VP6_DC_UPDATE_PROBS[1][0], 179);
+        assert_eq!(VP6_DC_UPDATE_PROBS[1][10], 255);
+        // EOB node (index 1) is 255 in both planes.
+        assert_eq!(VP6_DC_UPDATE_PROBS[0][1], 255);
+        assert_eq!(VP6_DC_UPDATE_PROBS[1][1], 255);
+    }
+
+    #[test]
+    fn ac_update_probs_dimensions() {
+        assert_eq!(AC_UPDATE_PROBS.len(), NUM_AC_PREC_CONTEXTS);
+        for prec in AC_UPDATE_PROBS.iter() {
+            assert_eq!(prec.len(), NUM_PLANES);
+            for plane in prec.iter() {
+                assert_eq!(plane.len(), NUM_AC_BANDS);
+                for band in plane.iter() {
+                    assert_eq!(band.len(), NUM_TREE_NODES);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ac_update_probs_spot_values() {
+        // Corners of the §13.3 listing.
+        assert_eq!(AC_UPDATE_PROBS[0][0][0][0], 227);
+        assert_eq!(AC_UPDATE_PROBS[0][0][0][10], 255);
+        assert_eq!(AC_UPDATE_PROBS[1][0][0][0], 206);
+        assert_eq!(AC_UPDATE_PROBS[1][0][1][1], 199);
+        assert_eq!(AC_UPDATE_PROBS[2][0][0][0], 225);
+        assert_eq!(AC_UPDATE_PROBS[2][0][2][6], 249);
+        assert_eq!(AC_UPDATE_PROBS[2][1][0][0], 243);
+        // Last prec/plane/band row is all 255.
+        assert!(AC_UPDATE_PROBS[2][1][5].iter().all(|&p| p == 255));
+    }
+
+    // -------- DcNodeEqs --------
+
+    #[test]
+    fn dc_node_eqs_dimensions_and_spot_values() {
+        assert_eq!(DC_NODE_EQS.len(), NUM_DC_NODE_EQS);
+        for node in DC_NODE_EQS.iter() {
+            assert_eq!(node.len(), NUM_DC_CONTEXTS);
+            for ctx in node.iter() {
+                assert_eq!(ctx.len(), 2);
+            }
+        }
+        // Zero Node, context 0: slope 122 constant 133.
+        assert_eq!(DC_NODE_EQS[0][0], [122, 133]);
+        // Zero Node, context 2: negative constant.
+        assert_eq!(DC_NODE_EQS[0][2], [142, -16]);
+        // The EOB dummy row maps any input to constant 1 (slope 0).
+        assert_eq!(DC_NODE_EQS[1], [[0, 1], [0, 1], [0, 1]]);
+        // Low Val Node, context 2: negative constant.
+        assert_eq!(DC_NODE_EQS[3][2], [246, -3]);
+        // Two Node, context 0.
+        assert_eq!(DC_NODE_EQS[4][0], [168, 79]);
+    }
+
+    // -------- DcProbs -> DcNodeContexts conversion --------
+
+    #[test]
+    fn dc_node_contexts_dummy_eob_node_is_one() {
+        // The EOB node (index 1) uses the slope-0 / constant-1 dummy,
+        // so it maps to 1 regardless of the input probability.
+        for input in [0u8, 1, 64, 128, 200, 255] {
+            let mut dc = baseline_dc_probs();
+            for plane in dc.iter_mut() {
+                plane[1] = input;
+            }
+            let contexts = dc_probs_to_node_contexts(&dc);
+            for plane in contexts.iter() {
+                for ctx in plane.iter() {
+                    assert_eq!(ctx[1], 1, "EOB node should clip to 1 for input {input}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dc_node_contexts_passthrough_nodes_5_to_10() {
+        // Nodes 5..=10 copy the transmitted probability verbatim into
+        // every context.
+        let mut dc = baseline_dc_probs();
+        let marks = [11u8, 22, 33, 44, 55, 66];
+        for plane in dc.iter_mut() {
+            for (k, m) in marks.iter().enumerate() {
+                plane[5 + k] = *m;
+            }
+        }
+        let contexts = dc_probs_to_node_contexts(&dc);
+        for plane in contexts.iter() {
+            for ctx in plane.iter() {
+                for (k, m) in marks.iter().enumerate() {
+                    assert_eq!(ctx[5 + k], *m);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dc_node_contexts_baseline_128_matches_hand_computed() {
+        // Hand-computed from the §13.2 pseudo-code with DcProbs all 128.
+        // Temp = ((128 * slope + 128) >> 8) + constant, clipped 1..=255.
+        let contexts = dc_probs_to_node_contexts(&baseline_dc_probs());
+        let expect = |slope: i32, constant: i32| -> u8 {
+            ((((128 * slope) + 128) >> 8) + constant).clamp(1, 255) as u8
+        };
+        for (plane, plane_ctx) in contexts.iter().enumerate() {
+            for (ctx, row) in plane_ctx.iter().enumerate() {
+                for (node, &got) in row.iter().enumerate() {
+                    if node < NUM_DC_NODE_EQS {
+                        let slope = DC_NODE_EQS[node][ctx][0];
+                        let constant = DC_NODE_EQS[node][ctx][1];
+                        assert_eq!(
+                            got,
+                            expect(slope, constant),
+                            "plane {plane} ctx {ctx} node {node}"
+                        );
+                    } else {
+                        // Pass-through nodes remain 128.
+                        assert_eq!(got, 128, "plane {plane} ctx {ctx} node {node}");
+                    }
+                }
+            }
+        }
+        // A couple of concrete spot values for the Zero node.
+        // ctx 0: ((128*122+128)>>8)+133 = (15616>>8)+133 = 61+133 = 194.
+        assert_eq!(contexts[0][0][0], 194);
+        // ctx 2: ((128*142+128)>>8)+(-16) = (18304>>8)-16 = 71-16 = 55.
+        assert_eq!(contexts[0][2][0], 55);
+    }
+
+    #[test]
+    fn dc_node_contexts_output_always_clipped_to_1_255() {
+        // Probe a spread of inputs; every output must be in 1..=255.
+        for input in [0u8, 1, 50, 128, 200, 255] {
+            let dc = [[input; NUM_TREE_NODES]; NUM_PLANES];
+            let contexts = dc_probs_to_node_contexts(&dc);
+            for plane in contexts.iter() {
+                for ctx in plane.iter() {
+                    // Only nodes 0..5 go through the clip; pass-through
+                    // nodes echo the input (which may be 0 only if input
+                    // was 0 — that is the transmitted value, not a tree
+                    // probability the decoder reads at node 5+).
+                    for (node, &p) in ctx.iter().take(NUM_DC_NODE_EQS).enumerate() {
+                        assert!((1..=255).contains(&p), "node {node} prob {p} out of range");
+                    }
+                }
+            }
+        }
+    }
+
+    // -------- DCTTokenBoolTreeToHuffProbs --------
+
+    #[test]
+    fn huff_probs_all_128_matches_hand_computed() {
+        // With every node probability == 128, reproduce the §13.1
+        // listing by hand to pin the transform.
+        let node = [128u8; NUM_TREE_NODES];
+        let huff = dct_token_bool_tree_to_huff_probs(&node);
+
+        // EOB = (128*128)>>8 = 64
+        assert_eq!(huff[DctToken::EndOfBlock.index()], 64);
+        // ZERO = (128*(255-128))>>8 = (128*127)>>8 = 16256>>8 = 63
+        assert_eq!(huff[DctToken::Zero.index()], 63);
+
+        // prob = 255-128 = 127
+        // ONE = (127*128)>>8 = 16256>>8 = 63
+        assert_eq!(huff[DctToken::One.index()], 63);
+
+        // prob = (127*(255-128))>>8 = (127*127)>>8 = 16129>>8 = 63
+        // prob1 = (63*128)>>8 = 8064>>8 = 31
+        // TWO = (31*128)>>8 = 3968>>8 = 15
+        assert_eq!(huff[DctToken::Two.index()], 15);
+        // prob1 = (31*(255-128))>>8 = (31*127)>>8 = 3937>>8 = 15
+        // THREE = (15*128)>>8 = 1920>>8 = 7
+        assert_eq!(huff[DctToken::Three.index()], 7);
+        // FOUR = (15*(255-128))>>8 = (15*127)>>8 = 1905>>8 = 7
+        assert_eq!(huff[DctToken::Four.index()], 7);
+
+        // prob = (63*(255-128))>>8 = (63*127)>>8 = 8001>>8 = 31
+        // prob1 = (31*128)>>8 = 15
+        // CAT1 = (15*128)>>8 = 7
+        assert_eq!(huff[DctToken::Category1.index()], 7);
+        // CAT2 = (15*(255-128))>>8 = 7
+        assert_eq!(huff[DctToken::Category2.index()], 7);
+
+        // prob = (31*(255-128))>>8 = (31*127)>>8 = 3937>>8 = 15
+        // prob1 = (15*128)>>8 = 7
+        // CAT3 = (7*128)>>8 = 3
+        assert_eq!(huff[DctToken::Category3.index()], 3);
+        // CAT4 = (7*(255-128))>>8 = (7*127)>>8 = 889>>8 = 3
+        assert_eq!(huff[DctToken::Category4.index()], 3);
+
+        // prob = (15*(255-128))>>8 = (15*127)>>8 = 1905>>8 = 7
+        // CAT5 = (7*128)>>8 = 3
+        assert_eq!(huff[DctToken::Category5.index()], 3);
+        // CAT6 = (7*(255-128))>>8 = 3
+        assert_eq!(huff[DctToken::Category6.index()], 3);
+    }
+
+    #[test]
+    fn huff_probs_output_length() {
+        let huff = dct_token_bool_tree_to_huff_probs(&[128u8; NUM_TREE_NODES]);
+        assert_eq!(huff.len(), NUM_DCT_TOKENS);
+    }
+
+    #[test]
+    fn huff_probs_never_panic_on_extremes() {
+        // The chained `>> 8` arithmetic keeps every intermediate in
+        // 0..=255, so all-1 and all-255 inputs must not overflow u8.
+        for fill in [1u8, 255u8] {
+            let node = [fill; NUM_TREE_NODES];
+            let _ = dct_token_bool_tree_to_huff_probs(&node);
+        }
+        // A mixed vector too.
+        let node = [200, 1, 180, 30, 250, 5, 99, 128, 7, 240, 60];
+        let huff = dct_token_bool_tree_to_huff_probs(&node);
+        assert_eq!(huff.len(), NUM_DCT_TOKENS);
+    }
+
+    #[test]
+    fn display_names_match_spec() {
+        assert_eq!(DctToken::Category6.to_string(), "DCT_VAL_CATEGORY6");
+        assert_eq!(DctToken::EndOfBlock.to_string(), "DCT_EOB_TOKEN");
+        assert_eq!(
+            TreeNode::CatThreeFour.to_string(),
+            "CAT_THREEFOUR_CONTEXT_NODE"
+        );
+        assert_eq!(TreeNode::Zero.to_string(), "ZERO_CONTEXT_NODE");
+    }
+}

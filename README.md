@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 10 (2026-05-25).** The orphan-rebuild
+**Clean-room rebuild — round 11 (2026-05-25).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -303,7 +303,51 @@ implementation is consulted at any stage.
   decoder past round 9 without touching the contested §7.3 `Split`
   formula.
 
-### What rounds 1–10 do NOT land
+### What round 11 lands
+
+- `tokens` — the spec §13 DCT-coefficient token static surface (the
+  BoolCoder-independent half of coefficient decoding). Surfaces:
+  - `DctToken` — the twelve Table 18 tokens (`ZERO_TOKEN`,
+    `ONE_TOKEN`..`FOUR_TOKEN`, `DCT_VAL_CATEGORY1`..`6`,
+    `DCT_EOB_TOKEN`) as a `#[repr(u8)]` enum on the canonical 0..=11
+    index, with each token's `(min, max, extra_bits)` geometry and the
+    verbatim `extra_bit_probs` "Arithmetic Encoding the Extra Bits"
+    column.
+  - `TreeNode` — the eleven Table 20 coding-tree node names on the
+    canonical 0..=10 index (the index into a node probability vector).
+  - `baseline_dc_probs` / `baseline_ac_probs` — the all-128 keyframe
+    initialisers for `DcProbs[2][11]` and `AcProbs[2][3][6][11]`.
+  - `VP6_DC_UPDATE_PROBS[2][11]` / `AC_UPDATE_PROBS[3][2][6][11]` — the
+    verbatim per-node update-flag probability banks (§13.2 / §13.3).
+  - `DC_NODE_EQS[5][3][2]` — the verbatim `DcNodeEqs` slope/constant
+    linear-equation table (Table 27), with the EOB dummy row.
+  - `dc_probs_to_node_contexts` — the pure-integer §13.2 conversion
+    expanding `DcProbs[2][11]` into the `DcNodeContexts[2][3][11]`
+    per-context trees the §13.2.1 arithmetic DC decoder consults
+    (linear equation on nodes 0..5, pass-through on 5..11, clipped to
+    1..=255).
+  - `dct_token_bool_tree_to_huff_probs` — the verbatim §13.1
+    `DCTTokenBoolTreeToHuffProbs` transform converting an 11-entry
+    node-probability vector into the 12-entry Huffman probability set
+    the §13.2.2 / §13.3.2 Huffman decoders use.
+- The §13 `VP6_DecodeToken` traversal (per-node `B(prob)` reads, the
+  per-token extrabit `B(...)` loop, and the §13.3.3 AC zero-run reads)
+  plus the §13.2/§13.3 per-frame probability-update bitstream stay
+  deferred behind the §7.3 `Split` DOCS-GAP — every static table and
+  pure-integer derivation the traversal would consult is now landed.
+- Spec observation (deferred traversal, not this surface): Table 18
+  lists `DCT_VAL_CATEGORY6` with 12 extra bits but only 11 arithmetic
+  probabilities; the §13.2.1 magnitude loop
+  (`BitsCount = ExtraBits - 1; … Probs[BitsCount]`) would index one
+  past that 11-entry array before the separate `SignBit = b(1)`. The
+  accessor reports both Table 18 columns verbatim and leaves the
+  off-by-one for the BoolCoder-gated traversal to resolve.
+- Like §10/§15/§16/§17 this stage reads **no BoolCoder bits** — every
+  transform is pure integer arithmetic over already-known tables — so
+  it advances the decoder past round 10 without touching the contested
+  §7.3 `Split` formula.
+
+### What rounds 1–11 do NOT land
 
 - Anything downstream of the BoolCoder switch in the frame header
   (`VFragments`, `HFragments`, scaling, filter selectors,

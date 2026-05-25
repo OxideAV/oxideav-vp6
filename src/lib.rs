@@ -301,6 +301,7 @@ pub mod loopfilter;
 pub mod modes;
 pub mod reconstruct;
 pub mod scan;
+pub mod tokens;
 pub mod umv;
 
 pub use dc_pred::{
@@ -331,6 +332,12 @@ pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};
 pub use scan::{
     raster_to_zigzag_block, zigzag_to_raster_block, DEFAULT_SCAN_ORDER,
     DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG,
+};
+pub use tokens::{
+    baseline_ac_probs, baseline_dc_probs, dc_probs_to_node_contexts,
+    dct_token_bool_tree_to_huff_probs, DctToken, TreeNode, AC_UPDATE_PROBS, DC_NODE_EQS,
+    NUM_AC_BANDS, NUM_AC_PREC_CONTEXTS, NUM_DCT_TOKENS, NUM_DC_CONTEXTS, NUM_DC_NODE_EQS,
+    NUM_PLANES, NUM_TREE_NODES, VP6_DC_UPDATE_PROBS,
 };
 pub use umv::{
     build_extended_buffer, extend_border, extended_height, extended_stride, origin_offset,
