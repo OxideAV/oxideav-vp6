@@ -6,7 +6,90 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added (clean-room round 9, 2026-05-25)
+### Added (clean-room round 10, 2026-05-25)
+
+- `modes` module — the spec §10 macroblock coding-mode static
+  surface. Reads no BoolCoder bits; the §10 `VP6_DecodeMode`
+  traversal that consumes the surface stays deferred behind the
+  §7.3 `Split` DOCS-GAP. Surfaces:
+  - `CodingMode` enum — the ten Table 4 coding modes
+    (`CODE_INTER_NO_MV`, `CODE_INTRA`, `CODE_INTER_PLUS_MV`,
+    `CODE_INTER_NEAREST_MV`, `CODE_INTER_NEAR_MV`,
+    `CODE_USING_GOLDEN`, `CODE_GOLDEN_MV`, `CODE_INTER_FOURMV`,
+    `CODE_GOLD_NEAREST_MV`, `CODE_GOLD_NEAR_MV`) as a `#[repr(u8)]`
+    enum whose discriminants match the spec's canonical 0..=9
+    indexing throughout. Convenience predicates `is_intra`,
+    `uses_golden`, `carries_new_mv` cover the three partitions §17
+    reconstruction and §11 motion-vector paths route on.
+  - `ModeAvailability::{NearestAndNear, NearestOnly, Neither}` —
+    the three Table 5 ProbabilitySituation indices, with a
+    `from_neighbours(nearest_exists, near_exists)` constructor
+    mirroring the §10 traversal result.
+  - `NEAR_MACROBLOCKS[12]` — the verbatim 12-entry (row, col)
+    MB-unit neighbour offset table §10 traverses for
+    Nearest/Near MV resolution.
+  - `VP6_BASELINE_XMITTED_PROBS[3][20]` — the verbatim
+    `VP6_BaselineXmittedProbs` I-frame `probXmitted` initialiser.
+  - `VP6_MODE_VQ[3][16][20]` — the verbatim `VP6_ModeVq` 960-entry
+    baseline-bank that `SetNewBaselineProbs` / `WhichVector` select
+    from.
+  - `mode_decision_tree_node_probability` /
+    `build_mode_decision_tree` — the pure-integer transform that
+    converts a `probXmitted[3][20]` table into the
+    `ModeDecisionTree[3][10][9]` array §10's `VP6_DecodeMode`
+    traversal consults at each of Figure 10's nine internal nodes.
+  - `probability_mode_same` / `build_probability_mode_same` — the
+    §10 `probModeSame` companion the decision-tree root reads to
+    decide whether the MB inherits the previous MB's mode.
+- Transcribed verbatim from `docs/video/vp6/vp6_format.pdf` §10
+  (On2 Technologies, document version 1.02, August 2006). Like
+  §15/§16/§17.1/§11.4/§17.2–§17.4/§11.3/§11.5/§12.1/§14 the module
+  reads no BoolCoder bits and advances the decoder past round 9
+  without touching the contested §7.3 `Split` formula.
+- 42 unit tests over the §10 stage:
+  - **CodingMode (7 tests):** Table 4 order pinned by enum
+    discriminant; `from_index` round-trip across 0..=9 and rejection
+    of out-of-range indices; `ALL` length matches `NUM_CODING_MODES`;
+    `uses_golden` partitions the 4 golden modes; `is_intra` flags
+    only `CODE_INTRA`; `carries_new_mv` flags the three
+    fresh-MV-carrying modes; `Display` strings match the spec's
+    canonical `CODE_*` names.
+  - **ModeAvailability (3 tests):** Table 5 indices pinned; `from_index`
+    round-trip; `from_neighbours` truth-table covering all four
+    `(nearest, near)` input combinations including the (false, true)
+    degenerate case folded to `Neither`.
+  - **NEAR_MACROBLOCKS (5 tests):** 12-entry length; verbatim
+    spot-checks of the four distance-1 and eight distance-2 entries;
+    every offset unique; every offset is on a previously-decoded
+    macroblock (raster-order causality: `dr <= 0`, and `dc < 0` when
+    `dr == 0`).
+  - **VP6_BASELINE_XMITTED_PROBS (5 tests):** `[3][20]` shape;
+    per-situation verbatim spot-checks against the spec listing;
+    byte-width invariant on every entry.
+  - **VP6_MODE_VQ (6 tests):** `[3][16][20]` shape; first / last
+    vector spot-checks against the spec listing for each of the
+    three ProbabilitySituation rows.
+  - **probModeSame (4 tests):** all-zero input returns 255 across
+    all 30 `(av, last_mode)` pairs; baseline situation-0 + Intra
+    last yields 128 (verifying `255 - 255*2/4 = 128`); baseline
+    situation-1 + InterNoMv last yields 247 (verifying
+    `255 - 255*8/238 = 247`); `build_probability_mode_same`
+    bulk-build matches the per-element helper across all 30 cells.
+  - **ModeDecisionTree (12 tests):** `[3][10][9]` build shape;
+    all-zero input collapses every node probability to the floor
+    value 1; every probability stays >= 1 across all 270 cells of
+    the baseline tree; `build_mode_decision_tree` matches the
+    per-node helper across all 270 cells; per-node spec-derived
+    closed-form expected values for nodes 0, 3, 5, 7 and 8 at
+    several different `(availability, lastmode)` selections, each
+    walked through C[] weights and the `1 + 255*left/(1+branch)`
+    formula in the test commentary; the lastmode-zeroing rule
+    swapping which mode's weight is dropped from the `C[j]` table;
+    out-of-range node index panics; iterating every one of the
+    `VP6_ModeVq` 48 vectors as a `probXmitted` seed produces a
+    valid tree (every probability >= 1).
+
+
 
 - `scan` module — the spec §12.1 default zig-zag scan order. Reads no
   BoolCoder bits and is the natural predecessor to §15 inverse

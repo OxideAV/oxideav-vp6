@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 9 (2026-05-25).** The orphan-rebuild
+**Clean-room rebuild — round 10 (2026-05-25).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -259,7 +259,51 @@ implementation is consulted at any stage.
   `ScanOrderUpdateFlag` / `CoeffBandUpdateFlag` / `NewCoeffBand`
   fields (Table 17) are BoolCoder-coded and remain deferred.
 
-### What rounds 1–9 do NOT land
+### What round 10 lands
+
+- `modes` — the spec §10 macroblock coding-mode static surface.
+  Surfaces:
+  - `CodingMode` — the ten Table 4 coding modes (`CODE_INTER_NO_MV`,
+    `CODE_INTRA`, `CODE_INTER_PLUS_MV`, `CODE_INTER_NEAREST_MV`,
+    `CODE_INTER_NEAR_MV`, `CODE_USING_GOLDEN`, `CODE_GOLDEN_MV`,
+    `CODE_INTER_FOURMV`, `CODE_GOLD_NEAREST_MV`, `CODE_GOLD_NEAR_MV`)
+    as a `#[repr(u8)]` enum whose discriminants match the canonical
+    spec 0..=9 indexing throughout (`probXmitted`, `VP6_ModeVq`,
+    `ModeDecisionTree`). Convenience predicates `is_intra`,
+    `uses_golden`, `carries_new_mv` cover the three partitions the
+    §17 reconstruction and §11 motion-vector paths route on.
+  - `ModeAvailability::{NearestAndNear, NearestOnly, Neither}` — the
+    three Table 5 "ProbabilitySituation" indices that gate which
+    probability row applies, plus a `from_neighbours(nearest_exists,
+    near_exists)` constructor mirroring the §10 traversal result.
+  - `NEAR_MACROBLOCKS[12]` — the verbatim 12 (row, column) MB-unit
+    neighbour offsets §10 traverses to resolve Nearest/Near MVs.
+  - `VP6_BASELINE_XMITTED_PROBS[3][20]` — the verbatim
+    `VP6_BaselineXmittedProbs` I-frame `probXmitted` initialiser.
+  - `VP6_MODE_VQ[3][16][20]` — the verbatim `VP6_ModeVq` baseline
+    bank `SetNewBaselineProbs` / `WhichVector` select from (960
+    probability entries total).
+  - `mode_decision_tree_node_probability` / `build_mode_decision_tree`
+    — the pure-integer transform that converts a `probXmitted[3][20]`
+    table into the `ModeDecisionTree[3][10][9]` array §10's
+    `VP6_DecodeMode` traversal consults at each Figure 10 node.
+  - `probability_mode_same` / `build_probability_mode_same` — the
+    §10 `probModeSame` companion the decision-tree root reads to
+    decide whether the MB inherits the previous MB's mode.
+- The §10 `VP6_DecodeMode` traversal itself reads eleven BoolCoder
+  bits (`B(probModeSame)` at the root, then `B(Stats[…])` for nodes
+  0..=8 plus the per-node walk) and stays deferred behind the §7.3
+  `Split` DOCS-GAP; every piece of *static data* and every
+  *pure-integer derivation* the traversal would consult is now
+  landed. The §10 Mode Probability Updates bitstream (Table 7/8/9)
+  is similarly BoolCoder-gated and stays deferred.
+- Like §15/§16/§17.1/§11.4/§17.2–§17.4/§11.3/§11.5/§12.1/§14 this
+  stage reads **no BoolCoder bits** — every transform is pure
+  integer arithmetic over already-known tables — so it advances the
+  decoder past round 9 without touching the contested §7.3 `Split`
+  formula.
+
+### What rounds 1–10 do NOT land
 
 - Anything downstream of the BoolCoder switch in the frame header
   (`VFragments`, `HFragments`, scaling, filter selectors,

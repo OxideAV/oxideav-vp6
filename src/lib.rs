@@ -222,6 +222,32 @@
 //!   past round 7 without touching the contested §7.3 `Split`
 //!   formula.
 //!
+//! ## Round 10 surface
+//!
+//! * [`modes`] — the spec §10 macroblock coding-mode static surface.
+//!   Surfaces the ten Table 4 coding modes ([`modes::CodingMode`])
+//!   and three Table 5 ProbabilitySituation indices
+//!   ([`modes::ModeAvailability`]); the 12-entry [`modes::NEAR_MACROBLOCKS`]
+//!   neighbour-offset table; the verbatim
+//!   [`modes::VP6_BASELINE_XMITTED_PROBS`] `[3][20]` I-frame
+//!   `probXmitted` initialiser; the verbatim [`modes::VP6_MODE_VQ`]
+//!   `[3][16][20]` baseline-bank that `SetNewBaselineProbs` /
+//!   `WhichVector` select from; and the pure-integer
+//!   [`modes::build_mode_decision_tree`] (and per-node
+//!   [`modes::mode_decision_tree_node_probability`]) transform that
+//!   converts a `probXmitted[3][20]` table into the
+//!   `ModeDecisionTree[3][10][9]` array §10's `VP6_DecodeMode`
+//!   traversal consults. The companion
+//!   [`modes::probability_mode_same`] /
+//!   [`modes::build_probability_mode_same`] compute the root-node
+//!   "Same As Last" probability the Figure 10 traversal's first read
+//!   needs. The `VP6_DecodeMode` BoolCoder traversal itself stays
+//!   deferred until the §7.3 DOCS-GAP is resolved — but every piece
+//!   of static data and every pure-integer derivation it would
+//!   consult is now landed. Like
+//!   §15/§16/§17.1/§11.4/§17.2–§17.4/§11.3/§11.5/§12.1/§14 this
+//!   module reads no BoolCoder bits.
+//!
 //! ## Round 9 surface
 //!
 //! * [`scan`] — the spec §12.1 default zig-zag scan order. Surfaces
@@ -272,6 +298,7 @@ pub mod idct;
 pub mod inter;
 pub mod interp;
 pub mod loopfilter;
+pub mod modes;
 pub mod reconstruct;
 pub mod scan;
 pub mod umv;
@@ -293,6 +320,12 @@ pub use interp::{
 pub use loopfilter::{
     bound, boundary_x, boundary_y, filter_horizontal_boundary, filter_vertical_boundary,
     prediction_loop_filter_function, PREDICTION_LOOP_FILTER_LIMIT_VALUES,
+};
+pub use modes::{
+    build_mode_decision_tree, build_probability_mode_same, mode_decision_tree_node_probability,
+    probability_mode_same, CodingMode, ModeAvailability, ModeDecisionTree, ModeDecisionTreeRow,
+    NEAR_MACROBLOCKS, NUM_CODING_MODES, NUM_MODE_DECISION_NODES, NUM_MODE_VQ_VECTORS,
+    NUM_PROBABILITY_SITUATIONS, PROB_XMITTED_ROW_LEN, VP6_BASELINE_XMITTED_PROBS, VP6_MODE_VQ,
 };
 pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};
 pub use scan::{
