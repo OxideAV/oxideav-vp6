@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 12 (2026-05-26).** The orphan-rebuild
+**Clean-room rebuild — round 13 (2026-05-29).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -392,7 +392,67 @@ implementation is consulted at any stage.
   transform that feeds another Huffman tree) and the actual `R(1)`
   byte-stream reader are deferred for later rounds.
 
-### What rounds 1–12 do NOT land
+### What round 13 lands
+
+- `zrl` — the spec §13.3.3 AC zero-run-length static surface (the
+  BoolCoder-independent half of zero-run decoding). When the §13
+  token decoder produces a `ZERO_TOKEN` in the AC position, a
+  zero-run length follows. The run length can be coded with either
+  of the two §7 entropy schemes; the BoolCoder path of §13.3.3.1
+  stays deferred behind the §7.3 DOCS-GAP, while the Huffman path
+  of §13.3.3.2 reads only raw `R(1)` bits over a tree this module
+  builds, so it is **independent of the §7.3 `Split` formula
+  DOCS-GAP**.
+- Surfaces:
+  - `ZrlBand` — Table 37 zero-coefficient-starting-band indices
+    (`Band0` for AC coefficient positions 1–5; `Band1` for 6–63),
+    on the spec's canonical `0..=1` indexing, with a
+    `for_coefficient_position` helper that returns the band a
+    given AC coefficient lives in.
+  - `ZrlNode` — the fourteen Table 38 node indices. The first
+    eight (`0..=7`) name the eight internal nodes of the Figure 16
+    binary tree (`>4`, `>2`, `>1`, `>3`, `>8`, `>6`, `>5`, `>7`)
+    in the spec's canonical order; the remaining six (`8..=13`)
+    name the bit positions of the `(RunLength - 9)` six-bit
+    suffix the BoolCoder path reads when the run is greater than
+    8, with each extrabit's `(RunLength - 9) >> n & 1` shift
+    exposed via `extrabit_shift`.
+  - `ZERO_RUN_PROB_DEFAULTS[2][14]` — the verbatim
+    `ZeroRunProbDefaults` keyframe initialiser.
+  - `ZRL_UPDATE_PROBS[2][14]` — the verbatim `ZrlUpdateProbs`
+    per-node `NewNodeProbFlag` update-flag probability bank used
+    by the Table 41 BoolCoder reads (the reads themselves stay
+    deferred).
+  - `zrl_bool_tree_to_huff_probs` — the verbatim §13.3.3.2
+    `ZRLBoolTreeToHuffProbs` transform that converts an 8-entry
+    node-probability vector into a 9-entry Huffman probability
+    set (one chain factor per Figure 16 internal-node branch;
+    `>> 8` truncation per the spec's listing). Pure integer
+    arithmetic, no BoolCoder.
+  - `build_zrl_huffman_tree` — composes the §13.3.3.2 pseudo-code
+    pair `ZRLBoolTreeToHuffCodes` + `VP6_BuildHuffTree` for one
+    band. Runs `zrl_bool_tree_to_huff_probs` and then invokes
+    `create_huffman_tree` (the round-12 §7.2 primitive) to build
+    a `2N - 1 = 17`-node `HuffNode` tree the round-12 `decode_symbol`
+    walker can traverse against a byte-stream `R(1)` reader.
+- Like §15/§16/§17/§11/§12.1/§14/§10/§13/§7.2 this stage reads
+  **no BoolCoder bits** — every operation is pure integer
+  arithmetic over the supplied probability vector — so it advances
+  the decoder past round 12 without touching the contested §7.3
+  `Split` formula.
+- **DOCS-GAP candidate (literal-vs-escape semantics):** the
+  Figure 16 tree drawing carries two leaves labelled `8`, and the
+  §13.3.3 demonstration code's `if (ZrlToken<8) EncodedCoeffs +=
+  ZrlToken else EncodedCoeffs += 8 + R(6)` does not name which of
+  the two Figure 16 leaves emits which `ZrlToken` value — i.e.
+  whether the leaf at canonical index 7 carries a literal run of 8
+  or is the `>8` escape that triggers the 6-extrabit `R(6)` read.
+  The static surface itself is unambiguous (the conversion
+  outputs 9 probabilities, one per leaf-codeword) so it lands; the
+  literal-vs-escape disambiguation is reported as a docs-gap
+  candidate for the orchestrator to commission.
+
+### What rounds 1–13 do NOT land
 
 - Anything downstream of the BoolCoder switch in the frame header
   (`VFragments`, `HFragments`, scaling, filter selectors,

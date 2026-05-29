@@ -248,6 +248,33 @@
 //!   §15/§16/§17.1/§11.4/§17.2–§17.4/§11.3/§11.5/§12.1/§14 this
 //!   module reads no BoolCoder bits.
 //!
+//! ## Round 13 surface
+//!
+//! * [`zrl`] — the spec §13.3.3 AC zero-run-length static surface
+//!   (the BoolCoder-independent half of zero-run decoding).
+//!   Surfaces: the [`zrl::ZrlBand`] / [`zrl::ZrlNode`] Table 37 /
+//!   Table 38 enums on the spec's canonical `0..=1` / `0..=13`
+//!   indexing; the verbatim
+//!   [`zrl::ZERO_RUN_PROB_DEFAULTS`] `[2][14]` keyframe initialiser
+//!   for `ZeroRunProbs[2][14]`; the verbatim
+//!   [`zrl::ZRL_UPDATE_PROBS`] `[2][14]` per-node
+//!   `NewNodeProbFlag` update-flag probability bank (Table 41); the
+//!   pure-integer [`zrl::zrl_bool_tree_to_huff_probs`] transform
+//!   (the §13.3.3.2 `ZRLBoolTreeToHuffProbs` listing); and the
+//!   [`zrl::build_zrl_huffman_tree`] composer that runs the
+//!   conversion and then builds the §7.2 `2N - 1 = 17`-node
+//!   `HuffNode` tree the §7.2 walker traverses against a raw-bit
+//!   byte-stream reader. The §13.3.3.1 BoolCoder Figure 16
+//!   traversal + six-bit extrabit reads stay deferred behind the
+//!   §7.3 `Split` DOCS-GAP; the §13.3.3.2 Huffman path is fully
+//!   landed at the static-surface level, with the run-length
+//!   semantics for the 9th leaf (literal vs `> 8` escape)
+//!   identified as a docs-gap candidate. Like §15/§16/§17/§11/§12.1/§14/§10/§13/§7.2
+//!   this module reads **no BoolCoder bits** — every operation is
+//!   pure integer arithmetic over the supplied probability vector —
+//!   so it advances the decoder past round 12 without touching the
+//!   contested §7.3 `Split` formula.
+//!
 //! ## Round 12 surface
 //!
 //! * [`huffman`] — the spec §7.2 Huffman tree construction and
@@ -331,6 +358,7 @@ pub mod reconstruct;
 pub mod scan;
 pub mod tokens;
 pub mod umv;
+pub mod zrl;
 
 pub use dc_pred::{
     average_both_neighbours, sign as dc_sign, DcPredictionContext, Neighbour, ReferenceBucket,
@@ -374,6 +402,10 @@ pub use tokens::{
 pub use umv::{
     build_extended_buffer, extend_border, extended_height, extended_stride, origin_offset,
     UMV_BORDER_SIZE,
+};
+pub use zrl::{
+    build_zrl_huffman_tree, zrl_bool_tree_to_huff_probs, ZrlBand, ZrlNode, NUM_ZRL_BANDS,
+    NUM_ZRL_HUFF_PROBS, NUM_ZRL_NODES, ZERO_RUN_PROB_DEFAULTS, ZRL_UPDATE_PROBS,
 };
 
 /// Crate-local error type.

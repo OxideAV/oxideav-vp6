@@ -6,6 +6,86 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 13, 2026-05-29)
+
+- `zrl` module — the spec §13.3.3 AC zero-run-length static surface
+  (the BoolCoder-independent half of zero-run decoding). When the
+  §13 token decoder produces a `ZERO_TOKEN` in the AC position, a
+  zero-run length follows that says how many consecutive AC
+  coefficients are zero. The run length can be coded with either of
+  the two §7 entropy schemes — the BoolCoder path of §13.3.3.1
+  reads `B(prob)` BoolCoder bits across Figure 16 plus six
+  `(RunLength - 9)` extrabits and stays deferred behind the §7.3
+  DOCS-GAP, while the Huffman path of §13.3.3.2 converts the same
+  Figure 16 node probabilities into a 9-entry Huffman probability
+  set and traverses the resulting Huffman tree with raw `R(1)` bits
+  — so it is **independent of the §7.3 `Split` formula DOCS-GAP**.
+  Surfaces:
+  - `ZrlBand` — Table 37 zero-coefficient-starting-band indices
+    (Band0 = coefficient positions 1–5, Band1 = 6–63) with the
+    spec's canonical 0/1 indexing, an `ALL` array, round-trip
+    `index` / `from_index` accessors, and a
+    `for_coefficient_position` helper that partitions the AC
+    coefficient range into the two bands.
+  - `ZrlNode` — the fourteen Table 38 node indices. The first
+    eight (`0..=7`) name the eight internal nodes of the Figure 16
+    binary tree (`>4`, `>2`, `>1`, `>3`, `>8`, `>6`, `>5`, `>7`) in
+    the spec's canonical order; the remaining six (`8..=13`) name
+    the bit positions of the `(RunLength - 9)` six-bit suffix the
+    BoolCoder path reads when the run is greater than 8, with each
+    extrabit's shift exposed via `extrabit_shift`. `is_tree_node`
+    partitions the fourteen names into the two halves.
+  - `ZERO_RUN_PROB_DEFAULTS[2][14]` — the verbatim
+    `ZeroRunProbDefaults` keyframe initialiser ("At each key frame
+    every probability value in this array of AC Probabilities is
+    set to the multidimensional array ZeroRunProbDefaults").
+  - `ZRL_UPDATE_PROBS[2][14]` — the verbatim `ZrlUpdateProbs`
+    per-node `NewNodeProbFlag` update-flag probability bank (the
+    Table 41 BoolCoder reads themselves stay deferred).
+  - `zrl_bool_tree_to_huff_probs` — the verbatim §13.3.3.2
+    `ZRLBoolTreeToHuffProbs` transform that converts an 8-entry
+    node-probability vector into the 9-entry Huffman probability
+    set the Huffman tree builder consumes (one chain factor per
+    Figure 16 internal-node branch; `>> 8` truncation per the
+    spec's listing; intermediate values held in `u32` so the final
+    narrowing to `u8` is lossless).
+  - `build_zrl_huffman_tree` — composes the §13.3.3.2 pseudo-code
+    pair `ZRLBoolTreeToHuffCodes` + `VP6_BuildHuffTree` for one
+    band. Runs `zrl_bool_tree_to_huff_probs` and then invokes the
+    §7.2 `create_huffman_tree` primitive (already landed in round
+    12) to build a `2N - 1 = 17`-node `HuffNode` tree the §7.2
+    walker can traverse. Zero converted probabilities are floored
+    to `1` so the builder's "probability 0 is forbidden" check
+    doesn't reject the structural tree shape under chain-factor
+    underflow.
+- Tests (27): `ZrlBand` / `ZrlNode` enum-index round-trips +
+  Table 37 / Table 38 ordering invariants; the
+  `for_coefficient_position` partition of AC coefficients 1–63;
+  `extrabit_shift` against Table 38's `>> 0..=5` shifts;
+  `ZERO_RUN_PROB_DEFAULTS` and `ZRL_UPDATE_PROBS` verbatim values
+  per row; `zrl_bool_tree_to_huff_probs` output size; the
+  within-internal-node pair-equality invariant under uniform
+  `[128; 8]` inputs; the asymmetric-tree-depth geometry invariant
+  (the depth-1 `>8` leaf carries the most mass and the four
+  depth-2 left-half leaves outweigh the four depth-3 right-lower
+  leaves); root-extreme zeroing of the opposite subtree;
+  conversion well-formedness on both keyframe-default rows;
+  `build_zrl_huffman_tree` topology invariants (`17`-node total,
+  9 leaves, 8 internal nodes, root at index `2N - 2 = 16`); every
+  canonical symbol 0..=8 reachable from the root via the §7.2
+  walker; round-trip against both keyframe-default rows; canonical
+  Huffman invariant on skewed inputs (the dominant symbol's
+  codeword is no longer than the rare symbol's).
+- Like §15/§16/§17/§11/§12.1/§14/§10/§13/§7.2 this stage reads no
+  BoolCoder bits — every operation is pure integer arithmetic over
+  the supplied probability vector — so it advances the decoder past
+  round 12 without touching the contested §7.3 `Split` formula. The
+  §13.3.3.1 BoolCoder Figure 16 traversal + six-bit extrabit reads
+  remain deferred; the §13.3.3.2 9th-leaf literal-vs-escape
+  semantics (whether `ZrlToken == 8` means a literal run of 8 or
+  the `>8` escape) are reported as a docs-gap candidate (see the
+  module's "What this module does NOT land" section).
+
 ### Added (clean-room round 12, 2026-05-26)
 
 - `huffman` module — the spec §7.2 Huffman tree construction and
