@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 13 (2026-05-29).** The orphan-rebuild
+**Clean-room rebuild — round 14 (2026-05-29).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -452,7 +452,57 @@ implementation is consulted at any stage.
   literal-vs-escape disambiguation is reported as a docs-gap
   candidate for the orchestrator to commission.
 
-### What rounds 1–13 do NOT land
+### What round 14 lands
+
+- `raw_bits` — the spec §3 `R(x)` raw-bit byte-stream reader, the
+  byte-stream substrate underneath the §7.2 Huffman coder (and, once
+  the §7.3 DOCS-GAP is closed, underneath the BoolCoder's `R(8)`
+  refill reads as well). Surfaces:
+  - `RawBitReader<'a>` — thin wrapper around
+    `oxideav_core::bits::BitReader` exposing the §9 Tables 1/2
+    MSB-first `R(n)` convention (the same one
+    `frame_header::Vp6FrameHeader::parse` already consumes).
+    Constructors `new` and `with_byte_offset` (for partition-2 reads
+    where the caller has `Buff2Offset` from §9); bookkeeping accessors
+    `bit_position`, `byte_position`, `bits_remaining`, `is_empty`,
+    `is_byte_aligned`; alignment helper `align_to_byte` for the
+    *"the next field starts at the next byte boundary"* phrasing some
+    §9 entries use.
+  - `read_bit` / `read(n)` — the standard MSB-first `R(1)` / `R(n)`
+    reads. `read(n)` accepts `0..=32` bits per call (the largest
+    single `R(n)` field in the spec is `R(16)` for `Buff2Offset`;
+    §13.3.3 uses at most `R(6)`).
+  - `read_lsb_first(n)` — the explicit *least-significant bit first*
+    variant for the one place the spec inverts that ordering by name:
+    §13.3.3.1 (page 78), *"the run length minus nine is encoded using
+    six-bits, least significant bit first."* The `R(6)` escape suffix
+    the §13.3.3 AC zero-run path reads (in both the BoolCoder and the
+    Huffman entropy schemes — the spec's demonstration pseudo-code is
+    `if (ZrlToken < 8) … else 8 + R(6)`) consumes this.
+  - `read_huffman_symbol(&mut self, tree)` — convenience that drives
+    the §7.2 `huffman::decode_symbol` walk against the byte stream
+    directly, so callers using the §13 token Huffman path or the
+    §13.3.3.2 zero-run Huffman tree don't have to assemble the
+    `R(1)` closure themselves. Both walkers landed parameterised over
+    an `FnMut() -> u8` oracle in rounds 12 and 13 precisely so the
+    byte-stream reader could land independently here.
+  - `RawBitError::{OutOfBits, TooManyBits}` — narrow error type. VP6
+    partitions are bounded byte buffers per §6; reading past the end
+    is a malformed-input condition the decoder surfaces cleanly.
+- The reader implements `Clone + Copy` (it owns nothing but a borrowed
+  slice and a position) so a parser can checkpoint and restore by
+  assignment — useful for partition probes that look ahead without
+  committing.
+- Like §15/§16/§17/§11/§12.1/§14/§10/§13/§7.2 this module reads **no
+  BoolCoder bits** — every operation is plain byte-stream bit
+  arithmetic — so it advances the decoder past round 13 without
+  touching the contested §7.3 `Split` formula. With this round the
+  Huffman path of the §13 DCT-token decoder and the §13.3.3.2
+  zero-run Huffman decoder both have a complete end-to-end data path
+  (modulo the §13.3.3.2 9th-leaf semantics docs-gap noted in round
+  13's `zrl` report).
+
+### What rounds 1–14 do NOT land
 
 - Anything downstream of the BoolCoder switch in the frame header
   (`VFragments`, `HFragments`, scaling, filter selectors,

@@ -6,6 +6,72 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 14, 2026-05-29)
+
+- `raw_bits` module — the spec §3 `R(x)` raw-bit byte-stream reader,
+  the byte-stream substrate underneath the §7.2 Huffman coder (and,
+  once the §7.3 DOCS-GAP is closed, underneath the BoolCoder's `R(8)`
+  refill reads as well). Surfaces:
+  - `RawBitReader<'a>` — a thin wrapper around
+    `oxideav_core::bits::BitReader` exposing the standard `R(n)`
+    MSB-first byte-stream convention used by §9 Tables 1/2 (the same
+    convention `frame_header::Vp6FrameHeader::parse` already consumes).
+    Constructors `RawBitReader::new(bytes)` and
+    `RawBitReader::with_byte_offset(bytes, byte_offset)` (the latter
+    for partition 2 reads where the caller has `Buff2Offset` from
+    §9). Bookkeeping accessors: `bits_remaining`, `bit_position`,
+    `byte_position`, `is_byte_aligned`, `is_empty`. Position control:
+    `align_to_byte` for the *"the next field starts at the next byte
+    boundary"* phrasing some §9 entries use.
+  - `RawBitReader::read_bit() -> Result<u8, RawBitError>` — read one
+    raw bit (`R(1)`), MSB-first, returning the §7.2 walker's expected
+    `0`/`1`.
+  - `RawBitReader::read(n) -> Result<u32, RawBitError>` — read `n`
+    raw bits (`R(n)`, `0 <= n <= 32`) as an unsigned MSB-first integer.
+    Matches the §9 Tables 1/2 convention.
+  - `RawBitReader::read_lsb_first(n)` — the explicit *least-significant
+    bit first* variant for the one place in the spec that overrides
+    the MSB-first byte-stream convention by name: §13.3.3.1 (page 78),
+    *"the run length minus nine is encoded using six-bits, least
+    significant bit first."* The `R(6)` escape suffix the §13.3.3 AC
+    zero-run path reads (in both the BoolCoder and Huffman entropy
+    schemes — the spec's demonstration pseudo-code is
+    `if (ZrlToken < 8) … else 8 + R(6)`) consumes this.
+  - `RawBitReader::read_huffman_symbol(&mut self, tree)` — convenience
+    that wires the byte-stream `R(1)` source straight into the §7.2
+    `huffman::decode_symbol` walk. The Huffman path of §13 token
+    decoding (when the frame header's `UseHuffman == 1`) and the
+    §13.3.3.2 AC zero-run Huffman walker both consume this directly;
+    both landed parameterised over an `FnMut() -> u8` oracle in
+    rounds 12 and 13 precisely so the byte-stream reader could land
+    independently here.
+  - `RawBitError::{OutOfBits, TooManyBits}` — narrow error type. VP6
+    partitions are bounded byte buffers per §6; reading past the end
+    is a malformed-input condition the decoder surfaces cleanly.
+- The reader implements `Clone + Copy` (it owns nothing but a borrowed
+  slice and a position) so a parser can checkpoint-and-restore by
+  assignment — useful for partition probes that look ahead without
+  committing to a read. The `Debug` impl is hand-written because the
+  underlying `BitReader` doesn't derive it.
+- Unit tests (22 new): MSB-first packing of `R(n)`, the §9 Table 1
+  byte-0 layout (`FrameType R(1) | DctQMask R(6) | MultiStream R(1)`)
+  matched against `frame_header::Vp6FrameHeader::parse`'s convention,
+  `read_lsb_first` against an exhaustive `0..=63` round-trip, the
+  §13.3.3.1 escape worked example (`run_length = 17` → 6-bit payload
+  decimal `8`, packed `0b0001_0000`), end-to-end §7.2 Huffman decoding
+  through the byte stream (cross-checked against the closure form of
+  `decode_symbol`), out-of-bits truncation, the `n > 32` rejection,
+  the `n == 0` no-op, byte alignment after partial-byte reads, and the
+  `Copy` checkpoint pattern.
+- Like §15/§16/§17/§11/§12.1/§14/§10/§13/§7.2 this module reads **no
+  BoolCoder bits** — every operation is plain byte-stream bit
+  arithmetic — so it advances the decoder past round 13 without
+  touching the contested §7.3 `Split` formula. With this round the
+  Huffman path of the §13 DCT-token decoder and the §13.3.3.2 zero-run
+  Huffman decoder both have a complete end-to-end data path (modulo
+  the §13.3.3.2 9th-leaf semantics docs-gap noted in round 13's `zrl`
+  report).
+
 ### Added (clean-room round 13, 2026-05-29)
 
 - `zrl` module — the spec §13.3.3 AC zero-run-length static surface

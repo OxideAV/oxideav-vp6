@@ -339,6 +339,34 @@
 //!   §15/§16/§17.1/§11.4/§17.2–§17.4/§11.3/§11.5 this stage advances
 //!   the decoder past round 8 without touching the contested §7.3
 //!   `Split` formula.
+//!
+//! ## Round 14 surface
+//!
+//! * [`raw_bits`] — the spec §3 `R(x)` raw-bit byte-stream reader.
+//!   Surfaces [`raw_bits::RawBitReader`] with `read_bit` / `read(n)`
+//!   for the standard MSB-first `R(n)` convention used by §9
+//!   Tables 1/2 (and consumed today by
+//!   [`frame_header::Vp6FrameHeader::parse`]), plus an explicit
+//!   [`raw_bits::RawBitReader::read_lsb_first`] variant for the one
+//!   place the spec inverts that ordering: §13.3.3.1 (page 78), *"the
+//!   run length minus nine is encoded using six-bits, least
+//!   significant bit first."* Also surfaces
+//!   [`raw_bits::RawBitReader::read_huffman_symbol`], a convenience
+//!   that drives the §7.2 [`huffman::decode_symbol`] walk against the
+//!   byte stream so callers using the §13 / §13.3.3.2 Huffman paths
+//!   don't have to assemble the `R(1)` closure themselves. This is
+//!   the byte-stream substrate the round-12 §7.2 Huffman walker and
+//!   the round-13 §13.3.3.2 Huffman zero-run tree both consume; both
+//!   landed parameterised over an `FnMut() -> u8` source precisely so
+//!   the byte-stream reader could land independently. With this round
+//!   the Huffman path of the §13 token decoder and the §13.3.3.2
+//!   zero-run decoder both have a complete end-to-end data path
+//!   (modulo the §13.3.3.2 9th-leaf semantics docs-gap noted in
+//!   round 13's `zrl` report). Like
+//!   §15/§16/§17/§11/§12.1/§14/§10/§13/§7.2 this module reads **no
+//!   BoolCoder bits** — every operation is bit-level byte-stream
+//!   arithmetic — so it advances the decoder past round 13 without
+//!   touching the contested §7.3 `Split` formula.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -354,6 +382,7 @@ pub mod inter;
 pub mod interp;
 pub mod loopfilter;
 pub mod modes;
+pub mod raw_bits;
 pub mod reconstruct;
 pub mod scan;
 pub mod tokens;
@@ -388,6 +417,7 @@ pub use modes::{
     NEAR_MACROBLOCKS, NUM_CODING_MODES, NUM_MODE_DECISION_NODES, NUM_MODE_VQ_VECTORS,
     NUM_PROBABILITY_SITUATIONS, PROB_XMITTED_ROW_LEN, VP6_BASELINE_XMITTED_PROBS, VP6_MODE_VQ,
 };
+pub use raw_bits::{RawBitError, RawBitReader};
 pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};
 pub use scan::{
     raster_to_zigzag_block, zigzag_to_raster_block, DEFAULT_SCAN_ORDER,
