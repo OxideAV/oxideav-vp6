@@ -6,6 +6,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-vp6/releases/tag/v0.0.7) - 2026-05-30
+
+### Other
+
+- round 15: §7.3 BoolCoder primitive (decode_bool + b(n) + init) per errata #35
+- round 14: §3 R(n) raw-bit byte-stream reader + Huffman driver
+- round 13: §13.3.3 AC zero-run static surface + §13.3.3.2 Huffman conversion
+- round 12: §7.2 Huffman tree construction + traversal
+- §13 DCT-token static surface (BoolCoder-independent half)
+- round 10: §10 mode-decoding static surface (Table 4/5, NEAR_MACROBLOCKS, baseline+VQ probs, ModeDecisionTree builder)
+- round 9: §12.1 default zig-zag scan order + §14 DC prediction
+- round 8: §11.5 Unrestricted Motion Vector borders
+- round 7: §11.3 prediction loop filter
+- round 6 — §17.2/§17.3/§17.4 inter-block reconstruction + §11.4 MV decomposition
+- §11.4 fractional-pixel interpolation filters (round 5)
+- §17.1 intra block reconstruction (round 4)
+- inverse DCT transform (spec §16)
+- round 2: inverse-quantization layer (spec §15)
+- round 1: frame-header raw-bit prefix parser
+- orphan rebuild: clean-room scaffold post 2026-05-18 audit
+
 ### Added (clean-room round 15, 2026-05-30)
 
 - `bool_coder` module — the spec §7.3 binary arithmetic decoder
