@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 14 (2026-05-29).** The orphan-rebuild
+**Clean-room rebuild — round 15 (2026-05-30).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -502,20 +502,60 @@ implementation is consulted at any stage.
   (modulo the §13.3.3.2 9th-leaf semantics docs-gap noted in round
   13's `zrl` report).
 
-### What rounds 1–14 do NOT land
+### What round 15 lands
 
-- Anything downstream of the BoolCoder switch in the frame header
-  (`VFragments`, `HFragments`, scaling, filter selectors,
-  `UseHuffman`), plus mode/MV decoding and DCT-token decoding — every
-  one of these is `b(n)`/`B(x)`/`T` BoolCoder-coded. Blocked on a
-  DOCS-GAP against spec §7.3 — the
-  `Split = 1 + (((Range-1) * Probability) >> 7)` formula collapses
-  the prob-128 (`b(n)`) decoder path to always-0 (the `Bit=1` branch
-  yields `Range == 0`, a dead coder) and overflows `u32` when
-  `Probability > 128`. The fix is either a confirmation that `>> 7`
-  is correct alongside an encoder-side mapping explanation, or a
-  correction to `>> 8` (matching the VPx-family arithmetic coder
-  pattern). See the crate-root docs for the full report.
+- `bool_coder` module / `BoolCoder` struct — the spec §7.3 binary
+  arithmetic decoder, landing the primitive every remaining
+  BoolCoder-coded layer (frame-header tail, §10 mode decoding,
+  §11 motion-vector decoding, §13 DCT-token decoding, §13.3.3.1
+  AC zero-run-length decoding) depends on. Surfaces:
+  - `BoolCoder::new(bytes)` — `VP6_StartDecode`: 4-byte big-endian
+    prefill of `Value`, `Range = 255`, `Count = 8`, `Pos = 4`.
+    `Error::Truncated` for `bytes.len() < 4`.
+  - `BoolCoder::decode_bool(probability) -> Result<u8, Error>` — the
+    spec §7.3 `VP6_DecodeBool` per-bit step
+    (`Split = 1 + ( ((Range-1) * Probability) >> 7 )`, branch on
+    `Value < (Split << 24)`, update `Range`/`Value`, then run the
+    renormalization loop pulling fresh bytes via `Pos`). The §3
+    `B(x)` primitive every §10/§11/§13 tree walk consumes.
+  - `BoolCoder::decode_b1() -> Result<u8, Error>` — single
+    fixed-probability-128 bit (§3 `b(1)`).
+  - `BoolCoder::decode_b(n) -> Result<u32, Error>` — `n`-bit
+    fixed-probability-128 raw read (§3 `b(n)`), accumulated
+    most-significant-bit first so the bit ordering matches §3
+    `R(n)`.
+  - Diagnostic accessors `range` / `value` / `count` / `pos` for
+    test introspection.
+- The previous DOCS-GAP block (rounds 1–14) flagged what looked like
+  a self-contradiction in the §7.3 `Split` formula: at
+  `Probability = 128, Range = 255` the formula evaluates to
+  `Split = 255 = Range`, which makes the 0-branch unconditional and
+  collapses every `b(n)` read to zero. The newly-staged clean-room
+  errata `docs/video/vp6/vp6-errata-and-clarifications.md` entry
+  **#35** resolves the gap: the `>> 7` is correct and intentional
+  precisely because it makes probability 128 the half-interval
+  point, exactly what a binary arithmetic coder's fixed-probability
+  `b(x)` reads require. The `Split = 255` edge case is the natural
+  half-interval boundary, not a defect — when `Value < 0xFF00_0000`
+  (i.e. its top byte is below `0xFF`) the bit decodes to 0; otherwise
+  the 1-branch fires. The formula is bit-exact as printed; only the
+  unsigned-integer evaluation order ("multiply → shift-by-7 → add-1")
+  needed pinning down.
+- Like §15/§16/§17/§11/§12.1/§14/§10/§13/§7.2/§3 this module reads
+  only the staged spec PDF and the staged clean-room errata. No
+  third-party VP6 implementation has been consulted.
+
+### What round 15 does NOT land
+
+- The BoolCoder-gated payload parsers themselves: the §10
+  `VP6_DecodeMode` mode-tree walk, the §11 motion-vector decoder,
+  the §13 DCT-token tree walk, and the §13.3.3.1 AC zero-run
+  BoolCoder traversal. These are the immediate beneficiaries of
+  the b(n) primitive and the natural targets for subsequent rounds;
+  every one of them depends on the BoolCoder landed here.
+- Errata #67's §13 Table 18 `DCT_VAL_CATEGORY6` off-by-one
+  resolution. That entry is separate to #35 and lands as part of
+  a future §13.2 / §13.3 round.
 
 ## License
 

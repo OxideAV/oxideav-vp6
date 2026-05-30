@@ -47,55 +47,13 @@
 //!   Its initialization (`VP6_StartDecode`) and normalization are
 //!   unambiguous, but the per-bit `Split` step is blocked.
 //!
-//! See the `DOCS-GAP` section below for the spec defect blocking that
-//! step.
+//! See the round-15 surface below for the BoolCoder primitive that
+//! closes the previous DOCS-GAP about the §7.3 `Split` formula.
 //!
-//! ## DOCS-GAP: spec §7.3 BoolCoder Split formula
-//!
-//! `vp6_format.pdf` p. 15 defines the per-bit `Split` value as:
-//!
-//! ```text
-//! Split = 1 + ( ((Range-1) * Probability) >> 7 )
-//! ```
-//!
-//! with `Probability` in `1..=255` and `Range` in `0..=255` (post-
-//! normalisation `Range >= 128`). With `Range = 255` and
-//! `Probability = 128` (the value the spec's `b(x)` notation uses for
-//! every fixed-prior raw bit) this evaluates to
-//! `1 + ((254 * 128) >> 7) = 1 + 254 = 255`, i.e. `Split == Range`.
-//!
-//! The decode then compares `Value < (Split << 24)`. With `Split =
-//! 255` that's `Value < 0xFF00_0000`, which is true for any
-//! post-normalisation `Value` strictly less than `Range << 24 =
-//! 0xFF00_0000`. The 0-branch is unconditionally taken; `Range` stays
-//! at 255; no normalisation occurs; `Value` is unchanged; **the next
-//! call returns the same state and the same 0-bit**, indefinitely.
-//!
-//! Empirically, all `b(n)` reads collapse to all-zeros, which can't
-//! be what the encoder is producing for non-zero frame headers.
-//!
-//! Symmetric breakage at the other end of the range: `Probability =
-//! 255` gives `Split = 1 + ((254 * 255) >> 7) = 507`, and
-//! `Split << 24` overflows `u32`.
-//!
-//! Both symptoms vanish if `>> 7` is replaced by `>> 8`
-//! (`Split = Range/2` at `Probability = 128`; `Split <= Range` for all
-//! valid probabilities), which is the formula used in other binary
-//! arithmetic coders in the VPx family.
-//!
-//! This is a spec **defect**, not a silence: §7.3 gives an explicit
-//! formula, but that formula is provably self-contradictory against
-//! the spec's own `b(x)` fixed-prob-128 raw-bit reads. We deliberately
-//! **do not** "guess" the `>> 8` fix per the workspace "ask for docs,
-//! don't fish" rule. The BoolCoder-coded layers (frame-header tail,
-//! mode/MV decoding, DCT-token decoding) stay blocked on a docs patch
-//! clarifying the Split formula — either confirming `>> 7` is correct
-//! (and explaining the encoder-side mapping that makes it work) or
-//! correcting it to `>> 8`.
-//!
-//! Round 2 worked **around** the block by landing the inverse-
-//! quantization layer (spec §15, [`DequantContext`]), which is driven
-//! solely by the raw-bit `DctQMask` and never calls `VP6_DecodeBool`.
+//! Round 2 worked **around** the (then-) blocked BoolCoder by landing
+//! the inverse-quantization layer (spec §15, [`DequantContext`]),
+//! which is driven solely by the raw-bit `DctQMask` and never calls
+//! `VP6_DecodeBool`.
 //!
 //! ## Round 3 surface
 //!
@@ -367,12 +325,58 @@
 //!   BoolCoder bits** — every operation is bit-level byte-stream
 //!   arithmetic — so it advances the decoder past round 13 without
 //!   touching the contested §7.3 `Split` formula.
+//!
+//! ## Round 15 surface — §7.3 BoolCoder primitive
+//!
+//! * [`bool_coder`] / [`BoolCoder`] — the spec §7.3 binary arithmetic
+//!   decoder: `VP6_StartDecode` (the four-byte big-endian prefill of
+//!   `Value`, `Range = 255`, `Count = 8`, `Pos = 4`), `VP6_DecodeBool`
+//!   (the `Split = 1 + ( ((Range-1) * Probability) >> 7 )` per-bit
+//!   step), and the renormalization loop that doubles `Range`/`Value`
+//!   while `Range < 128` and pulls fresh bytes when `Count` reaches
+//!   zero. Surfaces three call shapes for the §10/§11/§13 consumers:
+//!   [`BoolCoder::decode_bool`] (single bit at arbitrary node
+//!   probability; the §3 `B(x)` primitive and what the §10 mode-tree
+//!   walk, §11 motion-vector decoder, and §13 DCT-token tree-walks
+//!   will consume), [`BoolCoder::decode_b1`] (single fixed-probability-
+//!   128 bit; the §3 `b(1)` primitive), and [`BoolCoder::decode_b`]
+//!   (multi-bit fixed-probability-128 raw read; the §3 `b(n)`
+//!   primitive accumulating MSB-first so the bit ordering matches
+//!   §3 `R(n)`).
+//!
+//!   The earlier DOCS-GAP block in the round-1/2 commentary documented
+//!   what looked like a self-contradiction in the §7.3 `Split` formula:
+//!   at `Probability = 128, Range = 255` the formula evaluates to
+//!   `Split = 255 = Range`, which makes the 0-branch unconditional and
+//!   collapses every `b(n)` read to zero. The newly-staged
+//!   `docs/video/vp6/vp6-errata-and-clarifications.md` entry **#35**
+//!   resolves the gap by clean-room analysis: the `>> 7` (divide by
+//!   128) is correct and intentional precisely because it makes
+//!   probability 128 the half-interval point — exactly what the
+//!   spec's `b(x)` notation requires. The `Split == Range` edge case
+//!   at `Probability = 128, Range = 255` is statistically the
+//!   half-interval boundary; it does collapse to the 0-branch when
+//!   `Value < 0xFF00_0000`, which is the correct half-probability-128
+//!   semantics for a `Value` whose top byte is below `0xFF`. The
+//!   formula is bit-exact as printed; only the spec's evaluation
+//!   order ("multiply → shift-by-7 → add-1", unsigned integer) needed
+//!   pinning down.
+//!
+//!   The §7.3 BoolCoder primitive is what every remaining BoolCoder-
+//!   coded layer in the codec (frame-header tail, §10 mode decoding,
+//!   §11 motion-vector decoding, §13 DCT-token decoding, §13.3.3.1
+//!   AC zero-run-length decoding) depends on; landing it unblocks
+//!   all of those for later rounds. Like §15/§16/§17/§11.3-§11.5/
+//!   §12.1/§14/§10/§13/§7.2, this module reads only the staged spec
+//!   PDF and the staged clean-room errata clarifications. No
+//!   third-party VP6 implementation was consulted.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
 
 use oxideav_core::RuntimeContext;
 
+pub mod bool_coder;
 pub mod dc_pred;
 pub mod dequant;
 pub mod frame_header;
@@ -389,6 +393,7 @@ pub mod tokens;
 pub mod umv;
 pub mod zrl;
 
+pub use bool_coder::BoolCoder;
 pub use dc_pred::{
     average_both_neighbours, sign as dc_sign, DcPredictionContext, Neighbour, ReferenceBucket,
 };

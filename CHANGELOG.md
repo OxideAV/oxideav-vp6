@@ -6,6 +6,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 15, 2026-05-30)
+
+- `bool_coder` module — the spec §7.3 binary arithmetic decoder
+  (`BoolCoder`). Surfaces:
+  - `BoolCoder::new(bytes)` — `VP6_StartDecode`: 4-byte big-endian
+    prefill of `Value`, `Range = 255`, `Count = 8`, `Pos = 4`.
+    Returns `Error::Truncated` if `bytes.len() < 4`.
+  - `BoolCoder::decode_bool(probability) -> Result<u8, Error>` —
+    the §7.3 `VP6_DecodeBool` per-bit step
+    (`Split = 1 + ( ((Range-1) * Probability) >> 7 )`, branch on
+    `Value < (Split << 24)`, update `Range`/`Value`, then run the
+    renormalization loop pulling fresh bytes via `Pos`). The §3
+    `B(x)` primitive.
+  - `BoolCoder::decode_b1() -> Result<u8, Error>` — single
+    fixed-probability-128 bit (§3 `b(1)`).
+  - `BoolCoder::decode_b(n) -> Result<u32, Error>` — `n`-bit
+    fixed-probability-128 raw read (§3 `b(n)`), MSB-first so the
+    bit order matches §3 `R(n)`. Saturates at `n = 32`.
+  - `range`, `value`, `count`, `pos` diagnostic accessors.
+- Resolves the prior DOCS-GAP about the §7.3 `Split` formula. The
+  newly-staged clean-room errata
+  `docs/video/vp6/vp6-errata-and-clarifications.md` entry **#35**
+  confirms `>> 7` (divide by 128) is correct and intentional
+  precisely because it makes `Probability = 128` the half-interval
+  point — exactly what binary-arithmetic-coder semantics for §3
+  `b(x)` require. The crate-root DOCS-GAP block is removed and
+  replaced with a round-15 "§7.3 BoolCoder primitive" summary.
+- 13 new tests exercising: §7.3 `VP6_StartDecode` initial state
+  (big-endian prefill, `Range = 255`, `Count = 8`, `Pos = 4`);
+  `Error::Truncated` rejection of streams shorter than 4 bytes; the
+  all-zero-stream zero-bit invariant across multiple probabilities;
+  the errata #35 canonical half-interval Split value
+  (`Probability = 128, Range = 255 → Split = 255`); the small-Split
+  renormalization shift (`Probability = 1, Range = 255 → Split = 2`);
+  a fully-traced renormalization byte-pull sequence (Range / Value /
+  Count / Pos at each step); `decode_b` MSB-first accumulation
+  matching repeated `decode_b1` calls; the `decode_b(0)` no-op;
+  `decode_b` saturation at 32 bits; `Truncated` propagation from
+  both single-bit and multi-bit reads; and bit-stream-input
+  determinism.
+
 ### Added (clean-room round 14, 2026-05-29)
 
 - `raw_bits` module — the spec §3 `R(x)` raw-bit byte-stream reader,
