@@ -258,27 +258,29 @@ impl DctToken {
     }
 
     /// The per-extrabit arithmetic-coding probabilities (§13 Table 18,
-    /// "Arithmetic Encoding the Extra Bits"), verbatim.
+    /// "Arithmetic Encoding the Extra Bits"), verbatim as printed.
     ///
     /// This is the spec's `TokenSetExtrabits[token].Probs` field, which
     /// §13.2.1 defines as "an array made from concatenating the choices
     /// in field 'Arithmetic Encoding the Extra Bits'". Tokens with no
     /// value field (`ZERO_TOKEN`, `EOB_TOKEN`) return an empty slice.
     ///
-    /// **Length note (spec discrepancy):** for every token except
-    /// `DCT_VAL_CATEGORY6` this list's length equals
-    /// [`DctToken::extra_bits`] (the "# of extrabits, incl. sign"
-    /// column), and its final entry is `B(128)` — the sign prior.
-    /// `DCT_VAL_CATEGORY6` lists **11** probabilities against an
-    /// `extra_bits` of **12**: its magnitude spans 67..=2114 (2048
-    /// values → 11 magnitude bits) plus a sign. The §13.2.1 magnitude
-    /// loop (`BitsCount = ExtraBits - 1; … Probs[BitsCount] …`) would
-    /// read `Probs[11]` for `CATEGORY6`, one past this 11-entry array,
-    /// before the separate `SignBit = b(1)`. Reconciling that off-by-
-    /// one is part of the **deferred** `VP6_DecodeToken` traversal
-    /// (BoolCoder-gated by the §7.3 DOCS-GAP); this accessor reports
-    /// the two table columns exactly as printed, leaving the traversal
-    /// to interpret them once unblocked.
+    /// **Length note:** for every token except `DCT_VAL_CATEGORY6` this
+    /// list's length equals [`DctToken::extra_bits`] (the "# of
+    /// extrabits, incl. sign" column), and its final entry is `B(128)`
+    /// — the sign prior. `DCT_VAL_CATEGORY6` lists **11** probabilities
+    /// against an `extra_bits` of **12**: its magnitude spans 67..=2114
+    /// (2048 values → 11 magnitude bits) plus a sign.
+    ///
+    /// The errata-#67 corrected reading (resolved in
+    /// `docs/video/vp6/vp6-errata-and-clarifications.md`) is that
+    /// `CATEGORY6` is the only internally consistent row — every other
+    /// row's trailing `B(128)` is the spurious sign prior, which is
+    /// actually decoded separately by a fixed `b(1)`. Callers that
+    /// drive the §13.2.1 / §13.3.1 magnitude loop should use
+    /// [`DctToken::magnitude_probs`] instead, which surfaces the
+    /// `#ExtraBits − 1` magnitude-only probabilities; this accessor
+    /// preserves the as-printed columns for callers that need them.
     #[inline]
     pub const fn extra_bit_probs(self) -> &'static [u8] {
         match self {
@@ -290,6 +292,46 @@ impl DctToken {
             Self::Category3 => &[173, 148, 140, 128],
             Self::Category4 => &[176, 155, 140, 135, 128],
             Self::Category5 => &[180, 157, 141, 134, 130, 128],
+            Self::Category6 => &[254, 254, 243, 230, 196, 177, 153, 140, 133, 129, 128],
+        }
+    }
+
+    /// The per-magnitude-bit arithmetic-coding probabilities for the
+    /// §13.2.1 / §13.3.1 traversal loop (errata #67 corrected reading).
+    ///
+    /// Equal to [`DctToken::extra_bit_probs`] with the trailing
+    /// sign-prior `B(128)` stripped for `CATEGORY1..CATEGORY5` and for
+    /// `ONE_TOKEN..FOUR_TOKEN`; for `CATEGORY6` the as-printed
+    /// 11-entry slice is already the magnitude-only set. The list's
+    /// length is therefore `#ExtraBits − 1` for every category token,
+    /// and zero for `ONE..FOUR` (whose magnitudes are constants) and
+    /// for `ZERO_TOKEN` / `EOB_TOKEN`. The slice is **MSB-first** as
+    /// printed in Table 18: entry 0 is the highest-order magnitude
+    /// bit, the last entry is the lowest. The §13.2.1 listing reads
+    /// it in reverse (`BitsCount = ExtraBits − 1` downwards), so a
+    /// caller indexes `Probs[BitsCount]` directly when accumulating
+    /// the magnitude.
+    ///
+    /// See `docs/video/vp6/vp6-errata-and-clarifications.md` entry
+    /// **#67** for the full derivation.
+    #[inline]
+    pub const fn magnitude_probs(self) -> &'static [u8] {
+        match self {
+            // No magnitude bits to decode: ZERO/EOB carry no value;
+            // ONE..FOUR carry a single sign-only extrabit (handled by
+            // the caller's separate `b(1)` sign read).
+            Self::Zero | Self::EndOfBlock => &[],
+            Self::One | Self::Two | Self::Three | Self::Four => &[],
+            // CATEGORY1..CATEGORY5: strip the trailing sign prior; the
+            // remaining N-1 entries are the MSB-first magnitude bits.
+            Self::Category1 => &[159],
+            Self::Category2 => &[165, 145],
+            Self::Category3 => &[173, 148, 140],
+            Self::Category4 => &[176, 155, 140, 135],
+            Self::Category5 => &[180, 157, 141, 134, 130],
+            // CATEGORY6: the printed 11-entry slice is already
+            // magnitude-only (errata #67); no trailing sign prior to
+            // strip.
             Self::Category6 => &[254, 254, 243, 230, 196, 177, 153, 140, 133, 129, 128],
         }
     }

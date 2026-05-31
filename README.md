@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 15 (2026-05-30).** The orphan-rebuild
+**Clean-room rebuild — round 16 (2026-06-01).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -556,6 +556,69 @@ implementation is consulted at any stage.
 - Errata #67's §13 Table 18 `DCT_VAL_CATEGORY6` off-by-one
   resolution. That entry is separate to #35 and lands as part of
   a future §13.2 / §13.3 round.
+
+### What round 16 lands
+
+- `dct_decode` module — the first BoolCoder-consuming layer, the
+  spec §13.2.1 arithmetic DC coefficient decoder. Surfaces:
+  - `decode_dc_token(bc, &node_probs)` — the Figure 15 binary-tree
+    walk down to a [`DctToken`] leaf, **DC variant**: the §13.2.1
+    listing's `if (!B(ZERO_CONTEXT_NODE))` root + the value subtree
+    descent through `ONE_CONTEXT_NODE`, `LOW_VAL_CONTEXT_NODE`,
+    `HIGH_LOW_CONTEXT_NODE`, `CAT_THREEFOUR_CONTEXT_NODE`,
+    `CAT_FIVE_CONTEXT_NODE`, `CAT_THREE_CONTEXT_NODE`,
+    `CAT_ONE_CONTEXT_NODE`, `TWO_CONTEXT_NODE`,
+    `THREE_CONTEXT_NODE`. Never returns `DctToken::EndOfBlock` (the
+    DC tree forbids EOB, per §13.2 + the `DcNodeEqs` dummy row).
+  - `decode_token_value(bc, token)` — the magnitude-loop + sign
+    decode shared between §13.2.1 and §13.3.1. Reads `#ExtraBits − 1`
+    magnitude bits (the errata-#67 corrected count) MSB-first using
+    `DctToken::magnitude_probs`, then a separate fixed-probability-128
+    sign bit, then reconstructs the signed coefficient via the
+    `(value ^ -SignBit) + SignBit` identity. Short-cuts the
+    `ONE_TOKEN..FOUR_TOKEN` constant-magnitude cases (no magnitude
+    bits, sign only).
+  - `decode_dc(bc, &node_probs)` — the full §13.2.1 wrapper:
+    [`decode_dc_token`] followed by [`decode_token_value`], returning
+    the signed `Dc` per the listing's final `Dc = ((value ^ -SignBit)
+    + SignBit)`.
+- `DctToken::magnitude_probs()` — the errata-#67 corrected
+  magnitude-only probability slice (`#ExtraBits − 1` entries,
+  trailing sign-prior `B(128)` stripped from `CATEGORY1..CATEGORY5`
+  and from `ONE..FOUR`; `CATEGORY6`'s as-printed 11-entry slice is
+  already magnitude-only). The legacy `extra_bit_probs` accessor is
+  preserved verbatim for callers that need the as-printed Table 18
+  column, with its docstring updated to point at the new accessor
+  for the magnitude-loop traversal.
+- 19 new unit tests pinning: the §13.2.1 zero-token short-circuit;
+  the per-token magnitude-bit count vs the value range
+  (`2^magnitude_bits = max - min + 1`); the MSB-first magnitude
+  reading (all-zero stream → +min_value for every category); the
+  constant-magnitude tokens' `+1..+4` output against the all-zero
+  stream; the determinism + `decode_dc = walk + value` composition
+  guarantees; the truncation surface on a 4-byte stream; the
+  sign-reconstruction identity; and the structural "DC walk never
+  returns EOB" property over a sweep of `node_probs` corners.
+- Like §15/§16/§17/§11/§12.1/§14/§10/§13/§7.2/§3/§7.3, this module
+  reads only the staged spec PDF and the staged clean-room errata.
+  No third-party VP6 implementation has been consulted.
+
+### What round 16 does NOT land
+
+- The §13.3.1 AC arithmetic decoder. The tree walk + magnitude loop
+  landed here is the substrate the AC path shares, but AC adds an
+  `EOB_CONTEXT_NODE` branch above the same tree plus the
+  "implicitly-1" first-decision shortcut when the preceding AC
+  coefficient was zero, and on a `ZERO_TOKEN` leaf transitions into
+  the §13.3.3 zero-run-length decoder. Wiring those AC-specific
+  branches + the §13.3.3 zero-run integration is the immediate
+  next-round target.
+- The §13.2 / §13.3 per-frame probability **update** bitstream
+  (Tables 22–24 / 31–35). That layer drives the per-frame
+  `DcProbs` / `AcProbs` adaptation via `B(NewNodeProbFlag)` reads
+  and a conditional `b(7)` `NewNodeProbValue`, both BoolCoder-coded;
+  it stays deferred behind the round-15 BoolCoder primitive's
+  reach.
 
 ## License
 

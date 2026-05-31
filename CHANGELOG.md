@@ -6,6 +6,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 16, 2026-06-01)
+
+- `dct_decode` module — the first BoolCoder-consuming layer: the
+  spec §13.2.1 arithmetic DC coefficient decoder. Surfaces:
+  - `decode_dc_token(bc, &node_probs)` — the Figure 15 binary-tree
+    walk down to a `DctToken` leaf (DC variant, never returns EOB).
+  - `decode_token_value(bc, token)` — the magnitude-loop + sign
+    decode shared between §13.2.1 and §13.3.1 (reads `#ExtraBits − 1`
+    magnitude bits MSB-first per errata #67, then a separate
+    fixed-prob-128 `b(1)` sign, then reconstructs the signed value via
+    `(value ^ -SignBit) + SignBit`).
+  - `decode_dc(bc, &node_probs)` — full §13.2.1 wrapper returning
+    the signed DC coefficient.
+- `DctToken::magnitude_probs()` — the errata-#67 corrected
+  magnitude-only probability slice (length `#ExtraBits − 1`).
+  Legacy `extra_bit_probs()` accessor preserved verbatim with its
+  docstring updated to point at the new accessor for the
+  magnitude-loop traversal.
+- 19 new unit tests pinning the §13.2.1 walk's behaviour: the
+  zero-token short-circuit; per-token magnitude-bit count vs value
+  range; MSB-first magnitude reading via all-zero-stream traces
+  (every category returns +min_value); the constant-magnitude
+  tokens' +1..+4 short-cuts; determinism + composition guarantees
+  (`decode_dc = decode_dc_token + decode_token_value`); the
+  truncation surface on a 4-byte stream + low-prob walks; the
+  sign-reconstruction identity; and the structural "DC walk never
+  returns EOB" property over a sweep of `node_probs` corners.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-vp6/releases/tag/v0.0.7) - 2026-05-30
 
 ### Other

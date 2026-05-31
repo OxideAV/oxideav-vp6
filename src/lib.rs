@@ -370,6 +370,34 @@
 //!   §12.1/§14/§10/§13/§7.2, this module reads only the staged spec
 //!   PDF and the staged clean-room errata clarifications. No
 //!   third-party VP6 implementation was consulted.
+//!
+//! ## Round 16 surface — §13.2.1 arithmetic DC decoder
+//!
+//! * [`dct_decode`] — the first BoolCoder-consuming layer: the §13.2.1
+//!   arithmetic DC decoder. Surfaces [`decode_dc_token`] (the Figure 15
+//!   binary-tree walk down to a leaf [`DctToken`], DC variant — never
+//!   returns EOB), [`decode_token_value`] (the magnitude-loop + sign
+//!   read for the value-carrying tokens, driven by the
+//!   errata-#67-corrected `magnitude_probs` slice with length
+//!   `#ExtraBits − 1`), and [`decode_dc`] (the §13.2.1 full wrapper
+//!   that combines them and returns the signed DC coefficient).
+//!
+//!   This is the round-15 BoolCoder primitive's first concrete
+//!   consumer — it confirms the §7.3 errata-#35 disambiguation in
+//!   end-to-end traversal against the §13 static surfaces landed in
+//!   rounds 10–14. The §13.3.1 AC path adds an `EOB_CONTEXT_NODE`
+//!   branch above the same binary tree (plus the "implicitly-1"
+//!   first-decision shortcut when the previous AC coefficient was
+//!   zero) and on a `ZERO_TOKEN` leaf transitions into the §13.3.3
+//!   zero-run-length decoder; the tree-walk substrate that the AC
+//!   path will share is the same [`decode_token_value`] /
+//!   [`decode_dc_token`] kernel landed here, with the AC-specific
+//!   branching and §13.3.3 zero-run integration deferred to a later
+//!   round. The newly-staged errata #67 also corrects every prior
+//!   round's `magnitude_probs` reading: the prior `extra_bit_probs`
+//!   accessor stays available for callers that want the as-printed
+//!   Table 18 columns, but the magnitude-loop traversal uses the new
+//!   accessor.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -378,6 +406,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod bool_coder;
 pub mod dc_pred;
+pub mod dct_decode;
 pub mod dequant;
 pub mod frame_header;
 pub mod huffman;
@@ -397,6 +426,7 @@ pub use bool_coder::BoolCoder;
 pub use dc_pred::{
     average_both_neighbours, sign as dc_sign, DcPredictionContext, Neighbour, ReferenceBucket,
 };
+pub use dct_decode::{decode_dc, decode_dc_token, decode_token_value};
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
 pub use huffman::{
