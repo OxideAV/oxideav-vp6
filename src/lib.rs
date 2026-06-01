@@ -398,6 +398,57 @@
 //!   accessor stays available for callers that want the as-printed
 //!   Table 18 columns, but the magnitude-loop traversal uses the new
 //!   accessor.
+//!
+//! ## Round 17 surface — §13.3.1 arithmetic AC decoder
+//!
+//! * [`dct_decode::decode_ac_token`] / [`dct_decode::decode_ac_coefficient`]
+//!   — the §13.3.1 per-coefficient AC arithmetic decoder, the second
+//!   BoolCoder-consuming layer. The AC tree differs from the §13.2.1
+//!   DC tree on two counts: it adds an `EOB_CONTEXT_NODE` branch
+//!   above the `ZERO_CONTEXT_NODE` root so a left turn distinguishes
+//!   end-of-block from a zero coefficient (the DC variant forbids
+//!   EOB by spec), and it implements the §13.3.1 "implicitly-1"
+//!   first-decision shortcut for the case
+//!   `(EncodedCoeffs > 1) && (Prec == 0)` — when the previously-
+//!   decoded AC coefficient in the current scan order was a
+//!   ZERO_TOKEN, the next coefficient is structurally forbidden from
+//!   being either `ZERO_TOKEN` or `EOB_TOKEN`, so the root decision
+//!   is implicitly `1` and the walk starts at `ONE_CONTEXT_NODE`.
+//!   [`AcOutcome`] surfaces the three-way per-step result the spec's
+//!   pseudo-code distinguishes: `EndOfBlock` (exits the per-block
+//!   loop), `ZeroRun` (hands off to §13.3.3's zero-run decoder), or
+//!   `Value { coeff, next_prec }` (carries a signed AC coefficient
+//!   and the §13.3.1 `Prec` update for the next position — `WasOne`
+//!   for magnitude 1, `WasGreaterThanOne` otherwise). The signed
+//!   reconstruction reuses the round-16 [`decode_token_value`]
+//!   magnitude-loop + sign kernel; the magnitude-only probability
+//!   slice (errata #67) and the §13.2.1/§13.3.1 sign read are
+//!   identical between the two paths.
+//!
+//! * Companion static surface in [`tokens`]: [`AcBand`] (Table 30,
+//!   six AC bands with `for_coefficient_position(usize) -> Option<AcBand>`
+//!   that returns the §13.3.1 `AcProbBand[encodedCoeffs]` band index
+//!   the walk reads), [`AcPlane`] (Table 28, Y / UV), and
+//!   [`AcPrecContext`] (Table 29, `WasZero` / `WasOne` /
+//!   `WasGreaterThanOne` plus a `seed_from_dc(dc: i32)` constructor
+//!   for the very-first-AC case). These let callers select the
+//!   correct row of [`AC_UPDATE_PROBS`] without hand-coded literal
+//!   indices.
+//!
+//! What round 17 deliberately does **not** land: the §13.3.3.1
+//! BoolCoder Figure 16 zero-run-length traversal itself (the
+//! static surface is already in [`zrl`], but the per-bit
+//! `B(prob)` walk + the six `(RunLength - 9)` extrabit reads are a
+//! separate logical unit — `decode_ac_coefficient` surfaces a
+//! `ZeroRun` outcome the caller routes into that decoder once
+//! landed), the per-frame Table 31–35 AC probability update
+//! bitstream, and the surrounding per-block driver that ties
+//! coefficient positions to scan-order updates of `Prec` (the
+//! `EncodedCoeffs ++` / `do { … } while (EncodedCoeffs < 64)`
+//! envelope from §13.3.1). The first AC coefficient seeding of
+//! `Prec` from the §13.2-decoded DC value is exposed via
+//! [`AcPrecContext::seed_from_dc`] so a future driver round can wire
+//! the DC → first-AC handoff without re-reading the spec.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -426,7 +477,10 @@ pub use bool_coder::BoolCoder;
 pub use dc_pred::{
     average_both_neighbours, sign as dc_sign, DcPredictionContext, Neighbour, ReferenceBucket,
 };
-pub use dct_decode::{decode_dc, decode_dc_token, decode_token_value};
+pub use dct_decode::{
+    decode_ac_coefficient, decode_ac_token, decode_dc, decode_dc_token, decode_token_value,
+    AcOutcome,
+};
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
 pub use huffman::{
@@ -460,9 +514,9 @@ pub use scan::{
 };
 pub use tokens::{
     baseline_ac_probs, baseline_dc_probs, dc_probs_to_node_contexts,
-    dct_token_bool_tree_to_huff_probs, DctToken, TreeNode, AC_UPDATE_PROBS, DC_NODE_EQS,
-    NUM_AC_BANDS, NUM_AC_PREC_CONTEXTS, NUM_DCT_TOKENS, NUM_DC_CONTEXTS, NUM_DC_NODE_EQS,
-    NUM_PLANES, NUM_TREE_NODES, VP6_DC_UPDATE_PROBS,
+    dct_token_bool_tree_to_huff_probs, AcBand, AcPlane, AcPrecContext, DctToken, TreeNode,
+    AC_UPDATE_PROBS, DC_NODE_EQS, NUM_AC_BANDS, NUM_AC_PREC_CONTEXTS, NUM_DCT_TOKENS,
+    NUM_DC_CONTEXTS, NUM_DC_NODE_EQS, NUM_PLANES, NUM_TREE_NODES, VP6_DC_UPDATE_PROBS,
 };
 pub use umv::{
     build_extended_buffer, extend_border, extended_height, extended_stride, origin_offset,

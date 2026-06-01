@@ -6,6 +6,64 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 17, 2026-06-01)
+
+- `dct_decode::decode_ac_token(bc, prec, encoded_coeffs, &node_probs)`
+  / `dct_decode::decode_ac_coefficient(bc, prec, encoded_coeffs,
+  &node_probs)` — the spec §13.3.1 per-coefficient arithmetic AC
+  decoder. The walk differs from the §13.2.1 DC variant on two
+  structural counts:
+  - **`EOB_CONTEXT_NODE` branch.** A 0-bit at the
+    `ZERO_CONTEXT_NODE` root no longer short-circuits to
+    `ZERO_TOKEN`; it enters a `B(EOB_CONTEXT_NODE)` decision whose
+    0-branch is `EOB_TOKEN` (end-of-block) and whose 1-branch is
+    `ZERO_TOKEN` (hand off to the §13.3.3 zero-run decoder).
+  - **Implicitly-1 first-decision shortcut.** When the previous AC
+    token was `ZERO_TOKEN` (`prec == WasZero`) and we are past the
+    first AC coefficient (`encoded_coeffs > 1`), the §13.3.1
+    pseudo-code mandates the next token can be neither `ZERO_TOKEN`
+    nor `EOB_TOKEN`, so the root decision is implicitly `1`. The
+    gate is correctly closed at `encoded_coeffs == 1` (the
+    very-first AC position, whose `Prec` was seeded from the
+    §13.2-decoded DC of the same block).
+- `dct_decode::AcOutcome` — the three-way per-coefficient result:
+  `EndOfBlock` (exit the per-block loop), `ZeroRun` (current coeff
+  is 0, caller invokes §13.3.3 zero-run decoder), or
+  `Value { coeff, next_prec }` (signed AC coefficient + §13.3.1
+  `Prec` update for the next position: `WasOne` if `|coeff| == 1`,
+  `WasGreaterThanOne` otherwise).
+- Static surface in `tokens`:
+  - `AcBand` — Table 30 six AC bands (coefficient 1; 2–4; 5–10;
+    11–21; 22–36; 37–63) with the `for_coefficient_position(usize)
+    -> Option<AcBand>` lookup that returns the §13.3.1
+    `AcProbBand[encodedCoeffs]` band index for any AC scan position
+    `1..=63`. Companion `index` / `from_index` / `ALL`.
+  - `AcPlane` — Table 28 (Y / UV) with the standard `index` /
+    `from_index` / `ALL`.
+  - `AcPrecContext` — Table 29 (`WasZero` / `WasOne` /
+    `WasGreaterThanOne`) plus `seed_from_dc(dc: i32) -> Self` that
+    implements the §13.3.1 first-AC seeding rule.
+- 18 new unit tests in `dct_decode`: the implicit-1 shortcut's
+  positive/negative cases on each conjunct
+  (`encoded_coeffs > 1`, `prec == WasZero`); the EOB/ZERO inversion
+  branches at the EOB-node; the `EndOfBlock` / `ZeroRun` / `Value`
+  outcome variants; the `next_prec` update invariant via a property
+  sweep that hits both magnitude-1 and magnitude->1 paths;
+  determinism; the `decode_ac_coefficient = decode_ac_token + value`
+  composition; `seed_from_dc` exact spec-matching against the
+  `0 / 1 / -1 / 2 / 2114 / -2114` corners; the truncation surface
+  on a 4-byte stream; a structural leaf-set sweep proving the AC
+  walk's leaves are all valid `DctToken` values. Plus 9 new unit
+  tests in `tokens` covering the Table 28/29/30 enum surfaces
+  (round-trip, Table-30 partition cover of `1..=63` with
+  per-band-count verification, display names).
+- Resolves the §13.2.1 round-16 close-out item "§13.3.1 AC
+  branching and §13.3.3 zero-run integration deferred to a later
+  round" for the §13.3.1 half. The §13.3.3 zero-run integration
+  remains follow-on (the `AcOutcome::ZeroRun` variant surfaces the
+  hand-off point; the §13.3.3.1 BoolCoder traversal is its own
+  logical unit on top of the round-15 BoolCoder primitive).
+
 ### Added (clean-room round 16, 2026-06-01)
 
 - `dct_decode` module — the first BoolCoder-consuming layer: the

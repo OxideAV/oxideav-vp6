@@ -665,6 +665,244 @@ pub fn dct_token_bool_tree_to_huff_probs(node_prob: &[u8; NUM_TREE_NODES]) -> [u
     out
 }
 
+/// VP6 AC band index (spec §13.3 Table 30).
+///
+/// The §13.3.1 arithmetic AC decoder selects a per-band node-probability
+/// vector via `AcProbs[plane][prec][AcProbBand[encodedCoeffs]]`. The
+/// table partitions the 63 AC scan positions `1..=63` into six bands
+/// per the spec's column layout: coefficient 1 (band 0), 2–4 (band 1),
+/// 5–10 (band 2), 11–21 (band 3), 22–36 (band 4), 37–63 (band 5). The
+/// discriminant is the spec's canonical `0..=5` index — matching the
+/// third dimension of [`AC_UPDATE_PROBS`] and the second dimension of
+/// `baseline_ac_probs()`'s inner `[plane][prec][band][node]` layout.
+///
+/// This is the AC counterpart of [`crate::zrl::ZrlBand`] (Table 37,
+/// which uses a coarser two-band partition for AC zero-run-length
+/// probability selection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum AcBand {
+    /// Coefficient position 1. Index 0.
+    Coefficient1 = 0,
+    /// Coefficient positions 2–4. Index 1.
+    Coefficients2To4 = 1,
+    /// Coefficient positions 5–10. Index 2.
+    Coefficients5To10 = 2,
+    /// Coefficient positions 11–21. Index 3.
+    Coefficients11To21 = 3,
+    /// Coefficient positions 22–36. Index 4.
+    Coefficients22To36 = 4,
+    /// Coefficient positions 37–63. Index 5.
+    Coefficients37To63 = 5,
+}
+
+impl AcBand {
+    /// All six AC bands in canonical (Table 30) index order.
+    pub const ALL: [AcBand; NUM_AC_BANDS] = [
+        AcBand::Coefficient1,
+        AcBand::Coefficients2To4,
+        AcBand::Coefficients5To10,
+        AcBand::Coefficients11To21,
+        AcBand::Coefficients22To36,
+        AcBand::Coefficients37To63,
+    ];
+
+    /// Canonical `0..=5` spec index (matches the enum discriminant).
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Inverse of [`AcBand::index`]: build a band from the spec's
+    /// `0..=5` integer. Returns `None` for out-of-range values.
+    #[inline]
+    pub const fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Coefficient1),
+            1 => Some(Self::Coefficients2To4),
+            2 => Some(Self::Coefficients5To10),
+            3 => Some(Self::Coefficients11To21),
+            4 => Some(Self::Coefficients22To36),
+            5 => Some(Self::Coefficients37To63),
+            _ => None,
+        }
+    }
+
+    /// Look up the §13.3.1 `AcProbBand[encodedCoeffs]` band index for
+    /// a given AC scan position.
+    ///
+    /// Returns `None` for `coeff_index == 0` (the DC position, which
+    /// the §13.2 decoder handles independently) and for
+    /// `coeff_index > 63` (outside the 64-coefficient block).
+    ///
+    /// The mapping is the verbatim Table 30 column-layout partition:
+    /// position 1 → `Coefficient1`, positions 2–4 →
+    /// `Coefficients2To4`, …, positions 37–63 → `Coefficients37To63`.
+    #[inline]
+    pub const fn for_coefficient_position(coeff_index: usize) -> Option<Self> {
+        match coeff_index {
+            0 => None,
+            1 => Some(Self::Coefficient1),
+            2..=4 => Some(Self::Coefficients2To4),
+            5..=10 => Some(Self::Coefficients5To10),
+            11..=21 => Some(Self::Coefficients11To21),
+            22..=36 => Some(Self::Coefficients22To36),
+            37..=63 => Some(Self::Coefficients37To63),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for AcBand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Coefficient1 => "AC_BAND_COEFF_1",
+            Self::Coefficients2To4 => "AC_BAND_COEFFS_2_4",
+            Self::Coefficients5To10 => "AC_BAND_COEFFS_5_10",
+            Self::Coefficients11To21 => "AC_BAND_COEFFS_11_21",
+            Self::Coefficients22To36 => "AC_BAND_COEFFS_22_36",
+            Self::Coefficients37To63 => "AC_BAND_COEFFS_37_63",
+        };
+        f.write_str(name)
+    }
+}
+
+/// VP6 AC plane index (spec §13.3 Table 28).
+///
+/// Y (luma) blocks select plane 0; U or V (chroma) blocks select plane 1.
+/// The discriminant is the spec's canonical `0..=1` index, matching the
+/// second dimension of [`AC_UPDATE_PROBS`] and of `baseline_ac_probs()`
+/// (per `[prec][plane][band][node]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum AcPlane {
+    /// Y colour plane. Index 0.
+    Y = 0,
+    /// U or V colour plane. Index 1.
+    UV = 1,
+}
+
+impl AcPlane {
+    /// All AC planes in canonical (Table 28) order.
+    pub const ALL: [AcPlane; NUM_PLANES] = [AcPlane::Y, AcPlane::UV];
+
+    /// Canonical `0..=1` spec index (matches the enum discriminant).
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Inverse of [`AcPlane::index`]: build a plane from the spec's
+    /// `0..=1` integer. Returns `None` for out-of-range values.
+    #[inline]
+    pub const fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Y),
+            1 => Some(Self::UV),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for AcPlane {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Y => "AC_PLANE_Y",
+            Self::UV => "AC_PLANE_UV",
+        };
+        f.write_str(name)
+    }
+}
+
+/// VP6 AC "preceding decoded coefficient" context (spec §13.3 Table 29).
+///
+/// Selects the third row of `AcProbs[plane][prec][band][node]` (called
+/// `Prec` in the §13.3.1 pseudo-code). For each AC coefficient the
+/// decoder looks back at the previously-decoded coefficient in the
+/// current scan order:
+///
+/// * `WasZero` (0) — preceding decoded coefficient was 0.
+/// * `WasOne` (1) — preceding decoded coefficient was 1.
+/// * `WasGreaterThanOne` (2) — preceding decoded coefficient had
+///   magnitude > 1.
+///
+/// The first AC coefficient seeds `Prec` from the §13.2-decoded DC
+/// value of the same block (DC == 0 → `WasZero`, DC == 1 →
+/// `WasOne`, otherwise → `WasGreaterThanOne`). Subsequent coefficients
+/// update `Prec` per the §13.3.1 pseudo-code's branch outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum AcPrecContext {
+    /// Preceding decoded coefficient was 0. Index 0.
+    WasZero = 0,
+    /// Preceding decoded coefficient was 1. Index 1.
+    WasOne = 1,
+    /// Preceding decoded coefficient had magnitude > 1. Index 2.
+    WasGreaterThanOne = 2,
+}
+
+impl AcPrecContext {
+    /// All preceding-coefficient contexts in canonical (Table 29)
+    /// order.
+    pub const ALL: [AcPrecContext; NUM_AC_PREC_CONTEXTS] = [
+        AcPrecContext::WasZero,
+        AcPrecContext::WasOne,
+        AcPrecContext::WasGreaterThanOne,
+    ];
+
+    /// Canonical `0..=2` spec index (matches the enum discriminant).
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Inverse of [`AcPrecContext::index`]: build a context from the
+    /// spec's `0..=2` integer. Returns `None` for out-of-range values.
+    #[inline]
+    pub const fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::WasZero),
+            1 => Some(Self::WasOne),
+            2 => Some(Self::WasGreaterThanOne),
+            _ => None,
+        }
+    }
+
+    /// Seed the §13.3.1 `Prec` context from a freshly-decoded DC
+    /// coefficient of the same block:
+    ///
+    /// ```text
+    /// if (dc == 0)        Prec = 0
+    /// else if (dc == 1)   Prec = 1
+    /// else                Prec = 2
+    /// ```
+    ///
+    /// Note the spec's signed-value test treats DC of 1 as
+    /// distinguished from DC of −1 (magnitude 1 with negative sign):
+    /// only `dc == 1` literally seeds `WasOne`. The §13.3.1 listing
+    /// reads `dc == 1` not `|dc| == 1`, so this routine mirrors that
+    /// exact comparison.
+    #[inline]
+    pub const fn seed_from_dc(dc: i32) -> Self {
+        match dc {
+            0 => Self::WasZero,
+            1 => Self::WasOne,
+            _ => Self::WasGreaterThanOne,
+        }
+    }
+}
+
+impl fmt::Display for AcPrecContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::WasZero => "AC_PREC_WAS_ZERO",
+            Self::WasOne => "AC_PREC_WAS_ONE",
+            Self::WasGreaterThanOne => "AC_PREC_WAS_GREATER_THAN_ONE",
+        };
+        f.write_str(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,5 +1358,186 @@ mod tests {
             "CAT_THREEFOUR_CONTEXT_NODE"
         );
         assert_eq!(TreeNode::Zero.to_string(), "ZERO_CONTEXT_NODE");
+    }
+
+    // ----------------------------------------------------------------------
+    // §13.3 AC band / plane / preceding-coefficient enums (Tables 28–30)
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn ac_band_indices_match_table_30_order() {
+        assert_eq!(AcBand::Coefficient1.index(), 0);
+        assert_eq!(AcBand::Coefficients2To4.index(), 1);
+        assert_eq!(AcBand::Coefficients5To10.index(), 2);
+        assert_eq!(AcBand::Coefficients11To21.index(), 3);
+        assert_eq!(AcBand::Coefficients22To36.index(), 4);
+        assert_eq!(AcBand::Coefficients37To63.index(), 5);
+        assert_eq!(AcBand::ALL.len(), NUM_AC_BANDS);
+    }
+
+    #[test]
+    fn ac_band_from_index_round_trip() {
+        for (i, band) in AcBand::ALL.iter().enumerate() {
+            assert_eq!(AcBand::from_index(i), Some(*band));
+            assert_eq!(band.index(), i);
+        }
+        assert_eq!(AcBand::from_index(NUM_AC_BANDS), None);
+        assert_eq!(AcBand::from_index(usize::MAX), None);
+    }
+
+    #[test]
+    fn ac_band_for_coefficient_position_partition() {
+        // DC position (0) returns None — §13.2 handles it separately.
+        assert_eq!(AcBand::for_coefficient_position(0), None);
+
+        // Position 1 → Coefficient1.
+        assert_eq!(
+            AcBand::for_coefficient_position(1),
+            Some(AcBand::Coefficient1)
+        );
+
+        // Positions 2..=4 → Coefficients2To4.
+        for pos in 2..=4 {
+            assert_eq!(
+                AcBand::for_coefficient_position(pos),
+                Some(AcBand::Coefficients2To4),
+                "pos {pos}"
+            );
+        }
+
+        // Positions 5..=10 → Coefficients5To10.
+        for pos in 5..=10 {
+            assert_eq!(
+                AcBand::for_coefficient_position(pos),
+                Some(AcBand::Coefficients5To10),
+                "pos {pos}"
+            );
+        }
+
+        // Positions 11..=21 → Coefficients11To21.
+        for pos in 11..=21 {
+            assert_eq!(
+                AcBand::for_coefficient_position(pos),
+                Some(AcBand::Coefficients11To21),
+                "pos {pos}"
+            );
+        }
+
+        // Positions 22..=36 → Coefficients22To36.
+        for pos in 22..=36 {
+            assert_eq!(
+                AcBand::for_coefficient_position(pos),
+                Some(AcBand::Coefficients22To36),
+                "pos {pos}"
+            );
+        }
+
+        // Positions 37..=63 → Coefficients37To63.
+        for pos in 37..=63 {
+            assert_eq!(
+                AcBand::for_coefficient_position(pos),
+                Some(AcBand::Coefficients37To63),
+                "pos {pos}"
+            );
+        }
+
+        // Out-of-block positions return None.
+        assert_eq!(AcBand::for_coefficient_position(64), None);
+        assert_eq!(AcBand::for_coefficient_position(100), None);
+        assert_eq!(AcBand::for_coefficient_position(usize::MAX), None);
+    }
+
+    #[test]
+    fn ac_band_partition_covers_every_ac_position_exactly_once() {
+        // Every AC scan position 1..=63 maps to exactly one band, and
+        // every band is hit by at least one position. (Structural
+        // covering check — a defensive guard against future
+        // refactors of `for_coefficient_position`.)
+        let mut counts = [0usize; NUM_AC_BANDS];
+        for pos in 1..=63 {
+            let band = AcBand::for_coefficient_position(pos)
+                .expect("every AC position 1..=63 maps to some band");
+            counts[band.index()] += 1;
+        }
+        assert_eq!(counts[AcBand::Coefficient1.index()], 1);
+        assert_eq!(counts[AcBand::Coefficients2To4.index()], 3);
+        assert_eq!(counts[AcBand::Coefficients5To10.index()], 6);
+        assert_eq!(counts[AcBand::Coefficients11To21.index()], 11);
+        assert_eq!(counts[AcBand::Coefficients22To36.index()], 15);
+        assert_eq!(counts[AcBand::Coefficients37To63.index()], 27);
+        // Sum to 63 AC positions.
+        assert_eq!(counts.iter().sum::<usize>(), 63);
+    }
+
+    #[test]
+    fn ac_plane_indices_match_table_28_order() {
+        assert_eq!(AcPlane::Y.index(), 0);
+        assert_eq!(AcPlane::UV.index(), 1);
+        assert_eq!(AcPlane::ALL.len(), NUM_PLANES);
+    }
+
+    #[test]
+    fn ac_plane_from_index_round_trip() {
+        for (i, plane) in AcPlane::ALL.iter().enumerate() {
+            assert_eq!(AcPlane::from_index(i), Some(*plane));
+            assert_eq!(plane.index(), i);
+        }
+        assert_eq!(AcPlane::from_index(NUM_PLANES), None);
+    }
+
+    #[test]
+    fn ac_prec_context_indices_match_table_29_order() {
+        assert_eq!(AcPrecContext::WasZero.index(), 0);
+        assert_eq!(AcPrecContext::WasOne.index(), 1);
+        assert_eq!(AcPrecContext::WasGreaterThanOne.index(), 2);
+        assert_eq!(AcPrecContext::ALL.len(), NUM_AC_PREC_CONTEXTS);
+    }
+
+    #[test]
+    fn ac_prec_context_from_index_round_trip() {
+        for (i, prec) in AcPrecContext::ALL.iter().enumerate() {
+            assert_eq!(AcPrecContext::from_index(i), Some(*prec));
+            assert_eq!(prec.index(), i);
+        }
+        assert_eq!(AcPrecContext::from_index(NUM_AC_PREC_CONTEXTS), None);
+    }
+
+    #[test]
+    fn ac_prec_context_seed_from_dc_partitions_signed_dc() {
+        assert_eq!(AcPrecContext::seed_from_dc(0), AcPrecContext::WasZero);
+        assert_eq!(AcPrecContext::seed_from_dc(1), AcPrecContext::WasOne);
+        // Spec uses signed `dc == 1`; -1 is not the same as 1.
+        assert_eq!(
+            AcPrecContext::seed_from_dc(-1),
+            AcPrecContext::WasGreaterThanOne,
+        );
+        assert_eq!(
+            AcPrecContext::seed_from_dc(2),
+            AcPrecContext::WasGreaterThanOne,
+        );
+        assert_eq!(
+            AcPrecContext::seed_from_dc(2114),
+            AcPrecContext::WasGreaterThanOne,
+        );
+        assert_eq!(
+            AcPrecContext::seed_from_dc(-2114),
+            AcPrecContext::WasGreaterThanOne,
+        );
+    }
+
+    #[test]
+    fn ac_band_plane_prec_display_names() {
+        assert_eq!(AcBand::Coefficient1.to_string(), "AC_BAND_COEFF_1");
+        assert_eq!(
+            AcBand::Coefficients37To63.to_string(),
+            "AC_BAND_COEFFS_37_63"
+        );
+        assert_eq!(AcPlane::Y.to_string(), "AC_PLANE_Y");
+        assert_eq!(AcPlane::UV.to_string(), "AC_PLANE_UV");
+        assert_eq!(AcPrecContext::WasZero.to_string(), "AC_PREC_WAS_ZERO");
+        assert_eq!(
+            AcPrecContext::WasGreaterThanOne.to_string(),
+            "AC_PREC_WAS_GREATER_THAN_ONE"
+        );
     }
 }

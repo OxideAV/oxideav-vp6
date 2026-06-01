@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 16 (2026-06-01).** The orphan-rebuild
+**Clean-room rebuild — round 17 (2026-06-01).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -619,6 +619,92 @@ implementation is consulted at any stage.
   and a conditional `b(7)` `NewNodeProbValue`, both BoolCoder-coded;
   it stays deferred behind the round-15 BoolCoder primitive's
   reach.
+
+### What round 17 lands
+
+- `decode_ac_token(bc, prec, encoded_coeffs, &node_probs)` /
+  `decode_ac_coefficient(bc, prec, encoded_coeffs, &node_probs)` —
+  the spec §13.3.1 per-coefficient AC arithmetic decoder, the second
+  BoolCoder-consuming layer. The AC tree differs from the §13.2.1 DC
+  tree on two structural counts:
+  - `EOB_CONTEXT_NODE` branch above the `ZERO_CONTEXT_NODE` root. A
+    0-bit at the root no longer short-circuits to `ZERO_TOKEN`; it
+    enters a `B(EOB_CONTEXT_NODE)` sub-decision whose 0-branch is
+    `EOB_TOKEN` (end-of-block) and whose 1-branch is `ZERO_TOKEN`
+    (proceed into the §13.3.3 zero-run decoder).
+  - The "implicitly-1" first-decision shortcut. When the previously-
+    decoded AC coefficient in the current scan order was the
+    `ZERO_TOKEN` (`prec == WasZero`) **and** we are past the very
+    first AC coefficient (`encoded_coeffs > 1`), the §13.3.1
+    pseudo-code mandates the next token can be neither `ZERO_TOKEN`
+    nor `EOB_TOKEN`, so the root decision is implicitly `1` and the
+    walk starts at `ONE_CONTEXT_NODE`. (At the *first* AC position
+    the `Prec` context came from the §13.2-decoded DC of the same
+    block, not from a prior AC zero, so the shortcut is gated to
+    fire only at `encoded_coeffs > 1`.)
+- `AcOutcome` — the three-way per-step result the §13.3.1 pseudo-code
+  distinguishes:
+  - `AcOutcome::EndOfBlock` — exit the per-block loop, no coefficient
+    emitted.
+  - `AcOutcome::ZeroRun` — current AC coefficient is 0; caller invokes
+    the §13.3.3 zero-run decoder to advance the scan position; the
+    next `Prec` context is `WasZero` (which also gates the implicit-1
+    shortcut on the *next* coefficient).
+  - `AcOutcome::Value { coeff, next_prec }` — signed AC coefficient
+    `coeff` was decoded; `next_prec` is the §13.3.1 update rule
+    (`WasOne` if `|coeff| == 1`, `WasGreaterThanOne` otherwise).
+- Static surface in `tokens`: `AcBand` (Table 30, six AC bands with
+  `for_coefficient_position(usize) -> Option<AcBand>` returning the
+  §13.3.1 `AcProbBand[encodedCoeffs]` band index for any AC scan
+  position `1..=63`), `AcPlane` (Table 28, Y / UV), `AcPrecContext`
+  (Table 29, `WasZero` / `WasOne` / `WasGreaterThanOne` with a
+  `seed_from_dc(dc: i32) -> Self` constructor that implements the
+  §13.3.1 first-AC seeding `if (dc == 0) Prec = 0; else if (dc == 1)
+  Prec = 1; else Prec = 2`).
+- The signed reconstruction reuses the round-16 `decode_token_value`
+  magnitude-loop + sign kernel verbatim — the §13.2.1 and §13.3.1
+  per-token magnitude/sign reads are identical (the errata-#67
+  corrected magnitude-only slice and the separate fixed-prob-128
+  sign bit), so no duplicated arithmetic.
+- 18 new unit tests pinning: the implicit-1 shortcut's
+  `(EncodedCoeffs > 1) && (Prec == WasZero)` gate (positive +
+  negatives against both conjuncts); the EOB/ZERO inversion at the
+  EOB-node (`B(EOB_CONTEXT_NODE) == 0 → EOB_TOKEN`,
+  `== 1 → ZERO_TOKEN`); the `next_prec` update rule (sweep over
+  `(prec, encoded_coeffs, node_probs, stream)` corners hitting both
+  magnitude-1 and magnitude->1 paths); the §13.3.1 first-AC seeding
+  `seed_from_dc` against `0 / 1 / 2 / −1 / 2114 / −2114`;
+  determinism; `decode_ac_coefficient` = `decode_ac_token` +
+  per-leaf value/sign; the truncation surface; and a structural
+  leaf-set check across all twelve possible `DctToken`s. Plus
+  Table 28/29/30 enum-surface tests in `tokens` (`AcBand` partition
+  cover of `1..=63`, plane round-trip, prec round-trip).
+- Like §15/§16/§17/§11/§12.1/§14/§10/§13/§7.2/§3/§7.3/§13.2.1, this
+  layer reads only the staged spec PDF and the staged clean-room
+  errata clarifications. No third-party VP6 implementation has been
+  consulted.
+
+### What round 17 does NOT land
+
+- The §13.3.3.1 BoolCoder zero-run-length traversal of Figure 16
+  itself. The static probability data + the §13.3.3.2 Huffman path
+  are already in `zrl`; the BoolCoder traversal would walk the
+  Figure 16 tree reading `B(ZeroRunProbs[band][node])` per node and
+  on the "run > 8" branch read six `B(...)` extrabits. The per-bit
+  primitive is in place (round 15 `BoolCoder::decode_bool`) so this
+  is a clean follow-on, but it's a separate logical unit. The
+  `AcOutcome::ZeroRun` variant surfaces the hand-off point.
+- The surrounding per-block driver loop. The §13.3.1 pseudo-code's
+  `EncodedCoeffs ++` envelope, scan-order updates, and the
+  `do { … } while (EncodedCoeffs < 64)` wrapper that ties this
+  per-coefficient routine into the spec's per-block lifetime are a
+  caller-side driver concern; `AcPrecContext::seed_from_dc` is
+  exposed so the DC → first-AC handoff is wired correctly when the
+  driver lands.
+- The §13.3 per-frame `AcProbs` update bitstream (Tables 31–35).
+  Same shape as the §13.2 DC update — `B(NewNodeProbFlag)` plus a
+  conditional `b(7)` `NewNodeProbValue` — and uses the same
+  BoolCoder substrate, but it is its own per-frame ingestion stage.
 
 ## License
 
