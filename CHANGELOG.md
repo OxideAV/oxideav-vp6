@@ -6,6 +6,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 18, 2026-06-03)
+
+- `inter::fetch_prediction_block_clamped(image, width, height, top, left,
+  dx, dy, &mut pred)` — the §11.5-derived **edge-clamped** integer-MC
+  fetch. The spec defines §11.5 "Unrestricted Motion Vectors" via a
+  48-sample buffer extension built by "duplicating the edge values 48
+  times", which is mathematically equivalent to clamping the read
+  position into the original image's `[0, width)` x `[0, height)`
+  rectangle (the equivalence already recorded in the `umv` module
+  docs). This entry point implements that equivalence directly: it
+  reads from the unbordered reference image, clamping each per-sample
+  `(row, col)` source before the dereference. For any MV inside the
+  48-sample §11.5 border the output is bit-identical to a
+  `fetch_prediction_block` call against the §11.5-bordered version of
+  the same image (verified by the
+  `clamped_matches_bordered_fetch_for_in_range_mv` and
+  `clamped_matches_bordered_fetch_for_edge_overhang` equivalence
+  tests, which sweep both fully-inside-image cases and the four
+  per-edge / four corner-quadrant overhang cases). For MVs whose
+  magnitude **exceeds** the 48-sample border the spec mandates (where
+  the bordered fetch would index out of bounds), the clamped fetch
+  remains well-defined and continues to serve up the corresponding
+  corner / edge-row / edge-column pixel of the original image — the
+  `clamped_well_defined_beyond_umv_border` test exercises a
+  `-200` sample MV against a 16x16 image and verifies every output
+  sample reads the `(0, 0)` corner.
+- 15 new unit tests covering all four edge-overhang directions
+  (left / right / top / bottom), the four corner quadrants, the
+  per-sample independence property (one bright sample in an
+  otherwise-zero image lands at exactly the right output position),
+  the in-range zero-MV and positive-MV reductions to a plain
+  co-located / offset copy, and the three degenerate panic cases
+  (zero width, zero height, truncated image buffer).
+
+Total test count: 363 → 378 (all green).
+
 ### Added (clean-room round 17, 2026-06-01)
 
 - `dct_decode::decode_ac_token(bc, prec, encoded_coeffs, &node_probs)`

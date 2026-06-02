@@ -52,6 +52,15 @@
 //!   prediction fetch: copy an 8x8 region from a reference reconstruction
 //!   buffer. Zero MV (§17.2) is the `dx == dy == 0` special case; a
 //!   full-pixel MV (§17.3) is the general integer offset.
+//! * [`fetch_prediction_block_clamped`] — the §11.5 edge-clamped form
+//!   of the integer prediction fetch. The spec's "duplicate edge values
+//!   48 times" rule (§11.5) makes any read from the bordered buffer
+//!   equivalent to clamping the read position into the original image's
+//!   valid range; this entry point implements that equivalence directly
+//!   without materialising the §11.5 border buffer, and remains
+//!   well-defined for motion vectors whose magnitude exceeds the
+//!   48-sample border the spec mandates (which would index out of bounds
+//!   in the bordered path).
 //! * [`whole_sample_aligned`] / [`MvShift`] / [`luma_frac`] /
 //!   [`chroma_frac`] — the §11.4 motion-vector decomposition that splits
 //!   an MV component into its whole-sample-aligned part (`MvX >> MvShift`)
@@ -198,6 +207,121 @@ pub fn fetch_prediction_block(
         for c in 0..8i32 {
             let src = (src_row + dx + c) as usize;
             pred[(r * 8 + c) as usize] = ref_buf[src];
+        }
+    }
+}
+
+/// Fetch the 8x8 prediction block for an integer (§17.2/§17.3) motion
+/// vector against an **unbordered** reference image, applying the §11.5
+/// "duplicate edge values" semantic as edge-clamping of the read
+/// position.
+///
+/// `image` is a flat `width * height` reference reconstruction with **no**
+/// §11.5 UMV border applied — i.e. the raw decoder output of the previous
+/// or golden frame, sample `(r, c)` at index `r * width + c`. `(top, left)`
+/// is the position of the block's top-left sample if the MV were zero
+/// (the co-located corner), expressed as integer `(row, col)` in the
+/// original image's grid. `(dx, dy)` is the whole-sample motion-vector
+/// offset (`(WholeSampleAlignedX, WholeSampleAlignedY)` from §11.4),
+/// either component of which is free to push the read past the original
+/// image edge. The 64 output samples are written to `pred` in raster
+/// order.
+///
+/// # The §11.5 derivation
+///
+/// §11.5 defines the unrestricted-motion-vector behaviour by extending
+/// every reconstruction buffer by 48 sample points in each direction:
+///
+/// > The buffers are extended by duplicating the edge values 48 times.
+///
+/// [`crate::umv::extend_border`] implements that extension verbatim, and
+/// [`fetch_prediction_block`] reads from a buffer that already has it
+/// applied. The crate-level documentation on
+/// [`crate::umv`] records the equivalence the spec sets up:
+///
+/// > because the extension is built by edge replication, any read from a
+/// > sample position inside the `±BORDER_SIZE`-wide extended frame is
+/// > equivalent to clamping the read position to the original image's
+/// > valid range.
+///
+/// This function takes the equivalence as primitive: rather than
+/// allocate the bordered buffer and copy `(image.len() + border)` bytes
+/// of edge-replicated padding per reference frame, it clamps each per-
+/// sample source position into the original image's `[0, width)` x
+/// `[0, height)` rectangle on the read side. For any MV whose source
+/// rectangle lies entirely inside the original image, the output is
+/// **bit-identical** to a [`fetch_prediction_block`] call against the
+/// §11.5-bordered version of the same image (the in-range read paths
+/// agree). For MVs whose source rectangle hangs off an edge, the
+/// clamped reads produce the same edge-duplicated samples that the §11.5
+/// border-buffer would have served back, regardless of how far past the
+/// edge the MV points — including MVs that exceed the 48-sample border
+/// the spec mandates (which would index out of bounds in the bordered
+/// reader).
+///
+/// In short, this entry point implements §11.5's "well-defined clamp"
+/// semantic directly, without materializing the border. Callers can
+/// reach it from the §17.2 zero MV (`dx == dy == 0`, which just becomes
+/// a co-located copy) or the §17.3 full-pixel MV (the general integer
+/// offset) without preallocating the §11.5-bordered buffer; the result
+/// is identical bit-for-bit.
+///
+/// # Panics
+///
+/// Panics if `width == 0` or `height == 0` (a degenerate image has no
+/// edge to replicate), or if `image.len() < width * height` (truncated
+/// buffer; the clamped read would otherwise dereference uninitialised
+/// memory).
+// Eight parameters is one over the clippy default, but each carries a
+// distinct §11.5 / §17 meaning (image + dims + co-located corner +
+// MV + output buffer) and bundling any pair would obscure the spec
+// mapping. The neighbour `fetch_prediction_block` is the same shape
+// minus dims.
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_prediction_block_clamped(
+    image: &[u8],
+    width: usize,
+    height: usize,
+    top: i32,
+    left: i32,
+    dx: i32,
+    dy: i32,
+    pred: &mut [u8; 64],
+) {
+    assert!(
+        width > 0,
+        "fetch_prediction_block_clamped: width must be > 0"
+    );
+    assert!(
+        height > 0,
+        "fetch_prediction_block_clamped: height must be > 0"
+    );
+    assert!(
+        image.len() >= width.checked_mul(height).expect("width * height overflow"),
+        "fetch_prediction_block_clamped: image too small ({} < {} = {} * {})",
+        image.len(),
+        width * height,
+        width,
+        height
+    );
+
+    // The §11.5 edge-clamp upper bounds. The valid sample range in the
+    // original image is `[0, width-1]` x `[0, height-1]`.
+    let max_col = (width - 1) as i32;
+    let max_row = (height - 1) as i32;
+
+    for r in 0..8i32 {
+        // Source row before clamping: co-located row + MV-y + block row.
+        let unclamped_row = top + dy + r;
+        // Clamp into [0, max_row]. The two-sided clamp is the §11.5
+        // edge-duplication semantic: row < 0 reads top-row samples;
+        // row > max_row reads bottom-row samples.
+        let src_row = unclamped_row.clamp(0, max_row) as usize;
+        let row_base = src_row * width;
+        for c in 0..8i32 {
+            let unclamped_col = left + dx + c;
+            let src_col = unclamped_col.clamp(0, max_col) as usize;
+            pred[(r * 8 + c) as usize] = image[row_base + src_col];
         }
     }
 }
@@ -603,5 +727,316 @@ mod tests {
         let residual = [10i32; 64];
         let pixels = inter_block_to_pixels(&pred, &residual);
         assert_eq!(pixels, [130u8; 64]);
+    }
+
+    // ---- fetch_prediction_block_clamped (§11.5 edge-clamp form) ----
+
+    /// Helper: build a `width * height` test image whose sample value at
+    /// `(r, c)` is a deterministic non-trivial function of position, so
+    /// the tests can recover *which* sample the read picked up.
+    fn ramp_image(width: usize, height: usize) -> Vec<u8> {
+        let mut v = vec![0u8; width * height];
+        for r in 0..height {
+            for c in 0..width {
+                // Distinct values across both axes; wrap into u8.
+                v[r * width + c] = ((r * 7 + c * 3 + 5) & 0xff) as u8;
+            }
+        }
+        v
+    }
+
+    /// A zero MV in-range — the clamped fetch reduces to a co-located
+    /// 8x8 copy out of the image (no clamping triggers).
+    #[test]
+    fn clamped_zero_mv_copies_colocated_unclamped() {
+        let (w, h) = (32, 32);
+        let img = ramp_image(w, h);
+        let mut pred = [0u8; 64];
+        // Position the block at (top=4, left=4), entirely inside the image.
+        fetch_prediction_block_clamped(&img, w, h, 4, 4, 0, 0, &mut pred);
+        for r in 0..8 {
+            for c in 0..8 {
+                assert_eq!(
+                    pred[r * 8 + c],
+                    img[(4 + r) * w + (4 + c)],
+                    "row {r}, col {c}: zero-MV in-range read should match co-located sample"
+                );
+            }
+        }
+    }
+
+    /// A full-pixel positive MV in-range — same equivalence as
+    /// [`fetch_full_pixel_positive_offset`] for the unbordered API.
+    #[test]
+    fn clamped_full_pixel_positive_offset_in_range() {
+        let (w, h) = (32, 32);
+        let img = ramp_image(w, h);
+        let mut pred = [0u8; 64];
+        // Block at (4, 4), MV = (+3, +5): all 8x8 reads land inside the image.
+        fetch_prediction_block_clamped(&img, w, h, 4, 4, 3, 5, &mut pred);
+        for r in 0..8 {
+            for c in 0..8 {
+                assert_eq!(pred[r * 8 + c], img[(4 + 5 + r) * w + (4 + 3 + c)]);
+            }
+        }
+    }
+
+    /// MV pushes the read past the **left** edge. The clamped fetch must
+    /// substitute the leftmost-column value for every out-of-range
+    /// column — the §11.5 edge-duplication semantic.
+    #[test]
+    fn clamped_left_edge_replicates_leftmost_column() {
+        let (w, h) = (32, 32);
+        let img = ramp_image(w, h);
+        let mut pred = [0u8; 64];
+        // Block at (top=4, left=4), MV = (-10, 0): cols 4-10 .. 4-3 .. 1
+        // are negative for the first 6 sample columns of the block —
+        // clamped to col 0 — and cols (-2..=1) for the last two columns.
+        fetch_prediction_block_clamped(&img, w, h, 4, 4, -10, 0, &mut pred);
+        for r in 0..8 {
+            let src_row = 4 + r;
+            for c in 0..8 {
+                let src_col_unclamped = 4i32 + (-10) + c as i32;
+                let expected_col = src_col_unclamped.max(0) as usize;
+                assert_eq!(
+                    pred[r * 8 + c],
+                    img[src_row * w + expected_col],
+                    "row {r}, col {c}: src col {src_col_unclamped} should clamp to {expected_col}"
+                );
+            }
+        }
+    }
+
+    /// MV pushes the read past the **right** edge. Must replicate the
+    /// rightmost-column value (the §11.5 symmetric case of the left
+    /// test).
+    #[test]
+    fn clamped_right_edge_replicates_rightmost_column() {
+        let (w, h) = (16, 16);
+        let img = ramp_image(w, h);
+        let mut pred = [0u8; 64];
+        // Block at (top=4, left=12), MV = (+10, 0): cols 12+10 .. 12+17
+        // are > 15 from the first sample column onward — clamped to col 15.
+        fetch_prediction_block_clamped(&img, w, h, 4, 12, 10, 0, &mut pred);
+        for r in 0..8 {
+            let src_row = 4 + r;
+            for c in 0..8 {
+                let src_col_unclamped = 12i32 + 10 + c as i32;
+                let expected_col = src_col_unclamped.min((w - 1) as i32) as usize;
+                assert_eq!(pred[r * 8 + c], img[src_row * w + expected_col]);
+            }
+        }
+    }
+
+    /// MV pushes the read past the **top** edge. Must replicate the
+    /// top-row value.
+    #[test]
+    fn clamped_top_edge_replicates_top_row() {
+        let (w, h) = (16, 16);
+        let img = ramp_image(w, h);
+        let mut pred = [0u8; 64];
+        // Block at (top=4, left=4), MV = (0, -10): rows 4-10 .. 4-3 are
+        // negative — clamped to row 0.
+        fetch_prediction_block_clamped(&img, w, h, 4, 4, 0, -10, &mut pred);
+        for r in 0..8 {
+            let src_row_unclamped = 4i32 + (-10) + r as i32;
+            let expected_row = src_row_unclamped.max(0) as usize;
+            for c in 0..8 {
+                assert_eq!(pred[r * 8 + c], img[expected_row * w + (4 + c)]);
+            }
+        }
+    }
+
+    /// MV pushes the read past the **bottom** edge. Must replicate the
+    /// bottom-row value.
+    #[test]
+    fn clamped_bottom_edge_replicates_bottom_row() {
+        let (w, h) = (16, 16);
+        let img = ramp_image(w, h);
+        let mut pred = [0u8; 64];
+        // Block at (top=12, left=4), MV = (0, +10): rows 12+10..12+17
+        // are > 15 from the start — clamped to row 15.
+        fetch_prediction_block_clamped(&img, w, h, 12, 4, 0, 10, &mut pred);
+        for r in 0..8 {
+            let src_row_unclamped = 12i32 + 10 + r as i32;
+            let expected_row = src_row_unclamped.min((h - 1) as i32) as usize;
+            for c in 0..8 {
+                assert_eq!(pred[r * 8 + c], img[expected_row * w + (4 + c)]);
+            }
+        }
+    }
+
+    /// MV pushes the read past **both** a horizontal and a vertical
+    /// edge — the §11.5 corner case (the four 48x48 corner quadrants
+    /// the `umv::extend_border` test suite covers via the bordered
+    /// path). The clamped read should serve up the single corner pixel
+    /// for every output sample.
+    #[test]
+    fn clamped_top_left_corner_returns_corner_pixel() {
+        let (w, h) = (16, 16);
+        let img = ramp_image(w, h);
+        let mut pred = [0u8; 64];
+        // Block at (0, 0), MV = (-100, -100): every read is far above
+        // and far left of the image — clamps to (0, 0) for every sample.
+        fetch_prediction_block_clamped(&img, w, h, 0, 0, -100, -100, &mut pred);
+        let corner = img[0];
+        assert_eq!(pred, [corner; 64]);
+    }
+
+    /// The reverse corner: MV pushes past bottom-right. Every sample
+    /// should be the `(h-1, w-1)` corner pixel.
+    #[test]
+    fn clamped_bottom_right_corner_returns_corner_pixel() {
+        let (w, h) = (16, 16);
+        let img = ramp_image(w, h);
+        let mut pred = [0u8; 64];
+        fetch_prediction_block_clamped(
+            &img,
+            w,
+            h,
+            (h - 1) as i32,
+            (w - 1) as i32,
+            100,
+            100,
+            &mut pred,
+        );
+        let corner = img[(h - 1) * w + (w - 1)];
+        assert_eq!(pred, [corner; 64]);
+    }
+
+    /// **The equivalence property.** For an in-range MV against an
+    /// image with no §11.5 border applied, the clamped fetch must
+    /// produce bit-identical output to `fetch_prediction_block` against
+    /// the §11.5-bordered version of the same image. This is the spec's
+    /// "edge replication == read clamp" identity, exercised concretely.
+    #[test]
+    fn clamped_matches_bordered_fetch_for_in_range_mv() {
+        let (w, h) = (32, 32);
+        let img = ramp_image(w, h);
+        // Build the §11.5-bordered version through the umv module.
+        let (bordered, ext_stride, _ext_height) = crate::umv::build_extended_buffer(&img, w, h);
+        let origin = crate::umv::origin_offset(ext_stride);
+
+        // Sweep a variety of (top, left, dx, dy) combinations that stay
+        // entirely inside the image — both readers must agree byte-for-byte.
+        let cases = [
+            (0, 0, 0, 0),
+            (4, 4, 0, 0),
+            (8, 8, 3, 5),
+            (10, 10, -3, -5),
+            (16, 16, 7, 7),
+            (20, 4, -1, 2),
+        ];
+        for (top, left, dx, dy) in cases {
+            let mut p_clamped = [0u8; 64];
+            fetch_prediction_block_clamped(&img, w, h, top, left, dx, dy, &mut p_clamped);
+            let mut p_bordered = [0u8; 64];
+            // Translate (top, left) into the bordered buffer's base_pos.
+            let base_pos = origin + (top as usize) * ext_stride + (left as usize);
+            fetch_prediction_block(&bordered, base_pos, ext_stride, dx, dy, &mut p_bordered);
+            assert_eq!(
+                p_clamped, p_bordered,
+                "in-range case (top={top}, left={left}, dx={dx}, dy={dy}): clamped fetch != bordered fetch"
+            );
+        }
+    }
+
+    /// **The MV-beyond-border equivalence.** For an MV that stays
+    /// inside the 48-sample §11.5 border (so the bordered fetch is
+    /// still in-bounds) but pushes past the *original* image edge, the
+    /// clamped fetch must still agree with the bordered fetch. This
+    /// exercises the spec's edge-replication arithmetic on both sides.
+    #[test]
+    fn clamped_matches_bordered_fetch_for_edge_overhang() {
+        let (w, h) = (32, 32);
+        let img = ramp_image(w, h);
+        let (bordered, ext_stride, _) = crate::umv::build_extended_buffer(&img, w, h);
+        let origin = crate::umv::origin_offset(ext_stride);
+
+        // Each case pushes the 8x8 read at least partially off the
+        // image but stays well within the 48-sample border so the
+        // bordered path is in bounds.
+        let cases = [
+            (0, 0, -8, 0),    // past left edge
+            (0, 0, 0, -8),    // past top edge
+            (0, 0, -8, -8),   // top-left corner
+            (24, 24, 8, 0),   // past right edge
+            (24, 24, 0, 8),   // past bottom edge
+            (24, 24, 8, 8),   // bottom-right corner
+            (0, 16, -20, -4), // left + top, partly overlapping the image
+        ];
+        for (top, left, dx, dy) in cases {
+            let mut p_clamped = [0u8; 64];
+            fetch_prediction_block_clamped(&img, w, h, top, left, dx, dy, &mut p_clamped);
+            let mut p_bordered = [0u8; 64];
+            let base_pos = origin + (top as usize) * ext_stride + (left as usize);
+            fetch_prediction_block(&bordered, base_pos, ext_stride, dx, dy, &mut p_bordered);
+            assert_eq!(
+                p_clamped, p_bordered,
+                "edge-overhang case (top={top}, left={left}, dx={dx}, dy={dy}): clamped fetch != bordered fetch"
+            );
+        }
+    }
+
+    /// MV exceeds the 48-sample §11.5 border — the bordered fetch
+    /// would index out of bounds, but the clamped fetch is well-defined
+    /// and returns edge-replicated samples for every position.
+    #[test]
+    fn clamped_well_defined_beyond_umv_border() {
+        let (w, h) = (16, 16);
+        let img = ramp_image(w, h);
+        let mut pred = [0u8; 64];
+        // MV = (-200, -200) — 200 samples past the top-left corner,
+        // well beyond the 48-sample §11.5 border.
+        fetch_prediction_block_clamped(&img, w, h, 0, 0, -200, -200, &mut pred);
+        // Every sample should clamp to (0, 0).
+        assert_eq!(pred, [img[0]; 64]);
+    }
+
+    /// Per-sample independence: each output sample comes from a
+    /// distinct clamped source, never spilling between rows or columns.
+    #[test]
+    fn clamped_per_sample_independence() {
+        let (w, h) = (32, 32);
+        let mut img = vec![0u8; w * h];
+        // Single bright sample at (10, 12); the rest is 0. Verify the
+        // clamped fetch picks it up at exactly one output position when
+        // the block is positioned to read it.
+        img[10 * w + 12] = 200;
+        let mut pred = [0u8; 64];
+        // Block at (top=8, left=10), MV = (0, 0): reads rows 8..=15, cols 10..=17.
+        // (10, 12) maps to output (r=10-8, c=12-10) = (2, 2).
+        fetch_prediction_block_clamped(&img, w, h, 8, 10, 0, 0, &mut pred);
+        for r in 0..8 {
+            for c in 0..8 {
+                let expected = if r == 2 && c == 2 { 200 } else { 0 };
+                assert_eq!(pred[r * 8 + c], expected, "spurious value at ({r}, {c})");
+            }
+        }
+    }
+
+    /// Degenerate image dimensions panic with a clear message rather
+    /// than producing nonsense or out-of-bounds reads.
+    #[test]
+    #[should_panic(expected = "width must be > 0")]
+    fn clamped_zero_width_panics() {
+        let mut pred = [0u8; 64];
+        fetch_prediction_block_clamped(&[], 0, 16, 0, 0, 0, 0, &mut pred);
+    }
+
+    #[test]
+    #[should_panic(expected = "height must be > 0")]
+    fn clamped_zero_height_panics() {
+        let mut pred = [0u8; 64];
+        fetch_prediction_block_clamped(&[], 16, 0, 0, 0, 0, 0, &mut pred);
+    }
+
+    #[test]
+    #[should_panic(expected = "image too small")]
+    fn clamped_truncated_image_panics() {
+        // Caller claims 16x16 but only supplies 10 bytes.
+        let img = vec![0u8; 10];
+        let mut pred = [0u8; 64];
+        fetch_prediction_block_clamped(&img, 16, 16, 0, 0, 0, 0, &mut pred);
     }
 }

@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 17 (2026-06-01).** The orphan-rebuild
+**Clean-room rebuild — round 18 (2026-06-03).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -705,6 +705,50 @@ implementation is consulted at any stage.
   Same shape as the §13.2 DC update — `B(NewNodeProbFlag)` plus a
   conditional `b(7)` `NewNodeProbValue` — and uses the same
   BoolCoder substrate, but it is its own per-frame ingestion stage.
+
+### What round 18 lands
+
+- `inter::fetch_prediction_block_clamped(image, width, height, top,
+  left, dx, dy, &mut pred)` — the **edge-clamped** integer-MC fetch.
+  §11.5 "Unrestricted Motion Vectors" defines the buffer extension
+  as "duplicating the edge values 48 times", which is mathematically
+  equivalent to clamping the read position into the original image's
+  `[0, width)` x `[0, height)` rectangle (an equivalence the `umv`
+  module already records). The new entry point implements that
+  equivalence directly: instead of reading from a 48-sample-bordered
+  buffer, it reads from the unbordered reference image and clamps each
+  per-sample `(row, col)` source position before the dereference.
+- The §11.5 equivalence is exercised concretely as a property test:
+  for any MV that stays inside the 48-sample §11.5 border the new
+  fetch produces bit-identical output to `fetch_prediction_block` on
+  the §11.5-bordered version of the same image — across both
+  fully-inside reads and the four per-edge / four corner overhang
+  cases. Beyond the 48-sample border (where the bordered fetch would
+  index out of bounds) the clamped fetch remains well-defined and
+  continues to serve up the appropriate corner / edge-row /
+  edge-column pixel.
+- Test count: **378** (15 new, all green). No spec-gap newly
+  encountered; no errata change required.
+
+### What round 18 does NOT land
+
+- Any change to the existing `inter::fetch_prediction_block` /
+  `umv::build_extended_buffer` path. Both remain in place; the
+  bordered buffer is still needed by the §11.4 fractional-pixel
+  interpolation (which reads two samples either side of the integer
+  sample position and is therefore most naturally served by a
+  pre-extended buffer). The clamped fetch is an opt-in
+  memory-efficient alternative for the integer §17.2 / §17.3 path.
+- A fractional-pixel edge-clamped variant. The §11.4
+  bilinear / bicubic interpolation already runs against the
+  §11.5-bordered buffer through `crate::interp`; lifting it onto the
+  edge-clamp form would mean writing a clamped variant that handles
+  the 2- and 4-tap filter reach explicitly, which is a separate
+  logical unit.
+- Any motion-vector decode path. The MV that drives the fetch is
+  parsed upstream and behind the BoolCoder (§10 / §11); this round
+  works strictly on the integer-MC consumer side, identical in scope
+  to the existing `fetch_prediction_block` it sits alongside.
 
 ## License
 

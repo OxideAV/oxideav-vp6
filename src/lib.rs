@@ -449,6 +449,37 @@
 //! `Prec` from the §13.2-decoded DC value is exposed via
 //! [`AcPrecContext::seed_from_dc`] so a future driver round can wire
 //! the DC → first-AC handoff without re-reading the spec.
+//!
+//! ## Round 18 surface — §11.5-derived edge-clamped MC fetch
+//!
+//! [`inter::fetch_prediction_block_clamped`] — the **edge-clamped**
+//! form of the §17.2/§17.3 integer-offset prediction fetch. The §11.5
+//! "Unrestricted Motion Vectors" buffer extension is defined as
+//! "duplicating the edge values 48 times", which (as the
+//! [`umv`] module-level documentation already records) is
+//! mathematically equivalent to clamping the read position into the
+//! original image's valid `[0, width)` x `[0, height)` rectangle.
+//! This entry point implements the equivalence directly: it reads
+//! straight out of the unbordered reference image, clamping each
+//! per-sample `(row, col)` source position before the dereference,
+//! and produces the same output the bordered
+//! [`inter::fetch_prediction_block`] path would have produced for any
+//! MV inside the §11.5 border — bit-identical on in-range reads,
+//! identical edge-replicated values on the overhang reads — without
+//! needing to allocate and fill the bordered buffer. Beyond the
+//! 48-sample border the spec mandates, where the bordered fetch
+//! would index out of bounds, the clamped fetch remains well-defined
+//! and continues to serve up edge-replicated corner / edge pixels.
+//!
+//! What round 18 deliberately does **not** land: there is no spec
+//! mandate that the decoder use one form or the other; the bordered
+//! path remains available for callers that already build the §11.5
+//! buffer (e.g. for the §11.4 fractional-pixel interpolation, which
+//! reads two samples either side of the integer sample position and
+//! is therefore naturally served by a pre-extended buffer). The
+//! clamped fetch is a memory-efficient alternative for the integer
+//! (§17.2 / §17.3) path that doesn't require a per-frame border
+//! materialisation.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -489,8 +520,8 @@ pub use huffman::{
 };
 pub use idct::idct_block;
 pub use inter::{
-    chroma_frac, fetch_prediction_block, inter_block_to_pixels, luma_frac, reconstruct_inter_block,
-    whole_sample_aligned, MvShift,
+    chroma_frac, fetch_prediction_block, fetch_prediction_block_clamped, inter_block_to_pixels,
+    luma_frac, reconstruct_inter_block, whole_sample_aligned, MvShift,
 };
 pub use interp::{
     bicubic_block, bicubic_point, bilinear_block, bilinear_point, var_16_point, BICUBIC_FILTER_SET,
