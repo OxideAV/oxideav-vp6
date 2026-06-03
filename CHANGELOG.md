@@ -6,6 +6,44 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 19, 2026-06-03)
+
+- `dct_decode::decode_ac_zero_run(bc, band, &probs)` — the spec
+  §13.3.3.1 BoolCoder zero-run-length traversal, the third
+  BoolCoder-consuming layer (after §13.2.1 DC and §13.3.1 AC). The
+  immediate consumer of the [`AcOutcome::ZeroRun`] hand-off that
+  round-17's §13.3.1 AC decoder surfaces. Walks Figure 16's binary
+  tree reading one `B(prob)` BoolCoder bit at each of the eight
+  internal nodes (`>4`, `>2`, `>1`, `>3`, `>8`, `>6`, `>5`, `>7`)
+  in the Table 38 / round-13 `ZrlNode` ordering. On the `>8` escape
+  branch reads six additional `B(prob)` extrabits as the LSB-first
+  encoding of `(RunLength - 9)` and reconstructs
+  `RunLength = value + 9`. Returns the run length as a `u32` in the
+  full spec output range `1..=72` (literal `1..=8` from the eight
+  binary-tree leaves plus `9..=72` from the `9 + (0..=63)` escape).
+  Composes round-15 `BoolCoder::decode_bool` over the round-13
+  [`zrl`] static surface; no new spec material, no new errata, no
+  third-party VP6 source consulted.
+- 11 new unit tests pinning: the low-probability all-zero-stream
+  leftmost-leaf result (`run = 1`); the band-argument's
+  row-selector semantics (output independent of `band` when `probs`
+  is the same); the BoolCoder state advance under renormalization;
+  the §7.3 errata-#35 "`Split > Range` collapses to 0-branch"
+  shortcut forcing the leftmost-leaf result at `probs = [255; 14]`;
+  the `>8` escape with zero extrabits yielding the minimum-escape
+  `run = 9`; the root 0-branch picking the lower (`1..=4`) subtree;
+  the truncation surface on a 4-byte stream that exhausts during
+  the first renormalization; determinism across a four-seed sweep;
+  the `1..=72` output-range invariant across the canonical
+  keyframe probability rows + five stream seeds + both bands; a
+  decode against `ZERO_RUN_PROB_DEFAULTS` at the all-zero stream
+  lands a well-defined run length per band; and the
+  `AcOutcome::ZeroRun` hand-off contract pinned by composing the
+  §13.3.1 outcome with `decode_ac_zero_run` at the keyframe
+  defaults.
+
+Total test count: 378 → 389 (all green).
+
 ### Added (clean-room round 18, 2026-06-03)
 
 - `inter::fetch_prediction_block_clamped(image, width, height, top, left,

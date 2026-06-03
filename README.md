@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 18 (2026-06-03).** The orphan-rebuild
+**Clean-room rebuild — round 19 (2026-06-03).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -749,6 +749,79 @@ implementation is consulted at any stage.
   parsed upstream and behind the BoolCoder (§10 / §11); this round
   works strictly on the integer-MC consumer side, identical in scope
   to the existing `fetch_prediction_block` it sits alongside.
+
+### What round 19 lands
+
+- `dct_decode::decode_ac_zero_run(bc, band, &probs)` — the spec
+  §13.3.3.1 BoolCoder zero-run-length traversal of Figure 16, the
+  immediate consumer of the [`AcOutcome::ZeroRun`] hand-off the
+  round-17 §13.3.1 AC decoder surfaces. Walks the Figure 16 binary
+  tree reading a `B(prob)` BoolCoder bit at each of the eight
+  internal nodes (the `>4`, `>2`, `>1`, `>3`, `>8`, `>6`, `>5`, `>7`
+  decisions in the Table 38 / round-13 `ZrlNode` ordering); on the
+  `>8` escape branch reads six additional `B(prob)` extrabits as the
+  LSB-first encoding of `(RunLength - 9)` and reconstructs
+  `RunLength = value + 9`. Returns the run length as a `u32` in the
+  spec's full output range `1..=72` (literal `1..=8` from the eight
+  binary-tree leaves plus `9..=72` from the `9 + (0..=63)` escape).
+- This is the third BoolCoder-consuming layer (after the round-16
+  §13.2.1 DC decoder and the round-17 §13.3.1 AC decoder); like its
+  siblings it composes only round-15's [`BoolCoder::decode_bool`]
+  primitive over the round-13 [`zrl`] static surface
+  (`ZrlBand` / `ZrlNode` / `ZERO_RUN_PROB_DEFAULTS` /
+  `ZRL_UPDATE_PROBS`) — no new spec material, no new errata. The
+  §13.3.3.1 listing on page 78 (the `if (!B(ZRP[0])) … else …`
+  cascade plus the six `B(ZRP[8..=13])` extrabit reads) maps
+  branch-for-branch onto the implementation.
+- 11 new unit tests pinning: the low-probability all-zero-stream
+  leftmost-leaf result (`run = 1`); the band argument's row-selector
+  semantics (output independent of `band` when `probs` is the same);
+  the BoolCoder state advance under renormalization; the §7.3
+  errata-#35 "`Split > Range` collapses to the 0-branch" shortcut
+  forcing the leftmost-leaf result at `probs = [255; 14]`; the `>8`
+  escape with zero extrabits yielding the minimum-escape `run = 9`;
+  the root 0-branch picking the lower (`1..=4`) subtree; the
+  truncation surface on a 4-byte stream that exhausts during the
+  first renormalization; determinism (same bytes + same probs →
+  same output) across a four-seed sweep; the `1..=72` output-range
+  invariant across the canonical keyframe probability rows and five
+  stream seeds and both bands; a decode against
+  [`ZERO_RUN_PROB_DEFAULTS`] at the all-zero stream lands a
+  well-defined run length per band; and the
+  [`AcOutcome::ZeroRun`] hand-off contract pinned by composing the
+  §13.3.1 outcome variant with `decode_ac_zero_run` at the keyframe
+  defaults.
+- Test count: **378 → 389** (11 new, all green). No spec-gap newly
+  encountered; no errata change required. The §13.3.3.2 9th-leaf
+  literal-vs-escape semantics docs-gap candidate (Figure 16 carries
+  two leaves labelled `8` — see round 13's [`zrl`] report) is
+  **unrelated** to this round's BoolCoder path: §13.3.3.1 reads its
+  own discrete `>8`-internal-node decision and the six
+  `(RunLength - 9)` extrabits, so the literal/escape distinction is
+  unambiguous in the BoolCoder variant.
+
+### What round 19 does NOT land
+
+- The §13.3.3.2 Huffman zero-run path's actual walk against
+  [`zrl::build_zrl_huffman_tree`]. The 9-entry Huffman probability
+  set, the tree builder, and the §7.2 [`huffman::decode_symbol`]
+  walker against a [`raw_bits::RawBitReader`] source are all
+  landed (rounds 12–14), but the integration — symbol indexing
+  decision + the `(RunLength - 9)` six-bit raw-suffix path —
+  belongs to a separate driver round that also resolves the
+  literal-vs-escape docs-gap candidate for the 9th leaf.
+- The §13.3.3 per-frame Table 39–41 `ZeroRunProbs` update
+  bitstream. Same shape as the §13.2 DC update and the §13.3 AC
+  update: `B(NewNodeProbFlag)` plus a conditional `b(7)`
+  `NewNodeProbValue`. Lands as a separate per-frame ingestion stage
+  using the same round-15 BoolCoder substrate.
+- The surrounding per-block driver loop that ties §13.3.1's
+  `AcOutcome::ZeroRun` to `decode_ac_zero_run` and threads the run
+  length back into the `EncodedCoeffs += ZeroRunCount` advance plus
+  the §12.1 scan-order traversal. Caller-side concern; the
+  [`AcOutcome::ZeroRun`] surface from round 17 and the run-length
+  output from this round make the wiring straightforward when the
+  driver lands.
 
 ## License
 

@@ -480,6 +480,46 @@
 //! clamped fetch is a memory-efficient alternative for the integer
 //! (§17.2 / §17.3) path that doesn't require a per-frame border
 //! materialisation.
+//!
+//! ## Round 19 surface — §13.3.3.1 arithmetic AC zero-run-length decoder
+//!
+//! * [`decode_ac_zero_run`] — the §13.3.3.1 BoolCoder zero-run-length
+//!   traversal of Figure 16. The immediate consumer of the round-17
+//!   [`AcOutcome::ZeroRun`] hand-off: when the §13.3.1 AC decoder
+//!   produces a `ZERO_TOKEN`, the spec mandates the run of trailing
+//!   zero coefficients that follows is encoded under one of the two
+//!   §7 entropy schemes; this routine implements the BoolCoder path.
+//!   Walks the Figure 16 binary tree reading a `B(prob)` bit at each
+//!   of the eight internal nodes (`>4`, `>2`, `>1`, `>3`, `>8`, `>6`,
+//!   `>5`, `>7`) in the Table 38 / round-13 [`zrl::ZrlNode`] ordering;
+//!   on the `>8` escape reads six `B(prob)` extrabits as the LSB-first
+//!   encoding of `(RunLength - 9)` and reconstructs
+//!   `RunLength = value + 9`. Returns the run length as `u32` in the
+//!   spec's full output range `1..=72` (literal `1..=8` plus the
+//!   `9..=72` escape interval).
+//!
+//!   This is the third BoolCoder-consuming layer (after the round-16
+//!   §13.2.1 DC decoder and round-17 §13.3.1 AC decoder). Composes
+//!   round-15 [`BoolCoder::decode_bool`] over the round-13
+//!   [`zrl`] static surface ([`zrl::ZrlBand`] / [`zrl::ZrlNode`] /
+//!   [`zrl::ZERO_RUN_PROB_DEFAULTS`] / [`zrl::ZRL_UPDATE_PROBS`]) — no
+//!   new spec material, no new errata. The §13.3.3.1 listing on
+//!   page 78 (the `if (!B(ZRP[0])) … else …` cascade plus the six
+//!   `B(ZRP[8..=13])` extrabit reads) maps branch-for-branch onto
+//!   the implementation.
+//!
+//! What round 19 deliberately does **not** land: the §13.3.3.2
+//! Huffman zero-run path's actual walk against
+//! [`zrl::build_zrl_huffman_tree`] (the static surfaces are landed
+//! in rounds 12–14, but the integration with the literal-vs-escape
+//! 9th-leaf docs-gap candidate is its own logical unit); the
+//! §13.3.3 per-frame Table 39–41 `ZeroRunProbs` update bitstream
+//! (`B(NewNodeProbFlag)` + conditional `b(7)` `NewNodeProbValue` —
+//! same shape as §13.2 / §13.3); and the surrounding per-block
+//! driver loop that ties [`AcOutcome::ZeroRun`] to
+//! [`decode_ac_zero_run`] and threads the run length back into
+//! `EncodedCoeffs += ZeroRunCount` plus the §12.1 scan-order
+//! traversal.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -509,8 +549,8 @@ pub use dc_pred::{
     average_both_neighbours, sign as dc_sign, DcPredictionContext, Neighbour, ReferenceBucket,
 };
 pub use dct_decode::{
-    decode_ac_coefficient, decode_ac_token, decode_dc, decode_dc_token, decode_token_value,
-    AcOutcome,
+    decode_ac_coefficient, decode_ac_token, decode_ac_zero_run, decode_dc, decode_dc_token,
+    decode_token_value, AcOutcome,
 };
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
