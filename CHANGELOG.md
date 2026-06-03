@@ -6,6 +6,82 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 21, 2026-06-04)
+
+- `mv_decode` module — the spec §11.1 per-component motion-vector
+  arithmetic decoder, the fifth BoolCoder-consuming layer (after
+  rounds 16's §13.2.1 DC, 17's §13.3.1 AC, 19's §13.3.3.1 ZRL
+  token and 20's per-frame probability-update layers). Decodes one
+  signed motion-vector component from a `BoolCoder` byte stream by
+  composing four per-axis probability banks: `IsMvShortProbs[axis]`
+  (short-vs-long discriminator), `ShortMvProbs[axis][0..=6]`
+  (Figure 11 three-bit short-tree), `MvSizeProbs[axis][0..=7]`
+  (seven-bit traversal in `[0, 1, 2, 7, 6, 5, 4]` order plus a
+  conditional bit-3 read), and `MvSignProbs[axis]` (sign bit
+  with negation). Returns a signed `i32` in the §11.1-staged
+  decoder range `-255..=255`. Surfaces:
+  - `decode_short_mv_magnitude(bc, &short)` — Figure 11 short-MV
+    tree walk; magnitude `0..=7`.
+  - `decode_long_mv_magnitude(bc, &size)` — seven-bit traversal
+    plus the conditional `B(size[3])` bit-3 read; magnitude
+    `8..=255`.
+  - `decode_mv_component(bc, &probs)` — per-component wrapper
+    composing magnitude + sign.
+  - `decode_mv_pair(bc, &[probs_x, probs_y])` — full `(x, y)`
+    pair, x first then y per the §11.1 outer loop.
+  - `MvProbs` per-axis bundle with `defaults(axis)` constructor.
+  - `IS_MV_SHORT_PROBS_DEFAULTS` (`{162, 164}`),
+    `SHORT_MV_PROBS_DEFAULTS` (`{225, 146, 172, 147, 214, 39,
+    156}` / `{204, 170, 119, 235, 140, 230, 228}`),
+    `MV_SIZE_PROBS_DEFAULTS` (`{247, 210, 135, 68, 138, 220,
+    239, 246}` / `{244, 184, 201, 44, 173, 221, 239, 253}`),
+    `MV_SIGN_PROBS_DEFAULTS` (`{128, 128}`) — verbatim §11.1
+    `Default_*` initialisers.
+- 18 new unit tests pinning: the short-tree zero-path
+  short-circuit; the short-tree all-1-path max-magnitude (3-bit
+  walk → 7); the short-magnitude `0..=7` range invariant across
+  both default-axis rows and four byte streams; the BoolCoder
+  bit-advance bound through the short walk; the long-MV all-zero
+  "implicit-bit-3" path yielding `0x08`; the long-MV all-ones
+  path yielding `0xFF`; the long-MV `>= 8` lower bound; the
+  long-MV high-bits branch reading bit 3; per-component positive
+  + negative + zero-stream + ones-stream composite decodes
+  against varied prob banks; the signed range invariant across
+  the two §11.1 default-vector rows and three streams;
+  determinism (same bytes + probs → same output) across two
+  independent runs; pair-decoder x-axis independence (x with
+  default probs, y with varied probs → x agrees across runs);
+  truncation on a 4-byte buffer that exhausts during the
+  per-component traversal; default-probs-against-zero-stream
+  produces a well-defined signed result.
+
+Total test count: 405 → 423 (18 new, all green). No spec gap
+encountered; no errata change required. Composes only round-15
+`BoolCoder::decode_bool` over the verbatim §11.1 default
+probability tables — no new spec material, no third-party VP6
+source consulted.
+
+### Deferred (round 21 follow-ups)
+
+- §11.2 per-frame MV-probability update bitstream — same shape
+  as the §13.2 / §13.3 / §13.3.3 updates already landed in
+  `prob_update`; lands as a thin wrapper over the existing
+  `decode_new_node_prob` primitive once §11.2's flag-prob tables
+  are transcribed.
+- §10 `VP6_DecodeMode` mode-decoder traversal — literal
+  pseudo-code's indentation is ambiguous around the
+  `B(Stats[0])` / `B(Stats[2])` else-branches; reported as a
+  DOCS-GAP candidate (separate from the round-13
+  `zrl::ZrlNode` 9th-leaf candidate and the round-15-resolved
+  §7.3 `Split` formula entry #35).
+- §10 `CODE_INTER_FOURMV` per-block 2-bit codeword (Table 10);
+  trivial on the existing BoolCoder substrate but distinct
+  logical unit.
+- §11 differential MV reconstruction — combining a decoded
+  delta with the same-reference neighbour MV (or absolute
+  fallback). Lives in the §10 caller alongside the
+  `modes::NEAR_MACROBLOCKS` traversal.
+
 ### Added (clean-room round 20, 2026-06-03)
 
 - `prob_update` module — the per-frame BoolCoder-coded

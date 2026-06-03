@@ -551,6 +551,46 @@
 //! integration with the §13.3.3.2 Huffman zero-run path (still gated
 //! by the literal-vs-escape 9th-leaf docs-gap candidate from round 13's
 //! [`zrl`] report).
+//!
+//! ## Round 21 surface — §11.1 motion-vector component decoder
+//!
+//! * [`mv_decode`] — the spec §11.1 per-component motion-vector
+//!   arithmetic decoder, the **fifth BoolCoder-consuming layer**
+//!   (after rounds 16's §13.2.1 DC, 17's §13.3.1 AC, 19's §13.3.3.1
+//!   ZRL token and 20's per-frame probability-update layers).
+//!   Decodes one signed motion-vector component from a
+//!   [`BoolCoder`] byte stream by composing four per-axis
+//!   probability banks (`IsMvShortProbs`, `ShortMvProbs`,
+//!   `MvSizeProbs`, `MvSignProbs` — verbatim §11.1 defaults staged
+//!   as [`mv_decode::IS_MV_SHORT_PROBS_DEFAULTS`],
+//!   [`mv_decode::SHORT_MV_PROBS_DEFAULTS`],
+//!   [`mv_decode::MV_SIZE_PROBS_DEFAULTS`],
+//!   [`mv_decode::MV_SIGN_PROBS_DEFAULTS`]).
+//!
+//!   The decoder splits short vectors (magnitude `0..=7`, three
+//!   BoolCoder reads walking the Figure 11 binary tree) from long
+//!   vectors (magnitude `8..=255` decoder-side; §11.1 caps the
+//!   encoder side at `<= 127`) via a single `B(IsVectorShort)`
+//!   discriminator. Long vectors traverse seven bit positions in
+//!   the spec-mandated order `[0, 1, 2, 7, 6, 5, 4]` then read
+//!   bit 3 conditionally on whether bits `4..=7` are non-zero
+//!   (otherwise bit 3 is implicit `1`). A final
+//!   `B(MvSignProbs[axis])` sign bit toggles negation. The
+//!   [`mv_decode::decode_mv_pair`] wrapper composes the two
+//!   per-axis decodes into the `(x, y)` pair §11.1's outer
+//!   `for i = 0..=1` loop produces.
+//!
+//! What round 21 deliberately does **not** land: the §11.2
+//! per-frame MV-probability update bitstream (same shape as the
+//! §13.2 / §13.3 / §13.3.3 updates already in [`prob_update`]);
+//! the §10 mode-decode traversal (literal pseudo-code's
+//! indentation is ambiguous around the `B(Stats[0])` /
+//! `B(Stats[2])` else-branches; reported as a DOCS-GAP
+//! candidate); the §10 `CODE_INTER_FOURMV` per-block 2-bit
+//! codeword (Table 10, distinct logical unit); and the §11
+//! differential MV reconstruction layer (combining decoded delta
+//! with same-reference neighbour MV; lives in the §10 caller
+//! alongside the [`modes::NEAR_MACROBLOCKS`] traversal).
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -568,6 +608,7 @@ pub mod inter;
 pub mod interp;
 pub mod loopfilter;
 pub mod modes;
+pub mod mv_decode;
 pub mod prob_update;
 pub mod raw_bits;
 pub mod reconstruct;
@@ -608,6 +649,12 @@ pub use modes::{
     probability_mode_same, CodingMode, ModeAvailability, ModeDecisionTree, ModeDecisionTreeRow,
     NEAR_MACROBLOCKS, NUM_CODING_MODES, NUM_MODE_DECISION_NODES, NUM_MODE_VQ_VECTORS,
     NUM_PROBABILITY_SITUATIONS, PROB_XMITTED_ROW_LEN, VP6_BASELINE_XMITTED_PROBS, VP6_MODE_VQ,
+};
+pub use mv_decode::{
+    decode_long_mv_magnitude, decode_mv_component, decode_mv_pair, decode_short_mv_magnitude,
+    MvProbs, IS_MV_SHORT_PROBS_DEFAULTS, MV_AXIS_X, MV_AXIS_Y, MV_SIGN_PROBS_DEFAULTS,
+    MV_SIZE_PROBS_DEFAULTS, NUM_MV_AXES, NUM_MV_SIZE_NODES, NUM_SHORT_MV_NODES,
+    SHORT_MV_PROBS_DEFAULTS,
 };
 pub use prob_update::{
     decode_new_node_prob, update_ac_probs, update_dc_probs, update_zero_run_probs,

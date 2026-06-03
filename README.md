@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 20 (2026-06-03).** The orphan-rebuild
+**Clean-room rebuild — round 21 (2026-06-04).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -896,6 +896,109 @@ implementation is consulted at any stage.
 - The §13.3.3.2 Huffman zero-run path's literal-vs-escape
   9th-leaf integration. Still gated by the docs-gap candidate from
   round 13's [`zrl`] report.
+
+### What round 21 lands
+
+- `mv_decode` module — the spec §11.1 per-component motion-vector
+  arithmetic decoder, the **fifth BoolCoder-consuming layer** (after
+  rounds 16's §13.2.1 DC, 17's §13.3.1 AC, 19's §13.3.3.1 ZRL token
+  and 20's per-frame probability-update layers). §11.1 describes how
+  one signed component of a "new" motion vector is decoded from the
+  bitstream by repeated BoolCoder reads against four per-axis
+  probability banks:
+  - `IsMvShortProbs[axis]` — the short-vs-long discriminator
+    (single `B(...)` read).
+  - `ShortMvProbs[axis][0..=6]` — the Figure 11 short-MV binary
+    tree (3 BoolCoder reads producing magnitude `0..=7`).
+  - `MvSizeProbs[axis][0..=7]` — the long-MV bit-position
+    probabilities (seven BoolCoder reads in traversal order
+    `[0, 1, 2, 7, 6, 5, 4]`, then conditionally bit 3 if any of
+    bits `4..=7` are non-zero; otherwise bit 3 is implicit `1`).
+  - `MvSignProbs[axis]` — the sign bit (final `B(...)` read with
+    negation).
+- Surfaces:
+  - `decode_short_mv_magnitude(bc, &short)` — Figure 11 short-MV
+    tree walk, magnitude `0..=7`.
+  - `decode_long_mv_magnitude(bc, &size)` — the seven-bit traversal
+    plus the conditional `B(size[3])` bit-3 read, magnitude
+    `8..=255` (decoder formula bounds; §11.1's `<= 127` cap is an
+    encoder-side constraint per "a long vector is defined as a
+    vector with a length that is … less than or equal to 127").
+  - `decode_mv_component(bc, &probs)` — the per-component wrapper:
+    `B(IsVectorShort)` discriminator, short/long magnitude path,
+    `B(MvSignProbs)` sign read with negation. Returns signed `i32`.
+  - `decode_mv_pair(bc, &[probs_x, probs_y])` — full `(x, y)` pair,
+    x first then y per §11.1's outer `for i = 0..=1` loop.
+  - `MvProbs` — per-axis bundle (`is_short`, `short`, `size`,
+    `sign`) plus `defaults(axis)` constructor.
+  - `IS_MV_SHORT_PROBS_DEFAULTS` / `SHORT_MV_PROBS_DEFAULTS` /
+    `MV_SIZE_PROBS_DEFAULTS` / `MV_SIGN_PROBS_DEFAULTS` — the
+    verbatim §11.1 `Default_*` initialisers.
+- 18 new unit tests pinning: the short-tree zero-path
+  short-circuit; the short-tree all-1-path max-magnitude path
+  (3-bit-deep walk yielding 7); the short magnitude range
+  `0..=7` invariant across both default axis rows and four byte
+  streams; the BoolCoder bit-advance bound through the short
+  walk; the long-MV all-zero "implicit-bit-3" path yielding
+  `0x08`; the long-MV all-ones path yielding `0xFF`; the
+  long-MV lower-bound at the §11.1 `>= 8` floor; the long-MV
+  read of bit 3 against the high-bits branch; per-component
+  positive + negative + zero-stream + ones-stream
+  composite decodes; the signed range invariant across
+  default-vector probs; determinism (same bytes + probs →
+  same output); pair-decoder axis independence (x with one
+  prob set, y with another → x agrees across runs); truncation
+  on a 4-byte buffer; default-against-zero-stream produces a
+  well-defined signed result.
+- Test count: **405 → 423** (18 new, all green). No spec gap
+  newly encountered; no errata change required. Composes only
+  round-15's [`BoolCoder::decode_bool`] over the verbatim §11.1
+  default probability tables — no new spec material, no new
+  errata, no third-party VP6 source consulted.
+
+### What round 21 does NOT land
+
+- The §11.2 per-frame MV-probability update bitstream. Same
+  two-field shape as the §13.2 / §13.3 / §13.3.3 updates already
+  landed in [`prob_update`] (`B(flag_prob)` plus a conditional
+  `b(7)` `NewNodeProbValue`); the §11.2 driver is a thin wrapper
+  over the existing `decode_new_node_prob` primitive once §11.2's
+  flag-prob tables are transcribed (separate per-codec wiring
+  round).
+- The §10 mode-decode itself, which signals whether an MV is
+  present for the current MB. The literal §10 `VP6_DecodeMode`
+  pseudo-code's indentation is ambiguous around the
+  `B(Stats[0]) == 0` branch (the inner `mode = CODE_INTRA;` is
+  followed by `if (B(Stats[5])) ... else if (B(Stats[1])) ...
+  else if (B(Stats[3])) ...` whose indentation could be parsed
+  as either nested inside the `else` of `B(Stats[2])` or as the
+  outer `else` of `B(Stats[0])`). The Figure 10 tree shape
+  (left subtree: Inter modes + Intra + 4MV; right subtree:
+  Golden modes) implies a specific traversal that the literal
+  pseudo-code does not unambiguously match. The static surface
+  (`probXmitted`, `ModeDecisionTree`, `probModeSame`) is in
+  place from round 10; the mode-decoder traversal stays deferred
+  pending a docs-gap clarification report.
+- **DOCS-GAP candidate:** §10 `VP6_DecodeMode` literal
+  pseudo-code (page 36) — the indentation of the `B(Stats[0])`
+  / `B(Stats[2])` else-branches and the placement of
+  `mode = CODE_INTRA;` create three plausible readings. A
+  spec-faithful trace (one byte sequence walked through both
+  Figure 10 and the literal pseudo-code) would pin which
+  reading is intended.
+- The §10 `CODE_INTER_FOURMV` per-block 2-bit codeword (Table
+  10, two fixed-probability-128 bits selecting from
+  `{CODE_INTER_NO_MV, CODE_INTER_PLUS_MV, CODE_INTER_NEAREST_MV,
+  CODE_INTER_NEAR_MV}`). Lands cleanly on the existing
+  `BoolCoder::decode_b1` primitive but is a separate logical
+  unit — deferred to a per-MB driver wiring round alongside
+  the resolved §10 mode-decoder.
+- The §11 differential MV reconstruction (new vector = decoded
+  delta + same-reference neighbour MV, or absolute when no
+  qualifying neighbour exists). This module decodes one delta
+  component; the neighbour-MV resolution traversal lives in the
+  §10 caller (the [`modes::NEAR_MACROBLOCKS`] offsets landed in
+  round 10).
 
 ## License
 
