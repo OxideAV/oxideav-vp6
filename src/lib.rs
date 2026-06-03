@@ -520,6 +520,37 @@
 //! [`decode_ac_zero_run`] and threads the run length back into
 //! `EncodedCoeffs += ZeroRunCount` plus the §12.1 scan-order
 //! traversal.
+//!
+//! ## Round 20 surface — §13.2 / §13.3 / §13.3.3 per-frame probability updates
+//!
+//! * [`prob_update`] — the per-frame BoolCoder-coded probability-update
+//!   bitstream the §13.2 DC, §13.3 AC and §13.3.3 ZRL token decoders
+//!   all consume to mutate their persistent probability banks at every
+//!   frame. The three update bitstreams share the same per-node shape
+//!   ([`prob_update::decode_new_node_prob`]: one `B(flag_prob)` followed
+//!   by a conditional `b(7)` `NewNodeProbValue` reconstructed as
+//!   `max(1, value * 2)` per the §13.2 Table 24 commentary), differing
+//!   only in the nested traversal that walks them across the persistent
+//!   bank: [`prob_update::update_dc_probs`] over Tables 22 / 23 / 24,
+//!   [`prob_update::update_ac_probs`] over Tables 31 / 32 / 33 / 34 / 35,
+//!   and [`prob_update::update_zero_run_probs`] over Tables 39 / 40 / 41.
+//!
+//!   This is the fourth BoolCoder-consuming layer (after rounds 16's
+//!   §13.2.1 DC, 17's §13.3.1 AC, and 19's §13.3.3.1 ZRL token decoders).
+//!   It composes only round-15's [`BoolCoder::decode_bool`] and
+//!   [`BoolCoder::decode_b`] — no new spec material, no new errata.
+//!   Wires directly against the [`tokens::VP6_DC_UPDATE_PROBS`] /
+//!   [`tokens::AC_UPDATE_PROBS`] / [`zrl::ZRL_UPDATE_PROBS`] flag
+//!   probability banks already staged in earlier rounds.
+//!
+//! What round 20 deliberately does **not** land: the per-frame driver
+//! that interleaves DC update → DC decode → AC update → AC decode →
+//! ZRL update → ZRL decode in their spec-mandated order; the keyframe-
+//! vs-interframe gating of the update bitstream by the §9 frame header
+//! flags (deferred behind the §9 BoolCoder-tail parser); and the
+//! integration with the §13.3.3.2 Huffman zero-run path (still gated
+//! by the literal-vs-escape 9th-leaf docs-gap candidate from round 13's
+//! [`zrl`] report).
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -537,6 +568,7 @@ pub mod inter;
 pub mod interp;
 pub mod loopfilter;
 pub mod modes;
+pub mod prob_update;
 pub mod raw_bits;
 pub mod reconstruct;
 pub mod scan;
@@ -576,6 +608,9 @@ pub use modes::{
     probability_mode_same, CodingMode, ModeAvailability, ModeDecisionTree, ModeDecisionTreeRow,
     NEAR_MACROBLOCKS, NUM_CODING_MODES, NUM_MODE_DECISION_NODES, NUM_MODE_VQ_VECTORS,
     NUM_PROBABILITY_SITUATIONS, PROB_XMITTED_ROW_LEN, VP6_BASELINE_XMITTED_PROBS, VP6_MODE_VQ,
+};
+pub use prob_update::{
+    decode_new_node_prob, update_ac_probs, update_dc_probs, update_zero_run_probs,
 };
 pub use raw_bits::{RawBitError, RawBitReader};
 pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};

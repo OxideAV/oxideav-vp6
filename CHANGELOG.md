@@ -6,6 +6,60 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 20, 2026-06-03)
+
+- `prob_update` module — the per-frame BoolCoder-coded
+  probability-update bitstream the §13.2 DC, §13.3 AC and §13.3.3 ZRL
+  token decoders all consume to mutate their persistent probability
+  banks at every frame. The fourth BoolCoder-consuming layer (after
+  rounds 16's §13.2.1 DC, 17's §13.3.1 AC and 19's §13.3.3.1 ZRL
+  token decoders). Three update bitstreams share the same per-node
+  shape (Tables 24, 35 and 41 are all the same two-field record:
+  `B(flag_prob)` `NewNodeProbFlag` followed by a conditional `b(7)`
+  `NewNodeProbValue`) and the same disambiguated reading of
+  "½ of the new probability value" (§13.2 Table 24 commentary):
+  `new_prob = max(1, NewNodeProbValue * 2)`. The 7-bit raw read puts
+  `NewNodeProbValue` in `0..=127`; doubling gives `0..=254`; the spec
+  clip converts the `0` case to `1`. Surfaces:
+  - `prob_update::decode_new_node_prob(bc, flag_prob)` — the per-node
+    step, returning `Ok(None)` on skip or `Ok(Some(prob))` on update.
+  - `prob_update::update_dc_probs(bc, &mut dc_probs, &flag_probs)` —
+    the §13.2 driver, walking Tables 22 / 23 / 24 as
+    `for plane in 0..2 { for node in 0..11 { ... } }`.
+  - `prob_update::update_ac_probs(bc, &mut ac_probs, &flag_probs)` —
+    the §13.3 driver, walking Tables 31 / 32 / 33 / 34 / 35 as
+    `for prec in 0..3 { for plane in 0..2 { for band in 0..6 { for
+    node in 0..11 { ... } } } }`. Notes the spec's two different
+    dimension orderings: `AcProbs[plane][prec][band][node]` (the
+    per-token bank §13.3.1 reads) vs `AcUpdateProbs[prec][plane]
+    [band][node]` (the flag-prob bank this driver walks), and writes
+    the spec walk order into the `AcProbs`-shaped target.
+  - `prob_update::update_zero_run_probs(bc, &mut zero_run_probs,
+    &flag_probs)` — the §13.3.3 driver, walking Tables 39 / 40 / 41
+    as `for band in 0..2 { for node in 0..14 { ... } }`.
+- 16 new unit tests pinning: the `flag_prob = 255` shortcut to
+  `None` (errata-#35 `Split == Range` 0-branch); the flag-set path
+  reading seven `b(7)` raw-bit tail; the `0 → 1` clip on the spec's
+  "½ of the new probability value" formula; the `None` return as a
+  no-op on the persistent bank; the `(1..=255)` range invariant
+  swept across `flag_prob ∈ {1, 64, 128, 192, 254}` and three
+  representative byte streams; the three drivers' deterministic
+  reproduction across two independent runs; the three drivers'
+  range invariant across the full `[2 * 11]` (DC), `[2][3][6][11]`
+  (AC) and `[2][14]` (ZRL) bank entries; the truncation surface on
+  a 4-byte buffer that exhausts during the DC walk; the AC walk's
+  byte-budget consumption against the worst-case `8 *
+  396 = 3168` BoolCoder-bit estimate; and the direct formula
+  invariants sweep over all 128 `b(7)` values (clip-to-1, parity
+  preservation under non-clip).
+
+Total test count: 389 → 405 (16 new, all green). No spec gap
+encountered; no errata change required. Composes only round-15
+`BoolCoder::decode_bool` / `decode_b` and the staged §13 lookup
+tables (`VP6_DC_UPDATE_PROBS`, `AC_UPDATE_PROBS`,
+`ZRL_UPDATE_PROBS`) — no new spec material, no third-party VP6
+source consulted.
+
 ### Added (clean-room round 19, 2026-06-03)
 
 - `dct_decode::decode_ac_zero_run(bc, band, &probs)` — the spec

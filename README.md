@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 19 (2026-06-03).** The orphan-rebuild
+**Clean-room rebuild — round 20 (2026-06-03).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -822,6 +822,80 @@ implementation is consulted at any stage.
   [`AcOutcome::ZeroRun`] surface from round 17 and the run-length
   output from this round make the wiring straightforward when the
   driver lands.
+
+### What round 20 lands
+
+- `prob_update` module — the per-frame BoolCoder-coded
+  probability-update bitstream the §13.2 DC, §13.3 AC and §13.3.3
+  ZRL token decoders all consume to mutate their persistent
+  probability banks at every frame. The fourth BoolCoder-consuming
+  layer (after rounds 16's §13.2.1 DC, 17's §13.3.1 AC and 19's
+  §13.3.3.1 ZRL token decoders). The three update bitstreams share
+  the same per-node shape (Tables 24, 35 and 41 are all the same
+  two-field record: `B(flag_prob)` `NewNodeProbFlag` followed by a
+  conditional `b(7)` `NewNodeProbValue`) and the same disambiguated
+  reading of "½ of the new probability value" (§13.2 Table 24
+  commentary): `new_prob = max(1, NewNodeProbValue * 2)`.
+- `prob_update::decode_new_node_prob(bc, flag_prob)` — the per-node
+  step, returning `Ok(None)` on `NewNodeProbFlag == 0` (skip) or
+  `Ok(Some(prob))` on `NewNodeProbFlag == 1` (update).
+- `prob_update::update_dc_probs(bc, &mut dc_probs, &flag_probs)` —
+  the §13.2 driver, walking Tables 22 / 23 / 24 in the
+  `[plane][node]` traversal order. Wires against
+  [`tokens::VP6_DC_UPDATE_PROBS`] as the flag-prob bank and
+  mutates a `DcProbs[2][11]`-shaped persistent bank in place.
+- `prob_update::update_ac_probs(bc, &mut ac_probs, &flag_probs)` —
+  the §13.3 driver, walking Tables 31 / 32 / 33 / 34 / 35 in the
+  `[prec][plane][band][node]` traversal order. Notes the spec's
+  two different dimension orderings: `AcProbs[plane][prec][band]
+  [node]` (the per-token bank §13.3.1 reads from, matching
+  [`tokens::baseline_ac_probs`]) vs `AcUpdateProbs[prec][plane]
+  [band][node]` (the flag-prob bank this driver walks, matching
+  [`tokens::AC_UPDATE_PROBS`]), and writes the spec walk order
+  into the `AcProbs`-shaped target via outer-two-index remap.
+- `prob_update::update_zero_run_probs(bc, &mut zero_run_probs,
+  &flag_probs)` — the §13.3.3 driver, walking Tables 39 / 40 / 41
+  in the `[band][node]` traversal order. Wires against
+  [`zrl::ZRL_UPDATE_PROBS`] as the flag-prob bank and mutates a
+  `ZeroRunProbs[2][14]`-shaped persistent bank in place.
+- Like §15/§16/§17/§11/§12.1/§14/§10/§13/§7.2/§3/§7.3/§13.2.1/
+  §13.3.1/§13.3.3.1 this module composes only round-15's
+  [`BoolCoder::decode_bool`] / [`BoolCoder::decode_b`] primitives —
+  no new spec material, no new errata.
+- 16 new unit tests pinning: the `flag_prob = 255` shortcut to
+  `None` (errata-#35 `Split == Range` 0-branch); the flag-set
+  path reading seven `b(7)` raw-bit tail; the `0 → 1` clip on the
+  spec's "½ of the new probability value" formula; the `None`
+  return as a no-op on the persistent bank; the `(1..=255)`
+  range invariant swept across `flag_prob ∈ {1, 64, 128, 192,
+  254}` and three representative byte streams; the three drivers'
+  deterministic reproduction across two independent runs; the
+  three drivers' range invariant across the full `[2 * 11]` (DC),
+  `[2][3][6][11]` (AC) and `[2][14]` (ZRL) bank entries; the
+  truncation surface on a 4-byte buffer that exhausts during the
+  DC walk; the AC walk's byte-budget consumption against the
+  worst-case `8 * 396 = 3168` BoolCoder-bit estimate; and the
+  direct formula invariants sweep over all 128 `b(7)` values
+  (clip-to-1, parity preservation under non-clip).
+- Test count: **389 → 405** (16 new, all green). No spec-gap
+  newly encountered; no errata change required.
+
+### What round 20 does NOT land
+
+- The per-frame driver that interleaves DC update → DC decode →
+  AC update → AC decode → ZRL update → ZRL decode in their
+  spec-mandated order; each per-frame ingest stage has its own
+  per-bitstream-position constraints (see §9 frame header and
+  §13's "Updates to this Baseline set of probabilities are made on
+  each frame" commentary) that belong to a wiring round, not a
+  per-stage round.
+- The keyframe-vs-interframe gating of the update bitstream by the
+  §9 frame header flags. Deferred behind the §9 BoolCoder-tail
+  parser; the round-1 raw-bit prefix only reaches the
+  pre-BoolCoder switch.
+- The §13.3.3.2 Huffman zero-run path's literal-vs-escape
+  9th-leaf integration. Still gated by the docs-gap candidate from
+  round 13's [`zrl`] report.
 
 ## License
 
