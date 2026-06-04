@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 21 (2026-06-04).** The orphan-rebuild
+**Clean-room rebuild — round 22 (2026-06-04).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced exclusively from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -999,6 +999,69 @@ implementation is consulted at any stage.
   component; the neighbour-MV resolution traversal lives in the
   §10 caller (the [`modes::NEAR_MACROBLOCKS`] offsets landed in
   round 10).
+
+### What round 22 lands
+
+- `mv_prob_update` module — the spec §11.2 per-frame motion-vector
+  probability-update bitstream, the **sixth BoolCoder-consuming
+  layer** (after rounds 16's §13.2.1 DC, 17's §13.3.1 AC, 19's
+  §13.3.3.1 ZRL token, 20's §13.2/§13.3/§13.3.3 per-frame
+  probability updates, and 21's §11.1 MV component decoder).
+  Walks the Table 13 update bitstream against four
+  flag-probability lookup banks, mutating the persistent
+  `[MvProbs; 2]` bank in place via the shared
+  `prob_update::decode_new_node_prob` primitive — same
+  `B(flag_prob)` + optional `b(7)` `NewProbability =
+  max(1, value * 2)` recipe the §13 updates use. Surfaces:
+  - `update_mv_probs(bc, &mut [MvProbs; 2])` — the Table 13
+    walker. Iteration order, top-to-bottom per Table 13: X
+    top-level (short-discriminator + sign), Y top-level, X
+    short-tree (7 nodes), Y short-tree (7 nodes), X long-bits
+    (8 bit positions in `LONG_VECTOR_BIT_ORDER`), Y long-bits.
+  - `UPDATE_IS_MV_SHORT_PROBABILITIES` (`{237, 231}`),
+    `UPDATE_MV_SIGN_PROBABILITIES` (`{246, 243}`),
+    `UPDATE_SHORT_VECTOR_NODE_PROBABILITIES`
+    (`[[253,253,254,…], [245,253,254,…]]`),
+    `UPDATE_LONG_VECTOR_BIT_PROBABILITIES`
+    (`[[254,…,250,250,252], [254,…,251,251,254]]`) — verbatim
+    §11.2 `Update*Probabilities` initialisers (page 43-44).
+  - `LONG_VECTOR_BIT_ORDER` — the eight-entry traversal-to-bit
+    permutation `[0, 1, 2, 7, 6, 5, 4, 3]` Table 15 walks.
+    Differs from §11.1's decode-time traversal
+    `[0, 1, 2, 7, 6, 5, 4]` by the trailing `3`: at update
+    time bit 3's probability is always present.
+- 9 new unit tests pinning the verbatim flag-probability
+  tables; the `LONG_VECTOR_BIT_ORDER` permutation vs `0..=7`;
+  the order's length-matches-`NUM_MV_SIZE_NODES`; the
+  flag-bank dimensions vs `MvProbs` shape; the helper
+  functions' signatures (compile-time shape check); Table 13's
+  X-before-Y step-order constants; the round-20
+  `decode_new_node_prob` primitive round-trip at moderate
+  flag-prob `128`; the X-row vs Y-row root-node flag-prob
+  asymmetry on the short-tree; and the long-vector flag-prob
+  tail-vs-head ordering.
+
+### What round 22 does NOT land
+
+- Sample-exact stream-driven walk against a real .vp6
+  inter-frame fixture. The published §11.2 flag-prob banks
+  cluster at the top of `1..=255`; the round-15 BoolCoder's
+  behaviour at `Probability > 128` on synthetic high-prob
+  streams drives the implementation's internal `range`
+  accumulator outside the round-15 self-correcting envelope
+  documented in errata #35. Sample-exact validation needs an
+  integration test bound to a conformant .vp6 bitstream
+  (encoder-produced, not synthetic).
+- Intra-vs-inter gating of the §11.2 walk (intra frames reset
+  the bank to §11.1 defaults instead of walking the update
+  bitstream; lives in the upstream per-frame driver alongside
+  the §9 BoolCoder-tail).
+- The §10 mode-decode traversal (DOCS-GAP candidate carried
+  forward from round 21 — the `B(Stats[0])` / `B(Stats[2])`
+  else-branch indentation ambiguity).
+- The §10 `CODE_INTER_FOURMV` per-block 2-bit codeword.
+- The §11 differential MV reconstruction (combining a decoded
+  delta with the same-reference neighbour MV).
 
 ## License
 

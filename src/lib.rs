@@ -591,6 +591,48 @@
 //! differential MV reconstruction layer (combining decoded delta
 //! with same-reference neighbour MV; lives in the §10 caller
 //! alongside the [`modes::NEAR_MACROBLOCKS`] traversal).
+//!
+//! ## Round 22 surface — §11.2 per-frame MV probability updates
+//!
+//! * [`mv_prob_update`] — the spec §11.2 per-frame motion-vector
+//!   probability-update bitstream, the **sixth BoolCoder-consuming
+//!   layer** (after rounds 16's §13.2.1 DC, 17's §13.3.1 AC, 19's
+//!   §13.3.3.1 ZRL token, 20's §13.2/§13.3/§13.3.3 per-frame
+//!   probability updates, and 21's §11.1 MV component decoder).
+//!   Walks the Table 13 update bitstream, mutating the persistent
+//!   `[MvProbs; 2]` bank in place against four flag-probability
+//!   lookup banks:
+//!   [`mv_prob_update::UPDATE_IS_MV_SHORT_PROBABILITIES`]
+//!   `{237, 231}`,
+//!   [`mv_prob_update::UPDATE_MV_SIGN_PROBABILITIES`] `{246, 243}`,
+//!   [`mv_prob_update::UPDATE_SHORT_VECTOR_NODE_PROBABILITIES`]
+//!   `[[253,253,254,…], [245,253,254,…]]`, and
+//!   [`mv_prob_update::UPDATE_LONG_VECTOR_BIT_PROBABILITIES`]
+//!   `[[254,…,250,250,252], [254,…,251,251,254]]` — all verbatim
+//!   §11.2 constants from page 43-44.
+//!
+//!   Each per-node step reuses the shared
+//!   [`prob_update::decode_new_node_prob`] primitive — same
+//!   `B(flag_prob)` + optional `b(7)` two-field record and the
+//!   same `NewProbability = (DecodedValue << 1) max 1` conversion
+//!   the §13.2 / §13.3 / §13.3.3 updates use, so the §11.2 driver
+//!   is the thin wrapper round 21 forecast. Surfaces
+//!   [`mv_prob_update::update_mv_probs`] (the Table 13 walker,
+//!   eight steps in the spec-mandated x-then-y per-bank order)
+//!   plus the eight-entry
+//!   [`mv_prob_update::LONG_VECTOR_BIT_ORDER`] `[0,1,2,7,6,5,4,3]`
+//!   permutation that Table 15 traverses against
+//!   `MvSizeProbs[axis][bit_position]`.
+//!
+//! What round 22 deliberately does **not** land: the
+//! intra-vs-inter gating of the §11.2 walk (intra frames reset
+//! the bank to defaults instead; lives in the upstream per-frame
+//! driver alongside the §9 frame-header BoolCoder tail); the §10
+//! mode-decode traversal (still a DOCS-GAP candidate around the
+//! `B(Stats[0])` / `B(Stats[2])` else-branches); the §10
+//! `CODE_INTER_FOURMV` per-block 2-bit codeword; and the §11
+//! differential MV reconstruction layer (combining a decoded
+//! delta with the same-reference neighbour MV).
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -609,6 +651,7 @@ pub mod interp;
 pub mod loopfilter;
 pub mod modes;
 pub mod mv_decode;
+pub mod mv_prob_update;
 pub mod prob_update;
 pub mod raw_bits;
 pub mod reconstruct;
@@ -655,6 +698,11 @@ pub use mv_decode::{
     MvProbs, IS_MV_SHORT_PROBS_DEFAULTS, MV_AXIS_X, MV_AXIS_Y, MV_SIGN_PROBS_DEFAULTS,
     MV_SIZE_PROBS_DEFAULTS, NUM_MV_AXES, NUM_MV_SIZE_NODES, NUM_SHORT_MV_NODES,
     SHORT_MV_PROBS_DEFAULTS,
+};
+pub use mv_prob_update::{
+    update_mv_probs, LONG_VECTOR_BIT_ORDER, UPDATE_IS_MV_SHORT_PROBABILITIES,
+    UPDATE_LONG_VECTOR_BIT_PROBABILITIES, UPDATE_MV_SIGN_PROBABILITIES,
+    UPDATE_SHORT_VECTOR_NODE_PROBABILITIES,
 };
 pub use prob_update::{
     decode_new_node_prob, update_ac_probs, update_dc_probs, update_zero_run_probs,

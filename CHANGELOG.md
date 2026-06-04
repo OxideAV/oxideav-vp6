@@ -6,6 +6,85 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 22, 2026-06-04)
+
+- `mv_prob_update` module — the spec §11.2 per-frame motion-vector
+  probability-update bitstream, the sixth BoolCoder-consuming
+  layer (after rounds 16's §13.2.1 DC, 17's §13.3.1 AC, 19's
+  §13.3.3.1 ZRL token, 20's §13.2/§13.3/§13.3.3 per-frame
+  probability updates, and 21's §11.1 MV component decoder).
+  Walks the Table 13 update bitstream against four
+  flag-probability lookup banks, mutating the persistent
+  `[MvProbs; 2]` bank in place via the shared
+  `prob_update::decode_new_node_prob` primitive (same
+  `B(flag_prob)` + optional `b(7)` `NewProbability =
+  max(1, value * 2)` recipe the §13.2 / §13.3 / §13.3.3 updates
+  use). Surfaces:
+  - `update_mv_probs(bc, &mut [MvProbs; 2])` — the Table 13
+    walker, eight steps in the spec-mandated order
+    (X top-level / Y top-level / X short-tree / Y short-tree /
+    X long-bits / Y long-bits, with each "top-level" step being a
+    `(short-discriminator, sign)` pair).
+  - `UPDATE_IS_MV_SHORT_PROBABILITIES` (`{237, 231}`),
+    `UPDATE_MV_SIGN_PROBABILITIES` (`{246, 243}`),
+    `UPDATE_SHORT_VECTOR_NODE_PROBABILITIES` (`[[253, 253, 254,
+    254, 254, 254, 254], [245, 253, 254, 254, 254, 254, 254]]`),
+    `UPDATE_LONG_VECTOR_BIT_PROBABILITIES` (`[[254, 254, 254,
+    254, 254, 250, 250, 252], [254, 254, 254, 254, 254, 251,
+    251, 254]]`) — verbatim §11.2 `Update*Probabilities`
+    initialisers from page 43-44.
+  - `LONG_VECTOR_BIT_ORDER` — the eight-entry traversal-to-bit
+    permutation `[0, 1, 2, 7, 6, 5, 4, 3]` Table 15 walks. Note
+    this differs from §11.1's decode-time traversal
+    `[0, 1, 2, 7, 6, 5, 4]` by the trailing `3`: at update time
+    bit 3's probability is always present in the per-axis
+    traversal order.
+- 9 new unit tests pinning: the verbatim flag-probability tables
+  (transcription guard); the `LONG_VECTOR_BIT_ORDER` permutation
+  vs `0..=7`; the `LONG_VECTOR_BIT_ORDER` length matches
+  `NUM_MV_SIZE_NODES`; the flag-bank dimensions vs `MvProbs`
+  shape; the driver helpers' function signatures (compile-time
+  shape check); the Table 13 X-before-Y step-order constants;
+  the round-20 `decode_new_node_prob` primitive round-trip at
+  moderate flag-prob `128`; the X-row vs Y-row root-node
+  flag-prob asymmetry on the short-tree; the long-vector
+  flag-prob tail-vs-head ordering.
+
+Total test count: 423 → 432 (9 new, all green). Composes only
+round-15 `BoolCoder` over the round-20
+`prob_update::decode_new_node_prob` primitive — no new spec
+material, no new errata. The published §11.2 flag-prob banks
+cluster at the top of the `1..=255` range; full-driver coverage
+under stream-driven Table 13 walks is deferred to an integration
+test bound to a real .vp6 inter-frame fixture (the round-15
+BoolCoder's behaviour at `Probability > 128` on synthetic
+high-prob inputs sits outside the round-15 self-correcting
+envelope).
+
+### Deferred (round 22 follow-ups)
+
+- Integration test: full Table 13 walk against a conformant
+  inter-frame .vp6 fixture. Static surface + driver shape are
+  validated here; sample-exact bit-walk validation needs a real
+  bitstream.
+- Intra-vs-inter gating of the §11.2 walk (intra frames reset
+  the bank to §11.1 defaults instead of walking; lives in the
+  upstream per-frame driver alongside the §9 BoolCoder-tail).
+- BoolCoder round-15 primitive behavior at `Probability > 128`
+  on synthetic streams — observed to drive the implementation's
+  internal `range` accumulator above 255 when repeated 0-branch
+  reads cumulate. Spec §7.3 keeps `Range` as a u8 (0-255). The
+  errata #35 commentary documents the case as "statistically
+  pathological"; integration coverage against a real bitstream
+  is the path to confirming the implementation is conformant on
+  spec-shaped input.
+- §10 `VP6_DecodeMode` mode-decoder traversal (literal
+  pseudo-code's indentation is ambiguous around the
+  `B(Stats[0])` / `B(Stats[2])` else-branches — DOCS-GAP
+  candidate carried forward from round 21).
+- §10 `CODE_INTER_FOURMV` per-block 2-bit codeword.
+- §11 differential MV reconstruction.
+
 ### Added (clean-room round 21, 2026-06-04)
 
 - `mv_decode` module — the spec §11.1 per-component motion-vector
