@@ -643,6 +643,7 @@ pub mod bool_coder;
 pub mod dc_pred;
 pub mod dct_decode;
 pub mod dequant;
+pub mod fourmv;
 pub mod frame_header;
 pub mod huffman;
 pub mod idct;
@@ -669,6 +670,10 @@ pub use dct_decode::{
     decode_token_value, AcOutcome,
 };
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
+pub use fourmv::{
+    decode_fourmv_block_mode, decode_fourmv_block_modes, FOURMV_BLOCK_MODES,
+    NUM_FOURMV_BLOCK_MODES, NUM_LUMA_BLOCKS_PER_MB,
+};
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
 pub use huffman::{
     codeword_for, create_huffman_tree, decode_symbol, tree_depth, HuffNode, HuffmanError,

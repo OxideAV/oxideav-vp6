@@ -5,12 +5,11 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 22 (2026-06-04).** The orphan-rebuild
+**Clean-room rebuild — round 23 (2026-06-05).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
-sourced exclusively from
+sourced from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
-(document version 1.02, August 2006). No third-party VP6
-implementation is consulted at any stage.
+(document version 1.02, August 2006).
 
 ### What round 1 lands
 
@@ -1041,6 +1040,56 @@ implementation is consulted at any stage.
   asymmetry on the short-tree; and the long-vector flag-prob
   tail-vs-head ordering.
 
+### What round 23 lands
+
+- `fourmv` module — the spec §10 / Table 10 per-Y-block
+  coding-mode signaling for `CODE_INTER_FOURMV` macroblocks.
+  Once the MB-level §10 mode decision lands on
+  `CODE_INTER_FOURMV`, each of the four 8x8 luma blocks
+  transmits a two-bit codeword over the round-15 BoolCoder at
+  fixed probability 128 per bit, selecting from a reduced
+  four-mode set `{InterNoMv, InterPlusMv, InterNearestMv,
+  InterNearMv}` indexed by codeword value `00..=11` (Table 10,
+  page 37). Surfaces:
+  - `FOURMV_BLOCK_MODES` — the four-entry Table 10 lookup, in
+    canonical codeword-value order
+    `[InterNoMv, InterPlusMv, InterNearestMv, InterNearMv]`.
+  - `NUM_LUMA_BLOCKS_PER_MB` (`4`),
+    `NUM_FOURMV_BLOCK_MODES` (`4`) — shape constants.
+  - `decode_fourmv_block_mode(bc)` — single-block decoder. One
+    `BoolCoder::decode_b(2)` read (two fixed-probability-128
+    bits MSB-first) plus the lookup.
+  - `decode_fourmv_block_modes(bc)` — four-block raster-order
+    walker (block 0 = top-left, 1 = top-right, 2 =
+    bottom-left, 3 = bottom-right). Eight BoolCoder bits per
+    MB total. Returns `[CodingMode; 4]`.
+- 10 new unit tests pinning Table 10 cover, the shape
+  constants, the all-zero stream → `InterNoMv` decode, the
+  walker vs four serial calls producing byte-identical
+  BoolCoder state, determinism, the reduced-set-membership
+  invariant across seeded streams, the truncation surface on a
+  4-byte buffer, and per-block reduced-set membership on
+  single-block seeds.
+- Test count: 432 → 442. `cargo fmt` and `cargo clippy
+  --all-targets -D warnings` clean.
+
+### What round 23 does NOT land
+
+- The §10 `VP6_DecodeMode` MB-level mode-tree traversal — the
+  decision that the MB *is* `CODE_INTER_FOURMV` is the gated
+  piece (DOCS-GAP candidate carried forward from round 21
+  around the `B(Stats[0])` / `B(Stats[2])` else-branch
+  indentation).
+- The §11.4 per-block MV-component decode for the four blocks
+  selected as `CODE_INTER_PLUS_MV` by this module (each such
+  block carries its own explicitly-coded MV; the round-21
+  `decode_mv_component` primitive handles the per-component
+  arithmetic but the per-block wiring into the InterFourMv
+  driver remains a downstream piece).
+- The chroma-block averaging-of-four-Y-vectors rounding rule
+  for the InterFourMv MB's two 8x8 chroma blocks (spec §10
+  prose; lives with the MB-level reconstruction driver).
+
 ### What round 22 does NOT land
 
 - Sample-exact stream-driven walk against a real .vp6
@@ -1059,7 +1108,6 @@ implementation is consulted at any stage.
 - The §10 mode-decode traversal (DOCS-GAP candidate carried
   forward from round 21 — the `B(Stats[0])` / `B(Stats[2])`
   else-branch indentation ambiguity).
-- The §10 `CODE_INTER_FOURMV` per-block 2-bit codeword.
 - The §11 differential MV reconstruction (combining a decoded
   delta with the same-reference neighbour MV).
 

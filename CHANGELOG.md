@@ -6,6 +6,50 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 23, 2026-06-05)
+
+- `fourmv` module — the spec §10 / Table 10 per-Y-block
+  coding-mode signaling for `CodingMode::InterFourMv`
+  macroblocks. When the MB-level §10 mode decision lands on
+  `CODE_INTER_FOURMV`, each of the four 8x8 luma blocks
+  transmits a two-bit codeword over the round-15 BoolCoder at
+  probability 128 per bit; the codeword indexes a reduced
+  four-mode set `{InterNoMv, InterPlusMv, InterNearestMv,
+  InterNearMv}` (Table 10, page 37). Surfaces:
+  - `FOURMV_BLOCK_MODES` — the four-entry Table 10 lookup, in
+    canonical codeword-value order `[InterNoMv, InterPlusMv,
+    InterNearestMv, InterNearMv]`.
+  - `NUM_LUMA_BLOCKS_PER_MB` (`4`),
+    `NUM_FOURMV_BLOCK_MODES` (`4`) — shape constants pinning
+    the four-blocks-per-MB and the reduced-set width.
+  - `decode_fourmv_block_mode(bc)` — single-block decoder. One
+    `BoolCoder::decode_b(2)` read (two fixed-probability-128
+    bits MSB-first) plus the lookup.
+  - `decode_fourmv_block_modes(bc)` — four-block raster-order
+    walker (block 0 = top-left, block 1 = top-right, block 2 =
+    bottom-left, block 3 = bottom-right). Eight BoolCoder bits
+    per MB total. Returns `[CodingMode; 4]`.
+- 10 new unit tests pinning: the Table 10 lookup cover; the
+  shape constants; `NUM_FOURMV_BLOCK_MODES` matches the lookup
+  length; the all-zero stream decoding to `InterNoMv`
+  (codeword `00`); the four-block walker on the all-zero
+  stream producing four `InterNoMv` decodes; the four-block
+  walker vs four serial per-block calls producing
+  byte-identical BoolCoder state at the end (`pos`, `range`,
+  `value`, `count` all equal); determinism across two
+  independent BoolCoder runs; the reduced-set-membership
+  invariant across a sweep of representative seed streams;
+  the truncation surface on a 4-byte buffer; and per-block
+  reduced-set-membership on three single-block seeds.
+- Test count: 432 → 442. `cargo fmt` + `cargo clippy
+  --all-targets -D warnings` clean. The §10 `VP6_DecodeMode`
+  Figure-10 traversal — and its DOCS-GAP candidate around the
+  `B(Stats[0])` / `B(Stats[2])` else-branches carried forward
+  from round 21 — remains separate from this Table 10 read:
+  every per-block bit here is fixed-probability-128, so the
+  read is a closed lookup with no branching dependence on the
+  pseudo-code's indentation.
+
 ### Added (clean-room round 22, 2026-06-04)
 
 - `mv_prob_update` module — the spec §11.2 per-frame motion-vector
