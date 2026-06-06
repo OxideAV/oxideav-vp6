@@ -633,6 +633,47 @@
 //! `CODE_INTER_FOURMV` per-block 2-bit codeword; and the §11
 //! differential MV reconstruction layer (combining a decoded
 //! delta with the same-reference neighbour MV).
+//!
+//! ## Round 24 surface — §10 Nearest / Near alternative-MV walker
+//!
+//! * [`near_mv`] — the §10 Nearest / Near MV neighbour walker
+//!   (the BoolCoder-independent alternative-MV traversal). Resolves
+//!   the §10 alternative-MV pair plus the implied [`modes::ModeAvailability`]
+//!   row index from the surrounding already-decoded MB grid by walking
+//!   the [`modes::NEAR_MACROBLOCKS`] table in spec order and applying
+//!   the two §10 predicates (`mv != (0, 0)` and matching
+//!   [`dc_pred::ReferenceBucket`]) at each step. The first qualifying
+//!   neighbour becomes `nearest_mv`, the second becomes `near_mv`;
+//!   the walker short-circuits at the second hit. Surfaces:
+//!   [`near_mv::MotionVector`] (the typed `(x, y)` MV pair plus the
+//!   single-place [`near_mv::MotionVector::is_zero`] predicate the
+//!   §10 "non (0, 0)" rule keys on),
+//!   [`near_mv::NeighbourMv`] (one neighbour's `{mv, reference}`
+//!   metadata for the walker), [`near_mv::NearMvResolution`] (the
+//!   walker output: optional `nearest_mv`, optional `near_mv`,
+//!   plus [`modes::ModeAvailability`]), [`near_mv::resolve_near_mvs`]
+//!   (the closure-driven walker the consumer wires against its
+//!   preferred MV-grid storage) and [`near_mv::resolve_near_mvs_from_grid`]
+//!   (the dense-row-major-slice convenience wrapper).
+//!
+//!   This is the §10 alternative-MV resolver — the
+//!   BoolCoder-independent piece of the §10 mode pipeline. Like
+//!   §15/§16/§17/§11.3–§11.5/§12.1/§14/§10's static probability
+//!   surface this module reads **no BoolCoder bits** — every step is
+//!   pure integer arithmetic over the supplied neighbour grid — so it
+//!   advances the decoder past round 23 without re-entering any
+//!   previously-resolved BoolCoder gate.
+//!
+//! What round 24 deliberately does **not** land: the §10
+//! `VP6_DecodeMode` Figure-10 BoolCoder traversal itself (still a
+//! DOCS-GAP candidate around the `B(Stats[0])` / `B(Stats[2])`
+//! else-branch indentation; round 21 report); and the §11 differential
+//! MV reconstruction (combining a round-21-decoded delta with the
+//! Nearest MV only when "the nearest MacroBlock … is either
+//! immediately to the left of or immediately above the current
+//! MacroBlock" per the §11 intro paragraph — distinct logical unit
+//! because of that "left or above only" constraint, which is stricter
+//! than this round's 12-neighbour traversal).
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -653,6 +694,7 @@ pub mod loopfilter;
 pub mod modes;
 pub mod mv_decode;
 pub mod mv_prob_update;
+pub mod near_mv;
 pub mod prob_update;
 pub mod raw_bits;
 pub mod reconstruct;
@@ -708,6 +750,9 @@ pub use mv_prob_update::{
     update_mv_probs, LONG_VECTOR_BIT_ORDER, UPDATE_IS_MV_SHORT_PROBABILITIES,
     UPDATE_LONG_VECTOR_BIT_PROBABILITIES, UPDATE_MV_SIGN_PROBABILITIES,
     UPDATE_SHORT_VECTOR_NODE_PROBABILITIES,
+};
+pub use near_mv::{
+    resolve_near_mvs, resolve_near_mvs_from_grid, MotionVector, NearMvResolution, NeighbourMv,
 };
 pub use prob_update::{
     decode_new_node_prob, update_ac_probs, update_dc_probs, update_zero_run_probs,

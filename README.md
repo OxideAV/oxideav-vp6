@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 23 (2026-06-05).** The orphan-rebuild
+**Clean-room rebuild — round 24 (2026-06-06).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -1089,6 +1089,79 @@ sourced from
 - The chroma-block averaging-of-four-Y-vectors rounding rule
   for the InterFourMv MB's two 8x8 chroma blocks (spec §10
   prose; lives with the MB-level reconstruction driver).
+
+### What round 24 lands
+
+- `near_mv` module — the spec §10 Nearest / Near alternative-MV
+  neighbour walker, the BoolCoder-independent piece of the §10
+  mode-decode pipeline. Resolves the §10 alternative-MV pair plus
+  the implied `ModeAvailability` row index (Table 5) from the
+  surrounding already-decoded macroblock grid. Walks
+  `modes::NEAR_MACROBLOCKS` in spec order applying the two §10
+  predicates at each step (`mv != (0, 0)` and matching
+  `ReferenceBucket`); the first qualifying neighbour becomes
+  `nearest_mv`, the second becomes `near_mv`; the walker
+  short-circuits at the second hit. Surfaces:
+  - `MotionVector` — typed `(x, y)` motion-vector pair in spec
+    ¼-pixel units (signed `i16`, range `±127` per §11.1's
+    magnitude cap), with `MotionVector::ZERO` and
+    `MotionVector::is_zero()` so the §10 "non (0, 0)" predicate
+    lives in one place.
+  - `NeighbourMv` — one neighbour's `{mv, reference}` metadata,
+    reusing `dc_pred::ReferenceBucket` so the same-reference
+    gating the §10 walker shares with §14 DC prediction stays in
+    one canonical enum.
+  - `NearMvResolution` — walker output:
+    `{ nearest_mv: Option<MotionVector>, near_mv: Option<MotionVector>,
+       availability: ModeAvailability }` plus the
+    `NearMvResolution::NONE` sentinel for the no-qualifying-neighbour
+    case and `has_nearest()` / `has_near()` shortcuts.
+  - `resolve_near_mvs(row, col, reference, neighbour_at)` —
+    closure-driven walker. `neighbour_at: FnMut(i32, i32) ->
+    Option<NeighbourMv>` so callers keep their preferred MV-grid
+    storage; out-of-frame `(row, col)` positions are reported
+    with negative coordinates.
+  - `resolve_near_mvs_from_grid(grid, grid_width, row, col, reference)`
+    — dense-grid convenience wrapper. Backs the walker with a flat
+    `&[Option<NeighbourMv>]` slice indexed `row * grid_width + col`;
+    out-of-bounds access returns `None` without panic.
+- 18 new unit tests pinning: `NEAR_MACROBLOCKS` spec order
+  (re-asserted locally so a future reorder trips the walker
+  tests); `MotionVector::is_zero` across the `(0, 0)` /
+  `(±1, 0)` / `(0, ±1)` / `(±127, ±127)` boundary; empty-grid →
+  `NearMvResolution::NONE`; single-above-neighbour →
+  `NearestOnly`; two-neighbours in spec order →
+  `NearestAndNear`; different-reference skip; `(0, 0)`-MV
+  skip; short-circuit at the second hit (visitor-counting);
+  top-left-corner negative-coordinate reporting; dense-grid
+  wrapper resolution; bottom-right and top-left corner
+  bounds safety; reference filtering through the wrapper;
+  `NONE` constant matches walker output; the
+  `availability` field matches
+  `ModeAvailability::from_neighbours`; `Intra` reference
+  filtering; maximum-magnitude (±127) MV qualification;
+  twelve-qualify-all → first-two picked.
+- Test count: 442 → 460. `cargo fmt` and `cargo clippy
+  --all-targets -D warnings` clean.
+
+### What round 24 does NOT land
+
+- The §10 `VP6_DecodeMode` Figure-10 BoolCoder traversal itself
+  (the `ModeDecisionTree` lookup the resolved availability would
+  index). Static probability surface landed in round 10; the
+  per-bit walk is gated on the round-21 DOCS-GAP candidate
+  about the `B(Stats[0])` / `B(Stats[2])` else-branch
+  indentation.
+- The §11 differential-MV reconstruction that combines a
+  round-21-decoded delta with the resolved Nearest MV when the
+  chosen mode is `CODE_INTER_PLUS_MV` / `CODE_GOLDEN_MV`. The
+  §11 intro paragraph carries an extra constraint ("immediately
+  to the left of or immediately above") stricter than the
+  12-neighbour traversal landed here, so the differential layer
+  is its own logical unit.
+- A driver wiring `near_mv` into the per-MB decode loop —
+  needs the §10 mode traversal landed first to know which
+  `ModeAvailability` row to feed the §10 probability surface.
 
 ### What round 22 does NOT land
 

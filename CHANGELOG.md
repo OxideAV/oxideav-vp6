@@ -6,6 +6,61 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 24, 2026-06-06)
+
+- `near_mv` module — the spec §10 Nearest / Near alternative-MV
+  neighbour walker (the BoolCoder-independent piece of the §10
+  mode-decode pipeline). Resolves the §10 alternative-MV pair plus
+  the implied `modes::ModeAvailability` row index (Table 5) from
+  the surrounding already-decoded macroblock grid by walking
+  `modes::NEAR_MACROBLOCKS` in spec order and applying the two
+  §10 predicates (`mv != (0, 0)` and matching
+  `dc_pred::ReferenceBucket`) at each step. The first qualifying
+  neighbour becomes `nearest_mv`, the second becomes `near_mv`;
+  the walker short-circuits at the second hit. Surfaces:
+  - `MotionVector` — typed `(x, y)` ¼-pixel motion vector
+    (`i16` per §11.1 `±127` magnitude cap) with
+    `MotionVector::ZERO` and `MotionVector::is_zero()` so the
+    §10 "non (0, 0)" predicate lives in one place.
+  - `NeighbourMv` — `{mv, reference}` neighbour metadata. The
+    `reference` field reuses `dc_pred::ReferenceBucket` so the
+    same-reference gate the §10 walker shares with §14 DC
+    prediction stays in one enum.
+  - `NearMvResolution` — walker output:
+    `{ nearest_mv, near_mv, availability }` plus the
+    `NearMvResolution::NONE` sentinel for the
+    no-qualifying-neighbour case and `has_nearest()` /
+    `has_near()` shortcuts.
+  - `resolve_near_mvs(row, col, reference, neighbour_at)` —
+    closure-driven walker. `neighbour_at: FnMut(i32, i32) ->
+    Option<NeighbourMv>` so consumers keep their preferred
+    MV-grid storage; out-of-frame `(row, col)` positions are
+    reported with negative coordinates.
+  - `resolve_near_mvs_from_grid(grid, grid_width, row, col,
+    reference)` — dense-grid wrapper. Backs the walker with a
+    flat `&[Option<NeighbourMv>]` slice indexed
+    `row * grid_width + col`; out-of-bounds access returns
+    `None` without panic.
+- 18 new unit tests pinning: `NEAR_MACROBLOCKS` spec order
+  (re-asserted locally so a future reorder trips this module's
+  tests); `MotionVector::is_zero` across `(0, 0)` /
+  `(±1, 0)` / `(0, ±1)` / `(±127, ±127)`; empty-grid →
+  `NearMvResolution::NONE`; single-above-neighbour →
+  `NearestOnly`; two-neighbours in spec order →
+  `NearestAndNear`; different-reference skip; `(0, 0)`-MV
+  skip; short-circuit-at-second-hit (visitor counting);
+  top-left-corner negative-coordinate reporting; dense-grid
+  wrapper resolution; bottom-right and top-left corner bounds
+  safety; reference filtering through the wrapper; the
+  `NearMvResolution::NONE` constant matches walker output; the
+  walker's `availability` field matches
+  `ModeAvailability::from_neighbours` for all three
+  availability cases; `Intra` reference filtering; ±127
+  maximum-magnitude MV qualification; all-12-qualify case
+  picks the first two `NEAR_MACROBLOCKS` entries.
+- Test count: 442 → 460. `cargo fmt --check` and `cargo
+  clippy --all-targets --no-deps -- -D warnings` clean.
+
 ### Added (clean-room round 23, 2026-06-05)
 
 - `fourmv` module — the spec §10 / Table 10 per-Y-block
