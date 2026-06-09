@@ -674,6 +674,65 @@
 //! MacroBlock" per the §11 intro paragraph — distinct logical unit
 //! because of that "left or above only" constraint, which is stricter
 //! than this round's 12-neighbour traversal).
+//!
+//! ## Round 25 surface — §11 differential motion-vector reconstruction
+//!
+//! * [`mv_diff`] — the §11 intro's differential MV reconstruction
+//!   step: given a §11.1-decoded delta and the surrounding decoded MB
+//!   grid, produces the final reconstructed motion vector. The §11
+//!   intro paragraph (page 38) says: "New motion vectors are coded
+//!   differentially with respect to the motion vector of the nearest
+//!   MacroBlock that uses the same reference frame …, if such a
+//!   MacroBlock exists and it is either immediately to the left of or
+//!   immediately above the current MacroBlock. Otherwise, new motion
+//!   vectors are coded absolutely (this can be thought of as
+//!   differential coded with respect to the vector (0,0))."
+//!
+//!   This is the BoolCoder-independent companion to round 21's §11.1
+//!   delta decoder and round 24's §10 12-neighbour walker. The §11
+//!   reference walk is strictly narrower than the §10 walk: only the
+//!   above-`(-1, 0)` and left-`(0, -1)` neighbours qualify (the first
+//!   two entries of [`modes::NEAR_MACROBLOCKS`], surfaced verbatim as
+//!   [`mv_diff::DIFF_REFERENCE_OFFSETS`]), and the same two §10
+//!   predicates (`mv != (0, 0)` and matching [`dc_pred::ReferenceBucket`])
+//!   are applied at each step. The first qualifying neighbour
+//!   provides the differential reference; if neither qualifies, the
+//!   reference is `(0, 0)` (the "coded absolutely" branch).
+//!
+//!   Surfaces: [`mv_diff::DIFF_REFERENCE_OFFSETS`] (the two-entry
+//!   `(-1, 0)` / `(0, -1)` table pinned against
+//!   [`modes::NEAR_MACROBLOCKS`]); [`mv_diff::select_diff_reference_mv`]
+//!   (closure-driven reference walker); [`mv_diff::reconstruct_diff_mv`]
+//!   (the per-component sum `final = reference + delta`);
+//!   [`mv_diff::reconstruct_new_mv`] (one-shot wrapper composing the
+//!   two); [`mv_diff::select_diff_reference_mv_from_grid`] and
+//!   [`mv_diff::reconstruct_new_mv_from_grid`] (dense-row-major-slice
+//!   convenience wrappers matching the [`near_mv::resolve_near_mvs_from_grid`]
+//!   shape). Like §15/§16/§17/§11.3–§11.5/§12.1/§14/§10's static
+//!   probability surface this module reads **no BoolCoder bits** —
+//!   every step is pure integer arithmetic over the supplied
+//!   neighbour grid plus the supplied delta — so it advances the
+//!   decoder past round 24 without re-entering any of the previously-
+//!   resolved BoolCoder gates.
+//!
+//! What round 25 deliberately does **not** land: the §10
+//! `VP6_DecodeMode` Figure-10 BoolCoder traversal that determines
+//! whether the current MB carries a new-MV `CODE_INTER_PLUS_MV` /
+//! `CODE_GOLDEN_MV` / `CODE_INTER_FOURMV` mode at all (still the
+//! `B(Stats[0])` / `B(Stats[2])` else-branch DOCS-GAP from round 21);
+//! a sum-saturation clarification — the §11 intro paragraph does not
+//! mention a post-sum clamp, the §11.1 `±127` cap applies to the
+//! decoded delta alone, and the §17 reconstruction stage is
+//! well-defined for any sum via §11.5 UMV or the
+//! [`inter::fetch_prediction_block_clamped`] edge-clamped fetch
+//! ([`mv_diff::reconstruct_diff_mv`] therefore performs a plain
+//! i16 sum with no wrap, but a future round may want to revisit this
+//! choice if a clarifying errata entry lands); and the per-block
+//! variant for `CODE_INTER_FOURMV` — Table 10 selects a per-block
+//! mode (already landed as [`fourmv::decode_fourmv_block_mode`]) and
+//! the spec leaves open whether the differential reference for each
+//! sub-block uses the same MB-level above/left neighbours or per-block
+//! neighbours within the four-MV cluster (deferred docs-gap candidate).
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -693,6 +752,7 @@ pub mod interp;
 pub mod loopfilter;
 pub mod modes;
 pub mod mv_decode;
+pub mod mv_diff;
 pub mod mv_prob_update;
 pub mod near_mv;
 pub mod prob_update;
@@ -745,6 +805,10 @@ pub use mv_decode::{
     MvProbs, IS_MV_SHORT_PROBS_DEFAULTS, MV_AXIS_X, MV_AXIS_Y, MV_SIGN_PROBS_DEFAULTS,
     MV_SIZE_PROBS_DEFAULTS, NUM_MV_AXES, NUM_MV_SIZE_NODES, NUM_SHORT_MV_NODES,
     SHORT_MV_PROBS_DEFAULTS,
+};
+pub use mv_diff::{
+    reconstruct_diff_mv, reconstruct_new_mv, reconstruct_new_mv_from_grid,
+    select_diff_reference_mv, select_diff_reference_mv_from_grid, DIFF_REFERENCE_OFFSETS,
 };
 pub use mv_prob_update::{
     update_mv_probs, LONG_VECTOR_BIT_ORDER, UPDATE_IS_MV_SHORT_PROBABILITIES,
