@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 24 (2026-06-06).** The orphan-rebuild
+**Clean-room rebuild — round 26 (2026-06-10).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -1183,6 +1183,74 @@ sourced from
   else-branch indentation ambiguity).
 - The §11 differential MV reconstruction (combining a decoded
   delta with the same-reference neighbour MV).
+
+### What round 25 lands
+
+- `mv_diff` module — the §11 intro's differential motion-vector
+  reconstruction (BoolCoder-independent). Combines a
+  round-21-decoded delta with a same-reference **above/left**
+  neighbour MV — the §11 intro's "immediately to the left of or
+  immediately above" constraint, strictly narrower than the §10
+  12-neighbour walk — or with `(0, 0)` when neither qualifies
+  (the "coded absolutely" branch). Surfaces:
+  `DIFF_REFERENCE_OFFSETS` (the two-entry `(-1, 0)` / `(0, -1)`
+  table pinned against the first two `modes::NEAR_MACROBLOCKS`
+  entries); `select_diff_reference_mv` /
+  `select_diff_reference_mv_from_grid` (the two-neighbour walker
+  applying the §10 predicates `mv != (0, 0)` + matching
+  `dc_pred::ReferenceBucket`); `reconstruct_diff_mv` (the
+  per-component sum `final = reference + delta`); and
+  `reconstruct_new_mv` / `reconstruct_new_mv_from_grid`
+  (one-shot compositions).
+- Test count: 460 → 484 (24 new, all green).
+
+### What round 26 lands
+
+- `scan_update` module — the spec §12.2 per-frame custom scan
+  order, the seventh BoolCoder-consuming layer. Resolves the
+  round-9 deferral ("the §12.2 per-frame custom scan-order
+  updates and their `ScanOrderUpdateFlag` /
+  `CoeffBandUpdateFlag` / `NewCoeffBand` fields (Table 17) are
+  BoolCoder-coded and remain deferred") now that the round-15
+  BoolCoder primitive is in place. Surfaces:
+  - `CUSTOM_SCAN_BAND_RANGES[16]` — the Table 16 sixteen-band
+    partition of the AC positions `1..=63`.
+  - `COEFF_BAND_UPDATE_FLAG_PROBS[64]` — the verbatim §12.2
+    `CoeffBandUpdateFlagProbs` bank (the spec's `NA` DC dummy
+    stored as the out-of-range poison value `0`, never read).
+  - `DEFAULT_BAND_ASSIGNMENT` — the §12.1-derived per-coefficient
+    default banding (the default scan order is the identity in
+    zig-zag space, so coefficient `c` defaults to the Table 16
+    band whose position range contains `c`).
+  - `decode_scan_order_update` — the Table 17 record: `b(1)`
+    `ScanOrderUpdateFlag`; on 0 the assignment resets to the
+    default per §12.2's "the scan order must be reset to the
+    default"; on 1 dispatches into the per-coefficient walk.
+  - `decode_coeff_band_updates` — the 63-set walk:
+    `B(flag_probs[c])` `CoeffBandUpdateFlag` per AC coefficient
+    in standard zig-zag order plus a conditional `b(4)`
+    `NewCoeffBand`. Flag-prob bank parameterised like the
+    round-20 `prob_update` drivers (synthetic-stream tests use
+    moderate banks inside the round-15 BoolCoder's
+    self-correcting envelope; the published bank's 255-saturated
+    tail is exercised once a real-bitstream integration lands).
+  - `build_custom_scan_order` — the §12.2 rebuild: bands in
+    ascending order, coefficients within a band "sorted into
+    ascending order based upon the original zig-zag scan order",
+    DC pinned at position 0; pinned against the §12.2 worked
+    example ("if AC7 and AC21 are labeled as belonging to band
+    3, then AC7 will be assigned position 11 and AC21 position
+    12").
+  - `custom_scan_order_to_raster` — composition with the §12.1
+    `DEFAULT_SCAN_ORDER` so the §15 inverse quantizer and §16
+    IDCT consumers get raster positions directly.
+- Intra-vs-inter seeding (§12.2: intra frames reset to the
+  default before the deltas apply; inter frames carry the
+  previous frame's assignment) is documented on the decoder and
+  left to the per-frame driver, alongside the Figure 5
+  "Coefficient Probability Updates" sequencing (scan-order
+  updates, then §13.3.3 ZRL updates, then §13.3 AC updates).
+- Test count: 484 → 498 (14 new, all green).
 
 ## License
 

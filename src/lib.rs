@@ -733,6 +733,48 @@
 //! the spec leaves open whether the differential reference for each
 //! sub-block uses the same MB-level above/left neighbours or per-block
 //! neighbours within the four-MV cluster (deferred docs-gap candidate).
+//!
+//! ## Round 26 surface — §12.2 custom scan order
+//!
+//! * [`scan_update`] — the spec §12.2 per-frame custom scan order,
+//!   the **seventh BoolCoder-consuming layer**. Resolves the round-9
+//!   deferral ("the §12.2 per-frame custom scan-order updates and
+//!   their `ScanOrderUpdateFlag` / `CoeffBandUpdateFlag` /
+//!   `NewCoeffBand` fields (Table 17) are BoolCoder-coded and remain
+//!   deferred") now that the round-15 [`BoolCoder`] primitive is in
+//!   place. Surfaces: [`scan_update::CUSTOM_SCAN_BAND_RANGES`] (the
+//!   Table 16 sixteen-band partition of the AC positions `1..=63`);
+//!   [`scan_update::COEFF_BAND_UPDATE_FLAG_PROBS`] (the verbatim
+//!   §12.2 `CoeffBandUpdateFlagProbs[64]` bank, DC dummy included);
+//!   [`scan_update::DEFAULT_BAND_ASSIGNMENT`] (the §12.1-derived
+//!   per-coefficient default banding);
+//!   [`scan_update::decode_scan_order_update`] (the Table 17 record:
+//!   `b(1)` `ScanOrderUpdateFlag`, resetting to the default on 0 per
+//!   §12.2's "the scan order must be reset to the default",
+//!   dispatching into the per-coefficient walk on 1);
+//!   [`scan_update::decode_coeff_band_updates`] (the 63-set walk:
+//!   `B(CoeffBandUpdateFlagProbs[c])` per coefficient plus a
+//!   conditional `b(4)` `NewCoeffBand`);
+//!   [`scan_update::build_custom_scan_order`] (the §12.2 rebuild:
+//!   bands in ascending order, coefficients within a band "sorted
+//!   into ascending order based upon the original zig-zag scan
+//!   order", DC pinned at position 0, pinned against the §12.2
+//!   AC7/AC21 worked example); and
+//!   [`scan_update::custom_scan_order_to_raster`] (composition with
+//!   the §12.1 [`DEFAULT_SCAN_ORDER`] so the §15 inverse quantizer
+//!   and §16 IDCT consumers get raster positions directly).
+//!
+//! What round 26 deliberately does **not** land: the per-frame
+//! "Coefficient Probability Updates" driver that sequences this
+//! record ahead of the §13.3.3 ZRL and §13.3 AC probability updates
+//! (§12.2 places the record inside that functional block and Figure 5
+//! fixes the order; the wiring belongs to the per-frame ingest round
+//! alongside the §9 BoolCoder-tail); and the intra-vs-inter seeding
+//! dispatch itself — §12.2 has intra frames reset the band assignment
+//! to the default before the deltas apply while inter frames carry
+//! the previous frame's assignment; both sentences are documented on
+//! [`scan_update::decode_scan_order_update`] but the frame-type
+//! dispatch lives with the per-frame driver.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -759,6 +801,7 @@ pub mod prob_update;
 pub mod raw_bits;
 pub mod reconstruct;
 pub mod scan;
+pub mod scan_update;
 pub mod tokens;
 pub mod umv;
 pub mod zrl;
@@ -826,6 +869,11 @@ pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};
 pub use scan::{
     raster_to_zigzag_block, zigzag_to_raster_block, DEFAULT_SCAN_ORDER,
     DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG,
+};
+pub use scan_update::{
+    build_custom_scan_order, custom_scan_order_to_raster, decode_coeff_band_updates,
+    decode_scan_order_update, BandAssignment, COEFF_BAND_UPDATE_FLAG_PROBS,
+    CUSTOM_SCAN_BAND_RANGES, DEFAULT_BAND_ASSIGNMENT, NUM_AC_POSITIONS, NUM_SCAN_BANDS,
 };
 pub use tokens::{
     baseline_ac_probs, baseline_dc_probs, dc_probs_to_node_contexts,

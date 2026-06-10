@@ -6,6 +6,101 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 26, 2026-06-10)
+
+- `scan_update` module — the spec §12.2 per-frame custom scan
+  order, the seventh BoolCoder-consuming layer (after rounds 16's
+  §13.2.1 DC, 17's §13.3.1 AC, 19's §13.3.3.1 ZRL token, 20's
+  §13.2/§13.3/§13.3.3 probability updates, 21's §11.1 MV component
+  decoder and 22's §11.2 MV probability updates). Resolves the
+  round-9 deferral of the Table 17 `ScanOrderUpdateFlag` /
+  `CoeffBandUpdateFlag` / `NewCoeffBand` fields. Surfaces:
+  - `CUSTOM_SCAN_BAND_RANGES[16]` — the Table 16 sixteen-band
+    partition of the AC positions `1..=63` (band 0 = position 1,
+    band 1 = positions 2–4, … band 15 = positions 58–63).
+  - `COEFF_BAND_UPDATE_FLAG_PROBS[64]` — the verbatim §12.2
+    `CoeffBandUpdateFlagProbs` bank; the spec's `NA` first entry
+    ("a dummy entry for the DC coefficient … never updated in the
+    bitstream") stored as the out-of-range poison value `0` and
+    never read.
+  - `BandAssignment` / `DEFAULT_BAND_ASSIGNMENT` — per-coefficient
+    band state plus the §12.1-derived default (the default scan
+    order is the identity in zig-zag space, so coefficient `c`
+    defaults to the Table 16 band whose position range contains
+    `c`).
+  - `decode_scan_order_update(bc, &flag_probs, &mut assignment)` —
+    the Table 17 record: `b(1)` `ScanOrderUpdateFlag`; on 0 the
+    assignment resets to the default per §12.2 ("the scan order
+    must be reset to the default"); on 1 dispatches into the
+    63-coefficient walk. Intra-vs-inter seeding (§12.2: intra
+    resets to the default before the deltas apply, inter carries
+    the previous frame's assignment) documented and left to the
+    per-frame driver.
+  - `decode_coeff_band_updates(bc, &flag_probs, &mut assignment)`
+    — the 63-set walk: `B(flag_probs[c])` `CoeffBandUpdateFlag`
+    per AC coefficient in standard zig-zag order, plus a
+    conditional `b(4)` `NewCoeffBand` (`0..=15`, exactly the
+    Table 16 band space). Flag-prob bank parameterised like the
+    round-20 `prob_update` drivers so synthetic-stream tests stay
+    inside the round-15 BoolCoder's self-correcting envelope
+    (errata #35 `Split > Range` commentary); the published bank's
+    255-saturated tail is exercised under a real-bitstream
+    integration once the per-frame driver round lands.
+  - `build_custom_scan_order(&assignment)` — the §12.2 rebuild:
+    bands in ascending order, coefficients within a band "sorted
+    into ascending order based upon the original zig-zag scan
+    order", DC pinned at position 0 ("In all scan orders the
+    first DCT coefficient is always the DC coefficient").
+  - `custom_scan_order_to_raster(&scan)` — composition with the
+    §12.1 `DEFAULT_SCAN_ORDER` so §15/§16 consumers get raster
+    positions directly.
+- 14 new unit tests pinning: the Table 16 contiguous tiling of
+  `1..=63`; the verbatim `CoeffBandUpdateFlagProbs` rows + DC
+  dummy + legal-probability invariant; the default banding vs
+  Table 16 with monotonicity; the default assignment rebuilding to
+  the identity scan (and composing to the §12.1 table exactly);
+  the §12.2 AC7/AC21-to-band-3 worked example (positions 11/12);
+  the within-band ascending-zig-zag ordering; the
+  permutation-for-any-assignment invariant (all-band-0,
+  all-band-15, striped); the per-position raster composition; the
+  flag-0 reset-to-default; the all-zero-stream no-op walk; the
+  forced-flag (`flag_prob = 1`) walk rewriting all 63 bands
+  through the `b(4)` path; the band `< 16` range invariant across
+  seed streams; determinism across two independent runs; and the
+  truncation surface on a 4-byte stream.
+- Test count: 484 → 498. `cargo fmt --check` and `cargo clippy
+  --all-targets --no-deps -- -D warnings` clean.
+
+### Added (clean-room round 25, 2026-06-09)
+
+- `mv_diff` module — the §11 intro's differential motion-vector
+  reconstruction (BoolCoder-independent). Combines a
+  round-21-decoded delta with a same-reference above/left
+  neighbour MV — the §11 intro's "immediately to the left of or
+  immediately above" constraint, strictly narrower than the §10
+  12-neighbour walk — or with `(0, 0)` when neither qualifies
+  (the "coded absolutely" branch). Surfaces:
+  `DIFF_REFERENCE_OFFSETS` (the two-entry `(-1, 0)` / `(0, -1)`
+  table pinned against the first two `modes::NEAR_MACROBLOCKS`
+  entries); `select_diff_reference_mv` /
+  `select_diff_reference_mv_from_grid` (two-neighbour walker
+  applying the §10 predicates `mv != (0, 0)` + matching
+  `dc_pred::ReferenceBucket`); `reconstruct_diff_mv` (the
+  per-component sum `final = reference + delta`, no-wrap since
+  §11.1 caps each input component at ±127); and
+  `reconstruct_new_mv` / `reconstruct_new_mv_from_grid` (one-shot
+  compositions).
+- 24 new unit tests pinning: spec offset order,
+  single-above/single-left qualification, above-wins precedence,
+  different-reference and zero-MV fall-throughs,
+  diagonal-neighbour exclusion, top-row / left-column /
+  top-left-corner boundary cases, sum-no-wrap at the ±127 cap,
+  walker short-circuit at first hit, and grid-wrapper equivalence
+  with the closure-driven walker.
+- Test count: 460 → 484. (Round 25 landed as commit `9eb340e`
+  without its README/CHANGELOG entries; this entry is the round-26
+  catch-up.)
+
 ### Added (clean-room round 24, 2026-06-06)
 
 - `near_mv` module — the spec §10 Nearest / Near alternative-MV
