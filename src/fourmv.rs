@@ -53,6 +53,10 @@
 //!   in raster order (block 0 = top-left, block 1 = top-right,
 //!   block 2 = bottom-left, block 3 = bottom-right). Returns
 //!   `[CodingMode; 4]`.
+//! * [`derive_fourmv_chroma_mv`] — the §10 chroma-block motion
+//!   vector for an `InterFourMv` macroblock: the average of the four
+//!   resolved per-Y-block vectors, each component rounded away from
+//!   zero ([`average_four_away_from_zero`]).
 //!
 //! ## Provenance
 //!
@@ -61,6 +65,7 @@
 
 use crate::bool_coder::BoolCoder;
 use crate::modes::CodingMode;
+use crate::near_mv::MotionVector;
 use crate::Error;
 
 /// Number of luma blocks the §10 `CODE_INTER_FOURMV` mode covers
@@ -137,6 +142,87 @@ pub fn decode_fourmv_block_modes(
         *slot = decode_fourmv_block_mode(bc)?;
     }
     Ok(out)
+}
+
+/// Divide a four-vector component sum by four, rounding **away from
+/// zero** (spec §10, page 28).
+///
+/// §10 prose: "the motion vector for the two chroma blocks is
+/// computed by averaging the four Y vectors (rounding away from
+/// zero)."
+///
+/// "Rounding away from zero" is read here as the *directed* rounding
+/// mode — every non-integer quotient moves to the next integer of
+/// larger magnitude (`ceil(|sum| / 4)` carrying the sign of `sum`).
+/// The spec names directed rounding modes elsewhere with the same
+/// construction: §14's both-neighbours DC predictor is "the
+/// arithmetic average of their DC values, **truncated towards zero**
+/// (values may be negative)" — i.e. the directed mode toward zero.
+/// §10's "rounding away from zero" is the parallel opposite-direction
+/// mode, not a round-to-nearest tie-break rule (the spec does not
+/// say "rounding *half* away from zero"). Concretely:
+///
+/// * `sum = 1`  → `+1` (0.25 rounds away from zero, not to nearest)
+/// * `sum = -1` → `-1`
+/// * `sum = 5`  → `+2` (1.25 → 2)
+/// * `sum = 8`  → `+2` (exact quotients are unaffected)
+///
+/// The result is exactly `-average_four_away_from_zero(-sum)` for
+/// every input (odd symmetry), matching the sign-agnostic wording of
+/// the prose.
+///
+/// With each §11.1 MV component capped at ±127 ¼-pel units, the
+/// four-component sum is within ±508 and the rounded average within
+/// ±127, so the result always fits the [`MotionVector`] component
+/// range.
+#[inline]
+pub fn average_four_away_from_zero(sum: i32) -> i16 {
+    // ceil(|sum| / 4), then reapply the sign. `sum` is at most ±508
+    // for spec-conformant inputs but the arithmetic below is total
+    // over all i32 (unsigned_abs + the u32 ceiling division cannot
+    // overflow; the caller-facing contract narrows the output type
+    // to i16 because conformant sums always fit).
+    let magnitude = sum.unsigned_abs().div_ceil(4);
+    if sum < 0 {
+        -(magnitude as i32) as i16
+    } else {
+        magnitude as i16
+    }
+}
+
+/// Derive the chroma-block motion vector for a `CODE_INTER_FOURMV`
+/// macroblock from its four per-Y-block motion vectors (spec §10,
+/// page 28).
+///
+/// §10 prose: "If a MB has coding mode CODE_INTER_FOURMV then each
+/// of its four Y-blocks will be coded independently […] In this case
+/// the motion vector for the two chroma blocks is computed by
+/// averaging the four Y vectors (rounding away from zero)."
+///
+/// Both 8x8 chroma blocks of the macroblock share the single derived
+/// vector. Each component (x, y) is averaged independently via
+/// [`average_four_away_from_zero`]. The input order is the same
+/// raster order [`decode_fourmv_block_modes`] returns (block 0 =
+/// top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right);
+/// averaging is order-insensitive so any permutation produces the
+/// same result.
+///
+/// The four luma vectors are the **resolved** per-block vectors —
+/// after each block's Table 10 mode (`InterNoMv` → `(0, 0)`,
+/// `InterPlusMv` → explicitly coded, `InterNearestMv` /
+/// `InterNearMv` → copied from the §10 neighbour resolution) has
+/// been applied — in ¼-pel luma units. The derived chroma vector is
+/// in the same ¼-pel luma units; the §11.4 fractional-pixel fetch
+/// interprets it at 1/8 chroma-sample precision via
+/// [`crate::inter::MvShift::Chroma`] exactly as it does for
+/// single-MV macroblocks.
+pub fn derive_fourmv_chroma_mv(luma_mvs: &[MotionVector; NUM_LUMA_BLOCKS_PER_MB]) -> MotionVector {
+    let sum_x: i32 = luma_mvs.iter().map(|mv| i32::from(mv.x)).sum();
+    let sum_y: i32 = luma_mvs.iter().map(|mv| i32::from(mv.y)).sum();
+    MotionVector::new(
+        average_four_away_from_zero(sum_x),
+        average_four_away_from_zero(sum_y),
+    )
 }
 
 #[cfg(test)]
@@ -330,5 +416,194 @@ mod tests {
             let m = decode_fourmv_block_mode(&mut bc).expect("decode");
             assert!(FOURMV_BLOCK_MODES.contains(&m));
         }
+    }
+
+    /// Exact quotients pass through the away-from-zero division
+    /// untouched: an average that is already an integer needs no
+    /// rounding (positive, negative, and zero sums).
+    #[test]
+    fn average_exact_quotients_are_untouched() {
+        assert_eq!(average_four_away_from_zero(0), 0);
+        assert_eq!(average_four_away_from_zero(4), 1);
+        assert_eq!(average_four_away_from_zero(-4), -1);
+        assert_eq!(average_four_away_from_zero(16), 4);
+        assert_eq!(average_four_away_from_zero(-16), -4);
+        assert_eq!(average_four_away_from_zero(508), 127);
+        assert_eq!(average_four_away_from_zero(-508), -127);
+    }
+
+    /// The directed away-from-zero reading: every non-integer
+    /// quotient moves to the next integer of larger magnitude. A
+    /// sum of 1 (quotient 0.25) rounds to 1, not to the nearest
+    /// integer 0 — this is the case that distinguishes the spec's
+    /// "rounding away from zero" from a round-to-nearest tie-break
+    /// rule.
+    #[test]
+    fn average_rounds_directed_away_from_zero() {
+        // 0.25 / 0.5 / 0.75 all round up to 1.
+        assert_eq!(average_four_away_from_zero(1), 1);
+        assert_eq!(average_four_away_from_zero(2), 1);
+        assert_eq!(average_four_away_from_zero(3), 1);
+        // 1.25 rounds to 2 (a nearest-rule would give 1).
+        assert_eq!(average_four_away_from_zero(5), 2);
+        // Negative mirror images.
+        assert_eq!(average_four_away_from_zero(-1), -1);
+        assert_eq!(average_four_away_from_zero(-2), -1);
+        assert_eq!(average_four_away_from_zero(-3), -1);
+        assert_eq!(average_four_away_from_zero(-5), -2);
+    }
+
+    /// Odd symmetry: `f(-sum) == -f(sum)` over the entire
+    /// spec-conformant sum range ±508 — the prose's "away from zero"
+    /// is sign-agnostic.
+    #[test]
+    fn average_is_odd_symmetric() {
+        for sum in -508..=508 {
+            assert_eq!(
+                average_four_away_from_zero(-sum),
+                -average_four_away_from_zero(sum),
+                "odd symmetry violated at sum={sum}"
+            );
+        }
+    }
+
+    /// Cross-check the integer formula against the mathematical
+    /// definition `sign(sum) * ceil(|sum| / 4)` over the entire
+    /// spec-conformant sum range, and pin the §11.1-derived output
+    /// bound |result| <= 127.
+    #[test]
+    fn average_matches_signed_ceiling_definition() {
+        for sum in -508..=508i32 {
+            let expected = {
+                let q = (sum.abs() + 3) / 4; // ceil for non-negative
+                if sum < 0 {
+                    -q
+                } else {
+                    q
+                }
+            };
+            let got = i32::from(average_four_away_from_zero(sum));
+            assert_eq!(got, expected, "mismatch at sum={sum}");
+            assert!(got.abs() <= 127, "|average| exceeds ±127 at sum={sum}");
+        }
+    }
+
+    /// Four identical vectors average to that vector exactly — the
+    /// degenerate FourMV macroblock where all Y blocks agree behaves
+    /// like a single-MV macroblock.
+    #[test]
+    fn chroma_mv_of_identical_vectors_is_identity() {
+        for mv in [
+            MotionVector::ZERO,
+            MotionVector::new(7, -3),
+            MotionVector::new(-127, 127),
+            MotionVector::new(127, -127),
+        ] {
+            assert_eq!(derive_fourmv_chroma_mv(&[mv; 4]), mv);
+        }
+    }
+
+    /// The x and y components are averaged independently of one
+    /// another.
+    #[test]
+    fn chroma_mv_components_average_independently() {
+        let mvs = [
+            MotionVector::new(1, -20),
+            MotionVector::new(0, 0),
+            MotionVector::new(0, 0),
+            MotionVector::new(0, -1),
+        ];
+        // sum_x = 1 -> 1 (0.25 away from zero); sum_y = -21 -> -6
+        // (-5.25 away from zero).
+        assert_eq!(derive_fourmv_chroma_mv(&mvs), MotionVector::new(1, -6));
+    }
+
+    /// Vectors that cancel exactly produce the zero chroma MV.
+    #[test]
+    fn chroma_mv_of_cancelling_vectors_is_zero() {
+        let mvs = [
+            MotionVector::new(3, -2),
+            MotionVector::new(-3, 2),
+            MotionVector::new(2, -5),
+            MotionVector::new(-2, 5),
+        ];
+        assert_eq!(derive_fourmv_chroma_mv(&mvs), MotionVector::ZERO);
+    }
+
+    /// Averaging is order-insensitive: any permutation of the four
+    /// per-block vectors derives the same chroma MV.
+    #[test]
+    fn chroma_mv_is_permutation_invariant() {
+        let a = MotionVector::new(5, -7);
+        let b = MotionVector::new(-1, 2);
+        let c = MotionVector::new(0, 127);
+        let d = MotionVector::new(-127, 1);
+        let reference = derive_fourmv_chroma_mv(&[a, b, c, d]);
+        for perm in [
+            [d, c, b, a],
+            [b, a, d, c],
+            [c, d, a, b],
+            [a, c, b, d],
+            [d, a, c, b],
+        ] {
+            assert_eq!(derive_fourmv_chroma_mv(&perm), reference);
+        }
+    }
+
+    /// The derived chroma MV always satisfies the §11.1 ±127
+    /// component bound when the inputs do (boundary sweep over the
+    /// extreme corners plus a deterministic LCG sweep of interior
+    /// points).
+    #[test]
+    fn chroma_mv_respects_component_bound() {
+        let corners = [
+            MotionVector::new(127, 127),
+            MotionVector::new(127, -127),
+            MotionVector::new(-127, 127),
+            MotionVector::new(-127, -127),
+        ];
+        for &a in &corners {
+            for &b in &corners {
+                for &c in &corners {
+                    for &d in &corners {
+                        let mv = derive_fourmv_chroma_mv(&[a, b, c, d]);
+                        assert!(mv.x.abs() <= 127 && mv.y.abs() <= 127);
+                    }
+                }
+            }
+        }
+        // Deterministic interior sweep (LCG, fixed seed).
+        let mut state = 0x2545_F491u32;
+        let mut next_component = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 16) % 255) as i16 - 127
+        };
+        for _ in 0..1_000 {
+            let mvs = [
+                MotionVector::new(next_component(), next_component()),
+                MotionVector::new(next_component(), next_component()),
+                MotionVector::new(next_component(), next_component()),
+                MotionVector::new(next_component(), next_component()),
+            ];
+            let mv = derive_fourmv_chroma_mv(&mvs);
+            assert!(
+                mv.x.abs() <= 127 && mv.y.abs() <= 127,
+                "out of range: {mv:?}"
+            );
+        }
+    }
+
+    /// Worked example with mixed magnitudes pinning both the sum
+    /// and the rounding direction per component: x sums to 7
+    /// (1.75 → 2), y sums to -9 (-2.25 → -3).
+    #[test]
+    fn chroma_mv_worked_example() {
+        let mvs = [
+            MotionVector::new(4, -4),
+            MotionVector::new(2, -3),
+            MotionVector::new(1, -1),
+            MotionVector::new(0, -1),
+        ];
+        assert_eq!(derive_fourmv_chroma_mv(&mvs), MotionVector::new(2, -3));
     }
 }

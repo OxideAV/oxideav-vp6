@@ -1252,6 +1252,94 @@ sourced from
   updates, then §13.3.3 ZRL updates, then §13.3 AC updates).
 - Test count: 484 → 498 (14 new, all green).
 
+### What round 27 lands
+
+- `derive_fourmv_chroma_mv` / `average_four_away_from_zero` — the
+  spec §10 chroma motion vector for a `CODE_INTER_FOURMV`
+  macroblock, the round-23 explicit deferral ("the chroma-block
+  averaging-of-four-Y-vectors rounding rule"). §10 prose (page
+  28): "the motion vector for the two chroma blocks is computed
+  by averaging the four Y vectors (rounding away from zero)."
+  BoolCoder-independent. Each component is averaged
+  independently; "rounding away from zero" is implemented as the
+  *directed* rounding mode (every non-integer quotient moves to
+  the next integer of larger magnitude, `sign(sum) *
+  ceil(|sum| / 4)`), matching the spec's parallel use of the
+  opposite directed mode in §14 ("the arithmetic average of
+  their DC values, **truncated towards zero**"). A
+  nearest-with-ties-away reading would require the word "half"
+  the prose does not contain; the doc comment records the
+  distinction and the `sum = 1 → +1` case that separates the two
+  readings. Inputs are the four **resolved** per-Y-block vectors
+  (post-Table-10 mode application) in ¼-pel luma units; the
+  output is in the same units and feeds the §11.4 fractional
+  fetch at 1/8 chroma-sample precision via `MvShift::Chroma`,
+  exactly as for single-MV macroblocks.
+- 10 new unit tests pinning: exact quotients untouched (±508
+  boundary included); the directed-vs-nearest distinguishing
+  cases (`sum = 1, 5` and negative mirrors); odd symmetry
+  `f(-s) == -f(s)` over the full conformant range ±508; the
+  signed-ceiling definition cross-check + the §11.1-derived
+  ±127 output bound over the full range; identical-vectors
+  identity; per-component independence; exact cancellation →
+  zero; permutation invariance; the corner sweep (all 256
+  ±127-corner combinations) plus a seeded interior sweep
+  respecting the component bound; and a mixed-magnitude worked
+  example (x: 7 → 2, y: −9 → −3).
+- Test count: 498 → 508. `cargo fmt` and `cargo clippy
+  --all-targets -D warnings` clean.
+
+### What round 27 does NOT land
+
+- **The §9 frame-header BoolCoder-tail parser — investigated as
+  this round's primary target and found still blocked, now with
+  a sharper diagnosis.** Errata #35 (the §7.3 `Split`
+  clarification staged 2026-06) is **internally inconsistent**:
+  its summary table concludes the shift amount is `>> 7`
+  ("divide by 128; prob 128 = half interval. **Not** `>> 8`"),
+  but every quantitative property its own rationale relies on
+  holds only under `>> 8`:
+  - At `Probability = 128`, `Split = 1 + ((Range-1)*128 >> 7)
+    = 1 + (Range-1) = Range` — the **full** interval, not the
+    half interval the errata asserts (`"= 1 + (Range-1) ≈
+    Range/2"` is arithmetically false as printed). The `Bit = 1`
+    interval `Range - Split` is **empty**, so a `b(n)` field can
+    never carry a 1-bit: decoding a 1 requires the top byte of
+    `Value` to be `0xFF` and then sets `Range = 0`, which the
+    renormalization loop can never recover (`0 * 2 = 0`).
+    Header fields like `VFragments = 30` are therefore
+    undecodable under `>> 7` — and unencodable, so no conformant
+    encoder can have produced such a stream.
+  - At `Probability = 255`, `Split = 507 > Range` — a negative
+    `Bit = 1` interval, violating the errata's own "keeps
+    `Split` strictly less than `Range`, preserving a non-empty
+    `Bit = 1` interval" claim and the spec's `Range` ∈ 0–255
+    attribute bound.
+  - The errata's counter-claim that `>> 8` "would make
+    Probability = 128 yield only a quarter-range split" is also
+    false: `1 + ((Range-1)*128 >> 8) = 1 + (Range-1)/2 ≈
+    Range/2`, exactly the even split.
+  Every numbered property the errata's rationale demands
+  (half-interval at 128, near-full at 255, both branches
+  non-empty, `Range ≤ 255` invariant) is satisfied by `>> 8`
+  and violated by `>> 7`. The spec PDF's literal `>> 7` (page
+  15) appears to be the original typo, and the errata's
+  conclusion rationalises it while its mathematics argue for
+  `>> 8`. Resolving this requires a docs correction (or a
+  worked byte-trace pinning the intended arithmetic); the
+  round-15 `BoolCoder` implements the errata's literal `>> 7`
+  and all seven BoolCoder-consuming layers inherit the
+  degeneracy at `Probability >= 128` — none of the existing
+  synthetic-stream tests are sensitive to it, but sample-exact
+  decoding of any real `.vp6` bitstream will be.
+- The §10 `VP6_DecodeMode` MB-level traversal — DOCS-GAP
+  candidate carried forward from round 21 (the `B(Stats[0])` /
+  `B(Stats[2])` else-branch indentation), unaddressed by the
+  staged errata.
+- The per-MB driver that wires `derive_fourmv_chroma_mv` to the
+  four resolved block vectors (needs the §10 traversal plus the
+  §11.4 per-block MV decode wiring).
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).

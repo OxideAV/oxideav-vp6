@@ -816,8 +816,8 @@ pub use dct_decode::{
 };
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
 pub use fourmv::{
-    decode_fourmv_block_mode, decode_fourmv_block_modes, FOURMV_BLOCK_MODES,
-    NUM_FOURMV_BLOCK_MODES, NUM_LUMA_BLOCKS_PER_MB,
+    average_four_away_from_zero, decode_fourmv_block_mode, decode_fourmv_block_modes,
+    derive_fourmv_chroma_mv, FOURMV_BLOCK_MODES, NUM_FOURMV_BLOCK_MODES, NUM_LUMA_BLOCKS_PER_MB,
 };
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
 pub use huffman::{

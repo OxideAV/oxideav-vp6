@@ -6,6 +6,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 27, 2026-06-11)
+
+- `fourmv::derive_fourmv_chroma_mv` / `fourmv::average_four_away_from_zero`
+  — the spec §10 chroma motion vector for a `CODE_INTER_FOURMV`
+  macroblock ("the motion vector for the two chroma blocks is computed
+  by averaging the four Y vectors (rounding away from zero)", page 28).
+  Per-component averaging with directed away-from-zero rounding
+  (`sign(sum) * ceil(|sum| / 4)`), the round-23 explicit deferral.
+  BoolCoder-independent; 10 new unit tests (498 → 508).
+
+### Documented (clean-room round 27, 2026-06-11)
+
+- README "What round 27 does NOT land" records the §9 frame-header
+  BoolCoder-tail finding: errata #35's `>> 7` conclusion is internally
+  inconsistent with its own rationale (at probability 128 the printed
+  formula yields `Split = Range`, an empty `Bit = 1` interval, making
+  every `b(n)` header field undecodable); the §9 tail stays blocked
+  pending a docs correction.
+
 ### Added (clean-room round 26, 2026-06-10)
 
 - `scan_update` module — the spec §12.2 per-frame custom scan
