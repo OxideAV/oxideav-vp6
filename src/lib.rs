@@ -775,12 +775,33 @@
 //! the previous frame's assignment; both sentences are documented on
 //! [`scan_update::decode_scan_order_update`] but the frame-type
 //! dispatch lives with the per-frame driver.
+//!
+//! ## Round 28 — §13 per-block coefficient reconstruction driver
+//!
+//! [`block_decode`] composes the per-coefficient entropy primitives
+//! into the spec's per-block `CoeffData[64]` loop and the follow-on
+//! scan/dequant mapping:
+//! [`block_decode::decode_block_coefficients`] (the §13.2.1 DC decode
+//! seeding `CoeffData[0]` and the `Prec` context, then the §13.3.1
+//! do-while with per-iteration `[Prec][Band]` probability
+//! re-selection, the implicit-1 shortcut, per-leaf `Prec` updates,
+//! and the ZERO-leaf transition into the §13.3.3.1 zero-run decoder);
+//! [`block_decode::dequantize_to_raster`] (the §12
+//! scan-position-to-raster permutation fused with the §15 DC/AC
+//! scalar dequantizer); and
+//! [`block_decode::decode_block_to_raster`] (the one-shot composition
+//! whose output feeds [`idct_block`] directly). The §13.3
+//! `AcProbs[plane][prec][band][node]` decoding-bank layout vs the
+//! §13.3.1 listing's `AcUpdateProbs[Prec][Plane][Band]` naming slip,
+//! and the listing's EOB `EncodedCoeffs++` / post-loop `--`
+//! choreography, are both documented on the module.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
 
 use oxideav_core::RuntimeContext;
 
+pub mod block_decode;
 pub mod bool_coder;
 pub mod dc_pred;
 pub mod dct_decode;
@@ -806,6 +827,10 @@ pub mod tokens;
 pub mod umv;
 pub mod zrl;
 
+pub use block_decode::{
+    decode_block_coefficients, decode_block_to_raster, dequantize_to_raster, AcProbBank,
+    BlockCoeffs, DequantizedBlock, ZeroRunProbBank, BLOCK_SIZE,
+};
 pub use bool_coder::BoolCoder;
 pub use dc_pred::{
     average_both_neighbours, sign as dc_sign, DcPredictionContext, Neighbour, ReferenceBucket,

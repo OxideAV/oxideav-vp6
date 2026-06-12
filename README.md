@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 26 (2026-06-10).** The orphan-rebuild
+**Clean-room rebuild — round 28 (2026-06-12).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -1339,6 +1339,72 @@ sourced from
 - The per-MB driver that wires `derive_fourmv_chroma_mv` to the
   four resolved block vectors (needs the §10 traversal plus the
   §11.4 per-block MV decode wiring).
+
+### What round 28 lands
+
+- `block_decode` module — the §13 **per-block coefficient
+  reconstruction driver**, composing the per-coefficient entropy
+  primitives (rounds 16/17/19) with the §12 scan orders and the §15
+  dequantizer:
+  - `decode_block_coefficients` — the §13.2.1 DC decode seeding
+    `CoeffData[0]` and the `Prec` context (`dc == 0 / 1 / else`),
+    then the §13.3.1 per-block do-while: per-iteration
+    `[Prec][Band]` probability-row re-selection, the
+    `(EncodedCoeffs > 1) && (Prec == 0)` implicit-1 shortcut,
+    per-leaf `Prec` updates (`Prec = 0` on the ZERO leaf, 1 / 2 on
+    value leaves), the ZERO-leaf transition into the §13.3.3.1
+    zero-run decoder (band per `ZrlBand[EncodedCoeffs]`, run
+    inclusive of the triggering position, saturating past the block
+    end), and the EOB exit. Returns `BlockCoeffs { coeffs[64],
+    coeff_count }` with the invariant `coeffs[coeff_count..] == 0`.
+  - `dequantize_to_raster` / `BlockCoeffs::dequantize_to_raster` —
+    the §12 scan-position-to-raster permutation (default §12.1
+    zig-zag or a §12.2 custom order via
+    `custom_scan_order_to_raster`) fused with the §15 DC/AC scalar
+    dequantizer in one pass.
+  - `decode_block_to_raster` — the one-shot composition; its
+    `DequantizedBlock::raster` output feeds the §16 `idct_block`
+    directly.
+  - Two spec readings documented on the module: the §13.3.1
+    listing's `AcUpdateProbs[Prec][Plane][Band]` lookup is a naming
+    slip for the persistent `AcProbs[plane][prec][band][node]`
+    decoding bank (the §13.3.1 prose "stored in ACProbs act as the
+    binary decoding node probabilities" + the §13.3 dimension
+    tables resolve it); and the listing's EOB `EncodedCoeffs++` /
+    post-loop `EncodedCoeffs--` choreography nets to the
+    coefficient count on the EOB path while the post-loop value is
+    never consumed by any later listing, so the driver defines the
+    unambiguous `coeff_count` semantics instead.
+- 13 new unit tests pinning: the all-zero-stream empty block (EOB at
+  the first AC, count 1); two hand-computed §7.3 traces (DC-only
+  block with forced magnitude-1 DC then EOB; the DC-seeded `Prec`
+  selecting the first AC probability row); a forced
+  zero-run → implicit-1 value → EOB walk exercising every outcome
+  arm in one block; driver-vs-listing replay equality (an
+  independent do-while replay on the public primitives) across a
+  seed-stream × bank × plane grid including the final BoolCoder
+  byte position; structural invariants over arbitrary seed streams
+  (count bounds, zero tail, Table 18 magnitude bound); determinism;
+  the truncation surface on a 4-byte stream under a
+  CATEGORY6-forcing bank; fused-vs-two-step dequant equality against
+  `zigzag_to_raster_block` + `dequantize_block`; the DC/AC factor
+  split; custom-scan routing through the §12.2 AC7/AC21 worked
+  example; one-shot-vs-staged equality with identical bit
+  consumption; and the empty block IDCT-ing to all-zero differences.
+- Test count: 508 → 521. `cargo fmt --check` and `cargo clippy
+  --all-targets --no-deps -- -D warnings` clean.
+
+### What round 28 does NOT land
+
+- The per-frame / per-macroblock driver that selects each block's
+  `DcNodeContexts[plane][context]` row from the §14 DC-prediction
+  neighbour state and threads `BlockCoeffs` through prediction +
+  IDCT + §17 reconstruction — blocked on the §10 `VP6_DecodeMode`
+  MB traversal (DOCS-GAP carried forward) and the §9 frame-header
+  BoolCoder tail (errata #35 internal inconsistency, see round 27).
+- The §13.2 DC-coefficient *token-context* wiring (Table 26's
+  left/above zero-DC context selection) — pure composition over
+  `dc_pred`, a natural next-round target alongside this driver.
 
 ## License
 

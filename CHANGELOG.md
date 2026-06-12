@@ -6,6 +6,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 28, 2026-06-12)
+
+- `block_decode` module — the §13 per-block coefficient
+  reconstruction driver, the explicit prior-round deferral now that
+  every constituent primitive exists. `decode_block_coefficients`
+  composes the §13.2.1 DC decode (seeding `CoeffData[0]` and the
+  `Prec` context) with the §13.3.1 per-block AC do-while
+  (per-iteration `[Prec][Band]` probability re-selection, implicit-1
+  shortcut, per-leaf `Prec` updates, §13.3.3.1 zero-run transition,
+  EOB exit) into `BlockCoeffs { coeffs[64], coeff_count }`;
+  `dequantize_to_raster` fuses the §12 scan-position-to-raster
+  permutation (default or custom) with the §15 DC/AC dequantizer;
+  `decode_block_to_raster` is the one-shot composition feeding the
+  §16 `idct_block` directly. Documents the §13.3.1 listing's
+  `AcUpdateProbs[Prec][Plane][Band]` naming slip (the decoding bank
+  is `AcProbs[plane][prec][band][node]` per the §13.3 prose) and the
+  EOB `EncodedCoeffs++` / post-loop `--` exit choreography. Adds the
+  `AcProbBank` / `ZeroRunProbBank` type aliases and the `BLOCK_SIZE`
+  constant. 13 new unit tests (508 → 521) including two
+  hand-computed §7.3 traces, an independent spec-listing replay
+  pinning coefficients + count + final byte position across a
+  stream × bank × plane grid, and fused-vs-two-step scan/dequant
+  equality.
+
 ### Added (clean-room round 27, 2026-06-11)
 
 - `fourmv::derive_fourmv_chroma_mv` / `fourmv::average_four_away_from_zero`
