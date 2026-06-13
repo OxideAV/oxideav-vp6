@@ -864,8 +864,8 @@ pub mod umv;
 pub mod zrl;
 
 pub use block_decode::{
-    decode_block_coefficients, decode_block_to_raster, dequantize_to_raster, AcProbBank,
-    BlockCoeffs, DequantizedBlock, ZeroRunProbBank, BLOCK_SIZE,
+    decode_block_coefficients, decode_block_coefficients_ctx, decode_block_to_raster,
+    dequantize_to_raster, AcProbBank, BlockCoeffs, DequantizedBlock, ZeroRunProbBank, BLOCK_SIZE,
 };
 pub use bool_coder::BoolCoder;
 pub use dc_pred::{
@@ -942,9 +942,10 @@ pub use scan_update::{
 };
 pub use tokens::{
     baseline_ac_probs, baseline_dc_probs, dc_probs_to_node_contexts,
-    dct_token_bool_tree_to_huff_probs, AcBand, AcPlane, AcPrecContext, DctToken, TreeNode,
-    AC_UPDATE_PROBS, DC_NODE_EQS, NUM_AC_BANDS, NUM_AC_PREC_CONTEXTS, NUM_DCT_TOKENS,
-    NUM_DC_CONTEXTS, NUM_DC_NODE_EQS, NUM_PLANES, NUM_TREE_NODES, VP6_DC_UPDATE_PROBS,
+    dct_token_bool_tree_to_huff_probs, AcBand, AcPlane, AcPrecContext, DcContext,
+    DcZeroContextTracker, DctToken, TreeNode, AC_UPDATE_PROBS, DC_NODE_EQS, NUM_AC_BANDS,
+    NUM_AC_PREC_CONTEXTS, NUM_DCT_TOKENS, NUM_DC_CONTEXTS, NUM_DC_NODE_EQS, NUM_PLANES,
+    NUM_TREE_NODES, VP6_DC_UPDATE_PROBS,
 };
 pub use umv::{
     build_extended_buffer, extend_border, extended_height, extended_stride, origin_offset,

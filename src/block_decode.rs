@@ -88,7 +88,8 @@
 use crate::dct_decode::{decode_ac_coefficient, decode_ac_zero_run, decode_dc, AcOutcome};
 use crate::dequant::DequantContext;
 use crate::tokens::{
-    AcBand, AcPlane, AcPrecContext, NUM_AC_BANDS, NUM_AC_PREC_CONTEXTS, NUM_PLANES, NUM_TREE_NODES,
+    AcBand, AcPlane, AcPrecContext, DcContext, NUM_AC_BANDS, NUM_AC_PREC_CONTEXTS, NUM_DC_CONTEXTS,
+    NUM_PLANES, NUM_TREE_NODES,
 };
 use crate::zrl::{ZrlBand, NUM_ZRL_BANDS, NUM_ZRL_NODES};
 use crate::{BoolCoder, Error};
@@ -249,6 +250,40 @@ pub fn decode_block_coefficients(
         coeffs,
         coeff_count: encoded_coeffs.min(BLOCK_SIZE),
     })
+}
+
+/// Decode one full 8x8 block of DCT coefficients, selecting the
+/// §13.2 Table 26 DC node context from the per-plane `DcNodeContexts`
+/// bank instead of taking a pre-resolved row.
+///
+/// This is the §13.2 Table 26 context-wiring convenience over
+/// [`decode_block_coefficients`]: a driver that tracks the left/above
+/// neighbour zero-DC state (see [`crate::tokens::DcZeroContextTracker`])
+/// holds the converted bank `dc_contexts[plane][context][node]` (the
+/// [`crate::tokens::dc_probs_to_node_contexts`] output) and a
+/// [`DcContext`] for the current block, and this routine picks the
+/// `[context]` row before invoking the underlying decoder. The
+/// resolution is `DcContext::select_row(&dc_contexts[plane.index()])`,
+/// exactly the §13.2.1 `ContPtr = DcNodeContexts[Plane][Context]`
+/// indexing.
+///
+/// `dc_contexts` is the per-plane `DcNodeContexts[Plane][3][11]` bank
+/// (the same plane axis as `ac_probs`); all other arguments are as in
+/// [`decode_block_coefficients`].
+///
+/// Returns [`Error::Truncated`] if the byte stream is exhausted in any
+/// constituent BoolCoder call.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_block_coefficients_ctx(
+    bc: &mut BoolCoder<'_>,
+    plane: AcPlane,
+    dc_contexts: &[[[u8; NUM_TREE_NODES]; NUM_DC_CONTEXTS]; NUM_PLANES],
+    dc_context: DcContext,
+    ac_probs: &AcProbBank,
+    zrl_probs: &ZeroRunProbBank,
+) -> Result<BlockCoeffs, Error> {
+    let dc_node_probs = dc_context.select_row(&dc_contexts[plane.index()]);
+    decode_block_coefficients(bc, plane, dc_node_probs, ac_probs, zrl_probs)
 }
 
 /// Map a scan-order coefficient block to raster order and apply the
@@ -789,5 +824,102 @@ mod tests {
         let mut pixels = block.raster;
         crate::idct_block(&mut pixels);
         assert_eq!(pixels, [0i32; BLOCK_SIZE]);
+    }
+
+    /// The §13.2 Table 26 context-resolving wrapper
+    /// `decode_block_coefficients_ctx` must equal
+    /// `decode_block_coefficients` with the manually-selected
+    /// `DcNodeContexts[plane][context]` row — for every plane × context
+    /// combination, across a seed-stream sweep, including identical
+    /// BoolCoder consumption.
+    #[test]
+    fn ctx_wrapper_equals_manual_row_selection() {
+        use crate::tokens::DcContext;
+        let dc_contexts = dc_probs_to_node_contexts(&baseline_dc_probs());
+        let ac_probs = baseline_ac_probs();
+        let seeds: [[u8; 16]; 4] = [
+            [0x00; 16],
+            [0xFF; 16],
+            [
+                0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x0F, 0xED, 0xCB, 0xA9, 0x87, 0x65,
+                0x43, 0x21,
+            ],
+            [0xA5; 16],
+        ];
+        for plane in [AcPlane::Y, AcPlane::UV] {
+            for &ctx in &DcContext::ALL {
+                for bytes in &seeds {
+                    // Manual: pre-resolve the row and call the base
+                    // decoder.
+                    let row = &dc_contexts[plane.index()][ctx.index()];
+                    let mut bc_manual = BoolCoder::new(bytes).unwrap();
+                    let manual = decode_block_coefficients(
+                        &mut bc_manual,
+                        plane,
+                        row,
+                        &ac_probs,
+                        &ZERO_RUN_PROB_DEFAULTS,
+                    )
+                    .unwrap();
+
+                    // Wrapper: hand it the per-plane bank + context.
+                    let mut bc_ctx = BoolCoder::new(bytes).unwrap();
+                    let wrapped = decode_block_coefficients_ctx(
+                        &mut bc_ctx,
+                        plane,
+                        &dc_contexts,
+                        ctx,
+                        &ac_probs,
+                        &ZERO_RUN_PROB_DEFAULTS,
+                    )
+                    .unwrap();
+
+                    assert_eq!(manual.coeffs, wrapped.coeffs);
+                    assert_eq!(manual.coeff_count, wrapped.coeff_count);
+                    assert_eq!(
+                        bc_manual.pos(),
+                        bc_ctx.pos(),
+                        "both paths consume identical bits (plane {plane:?}, ctx {ctx:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The three DC contexts genuinely select different probability
+    /// rows (so the wrapper's context argument is load-bearing): under
+    /// at least one seed stream the decoded DC differs across contexts.
+    #[test]
+    fn ctx_distinguishes_contexts() {
+        use crate::tokens::DcContext;
+        let dc_contexts = dc_probs_to_node_contexts(&baseline_dc_probs());
+        let ac_probs = baseline_ac_probs();
+        let bytes = [
+            0x9A, 0x37, 0xC1, 0x5E, 0x88, 0x42, 0xF3, 0x10, 0x6B, 0xAD, 0x29, 0xD4, 0x77, 0x01,
+            0xBE, 0x55,
+        ];
+        let dcs: Vec<i32> = DcContext::ALL
+            .iter()
+            .map(|&ctx| {
+                let mut bc = BoolCoder::new(&bytes).unwrap();
+                decode_block_coefficients_ctx(
+                    &mut bc,
+                    AcPlane::Y,
+                    &dc_contexts,
+                    ctx,
+                    &ac_probs,
+                    &ZERO_RUN_PROB_DEFAULTS,
+                )
+                .unwrap()
+                .coeffs[0]
+            })
+            .collect();
+        // The baseline DcNodeEqs rows differ per context, so the
+        // resolved Zero/One node probabilities differ; at this seed the
+        // decoded DC is not identical across all three contexts.
+        assert!(
+            !(dcs[0] == dcs[1] && dcs[1] == dcs[2]),
+            "DC contexts should select distinct probability rows: {dcs:?}"
+        );
     }
 }

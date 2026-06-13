@@ -6,6 +6,43 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 30, 2026-06-14)
+
+- `tokens::DcContext` — the §13.2 Table 26 DC node context (the
+  left/above predicted-DC zero-vs-non-zero situation): `BothZero` (0),
+  `OneNonZero` (1), `BothNonZero` (2). Provides `index` / `from_index`
+  / `from_neighbours(left_non_zero, above_non_zero)` (the Table 26
+  partition) / `select_row(&DcNodeContexts[plane])` (the §13.2.1
+  `ContPtr = DcNodeContexts[Plane][Context]` indexing) and a `Display`.
+  This is the deferred "§13.2 DC-coefficient token-context wiring"
+  flagged by round 28: the decoder reads from
+  `DcNodeContexts[plane][context]`, not `DcProbs` directly, and this
+  resolves *which* of the three precomputed
+  `dc_probs_to_node_contexts` rows the §13.2.1 DC tree walk consults.
+  An absent neighbour (frame left/top edge) counts as zero-DC per
+  §13.2, so a corner block decodes with `BothZero`.
+- `tokens::DcZeroContextTracker` — a per-plane raster bookkeeping
+  companion. As blocks are decoded left→right / top→bottom it tracks
+  the running left-neighbour non-zero flag plus one above-neighbour
+  flag per column; `context_for()` returns the current block's
+  `DcContext` and `record(non_zero)` advances the raster position
+  (wrapping rows, resetting the left flag at each row start). Pure
+  integer/boolean bookkeeping — reads no BoolCoder bits.
+- `block_decode::decode_block_coefficients_ctx` — the
+  context-resolving convenience over `decode_block_coefficients`:
+  takes the per-plane `DcNodeContexts[plane][3][11]` bank plus a
+  `DcContext` and selects the `[context]` row before invoking the
+  base decoder, so a driver threading `DcZeroContextTracker` calls it
+  directly rather than pre-resolving the row.
+- 13 new unit tests (534 → 547): Table 26 index/round-trip/partition
+  pins; `select_row` dimension check; tracker raster behaviour
+  (corner both-zero, first-row left-only, row wrap resetting left,
+  both-non-zero, single-column plane, zero-cols panic); and
+  `decode_block_coefficients_ctx` byte-exact equality with manual row
+  selection across plane × context × seed plus a context-distinction
+  test. `cargo fmt --check` and `cargo clippy --all-targets --no-deps
+  -- -D warnings` clean.
+
 ### Added (clean-room round 29, 2026-06-13)
 
 - `frame_assembly` module — the §2/§13/§17 block-to-plane frame

@@ -614,6 +614,246 @@ pub fn dc_probs_to_node_contexts(
     out
 }
 
+/// VP6 DC node context (spec §13.2 Table 26).
+///
+/// The §13.2.1 arithmetic DC decoder does **not** read from `DcProbs`
+/// directly; it reads from `DcNodeContexts[plane][context]`, where
+/// `context` is selected per block from whether the immediately
+/// adjacent left and above blocks' **predicted DC values were zero or
+/// non-zero**. Table 26 enumerates the three situations:
+///
+/// * `BothZero` (0) — left block's predicted DC was 0 **and** above
+///   block's predicted DC was 0.
+/// * `OneNonZero` (1) — either the left or the above block's predicted
+///   DC is non-zero, but not both.
+/// * `BothNonZero` (2) — both the left and the above block's predicted
+///   DCs are non-zero.
+///
+/// The §13.2.1 note makes the contextual requirement explicit:
+/// *"Decoding the dc requires that the contextual information regarding
+/// whether the blocks immediately to the left of and above the current
+/// block have 0 or non 0 dc values."*
+///
+/// "Predicted DC" here is the neighbour block's reconstructed DC
+/// coefficient (the §14 predictor plus the §13.2-decoded `DcDelta`) —
+/// the actual DC value that block carries — tested for being zero. A
+/// missing neighbour (the frame's left edge has no left block, the top
+/// edge has no above block) contributes a **zero** DC to the test:
+/// §13.2 treats an absent neighbour the same as a zero-DC neighbour for
+/// the purpose of this context, so a top-left corner block (no left, no
+/// above) decodes with [`DcContext::BothZero`].
+///
+/// This selection is pure integer bookkeeping over already-decoded
+/// neighbour DC values (no BoolCoder bits): it picks *which* of the
+/// three precomputed [`dc_probs_to_node_contexts`] rows the §13.2.1 DC
+/// tree walk consults. The discriminant is the spec's canonical
+/// `0..=2` index — matching the second dimension of `DcNodeContexts`
+/// and of [`DC_NODE_EQS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum DcContext {
+    /// Both the left and above neighbours' predicted DCs were 0
+    /// (an absent neighbour counts as 0). Index 0.
+    BothZero = 0,
+    /// Exactly one of the left / above neighbours' predicted DCs was
+    /// non-zero. Index 1.
+    OneNonZero = 1,
+    /// Both the left and above neighbours' predicted DCs were non-zero.
+    /// Index 2.
+    BothNonZero = 2,
+}
+
+impl DcContext {
+    /// All DC node contexts in canonical (Table 26) order.
+    pub const ALL: [DcContext; NUM_DC_CONTEXTS] = [
+        DcContext::BothZero,
+        DcContext::OneNonZero,
+        DcContext::BothNonZero,
+    ];
+
+    /// Canonical `0..=2` spec index (matches the enum discriminant and
+    /// the second dimension of `DcNodeContexts`).
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Inverse of [`DcContext::index`]: build a context from the spec's
+    /// `0..=2` integer. Returns `None` for out-of-range values.
+    #[inline]
+    pub const fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::BothZero),
+            1 => Some(Self::OneNonZero),
+            2 => Some(Self::BothNonZero),
+            _ => None,
+        }
+    }
+
+    /// Select the §13.2 Table 26 DC node context from the
+    /// zero/non-zero state of the left and above neighbour blocks'
+    /// predicted DC values.
+    ///
+    /// `left_non_zero` / `above_non_zero` are `true` when the
+    /// corresponding neighbour block exists *and* carried a non-zero
+    /// predicted DC. A missing neighbour passes `false` (an absent
+    /// neighbour counts as zero-DC per §13.2). The mapping is the
+    /// Table 26 partition:
+    ///
+    /// ```text
+    /// neither non-zero → BothZero    (0)
+    /// exactly one      → OneNonZero  (1)
+    /// both non-zero    → BothNonZero (2)
+    /// ```
+    #[inline]
+    pub const fn from_neighbours(left_non_zero: bool, above_non_zero: bool) -> Self {
+        match (left_non_zero, above_non_zero) {
+            (false, false) => Self::BothZero,
+            (true, true) => Self::BothNonZero,
+            _ => Self::OneNonZero,
+        }
+    }
+
+    /// Select the active per-(plane) DC node-probability row a §13.2.1
+    /// DC tree walk consults, from a `DcNodeContexts[plane][context]`
+    /// bank (the [`dc_probs_to_node_contexts`] output).
+    ///
+    /// This is the convenience that wires the Table 26 context choice
+    /// into the [`crate::dct_decode::decode_dc`] /
+    /// [`crate::block_decode::decode_block_coefficients`] caller: given
+    /// the per-plane converted bank and this context, it returns the
+    /// 11-entry node-probability vector those decoders expect as
+    /// `dc_node_probs`.
+    #[inline]
+    pub fn select_row(
+        self,
+        contexts: &[[u8; NUM_TREE_NODES]; NUM_DC_CONTEXTS],
+    ) -> &[u8; NUM_TREE_NODES] {
+        &contexts[self.index()]
+    }
+}
+
+impl fmt::Display for DcContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::BothZero => "DC_CONTEXT_BOTH_ZERO",
+            Self::OneNonZero => "DC_CONTEXT_ONE_NON_ZERO",
+            Self::BothNonZero => "DC_CONTEXT_BOTH_NON_ZERO",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Per-plane raster tracker for the §13.2 Table 26 DC node context.
+///
+/// As a plane's blocks are decoded in raster order (left→right,
+/// top→bottom), the Table 26 DC context for each block depends on the
+/// zero/non-zero state of its immediate **left** and **above**
+/// neighbours' predicted DCs (see [`DcContext`]). This tracker holds
+/// the small amount of state needed to supply that context without the
+/// caller re-deriving neighbour positions:
+///
+/// * the non-zero flag of the block decoded immediately before the
+///   current one in this row (the **left** neighbour), and
+/// * one non-zero flag per column for the row above (the **above**
+///   neighbours).
+///
+/// The caller decodes blocks in raster order, calling
+/// [`context_for`](Self::context_for) at the start of each block to get
+/// its [`DcContext`], then [`record`](Self::record) with the block's
+/// own predicted-DC non-zero state once it is reconstructed. At the
+/// left edge of a row there is no left neighbour and at the top row
+/// there is no above neighbour; both absences contribute a zero-DC
+/// (`false`) to the context per §13.2 (an absent neighbour counts as
+/// zero-DC).
+///
+/// Pure integer / boolean bookkeeping — reads **no BoolCoder bits**. A
+/// driver runs one tracker per plane (or per plane × reference bucket,
+/// if the §14 same-reference partition is also applied to this
+/// context; §13.2 specifies the zero-DC test without further
+/// qualifying it by reference, so the default tracker tests the raw
+/// neighbour DC).
+#[derive(Debug, Clone)]
+pub struct DcZeroContextTracker {
+    /// Number of block columns in this plane.
+    cols: usize,
+    /// Per-column "above neighbour's predicted DC was non-zero" flags
+    /// for the most-recently-completed row. All `false` before the
+    /// first row.
+    above_non_zero: Vec<bool>,
+    /// The current block column being decoded (`0..cols`).
+    col: usize,
+    /// "Left neighbour's predicted DC was non-zero" flag for the
+    /// current row. Reset to `false` (no left neighbour) at the start
+    /// of each row.
+    left_non_zero: bool,
+}
+
+impl DcZeroContextTracker {
+    /// Build a tracker for a plane that is `cols` blocks wide.
+    ///
+    /// Panics if `cols == 0` (a plane must have at least one column).
+    pub fn new(cols: usize) -> Self {
+        assert!(cols > 0, "DcZeroContextTracker requires cols > 0");
+        Self {
+            cols,
+            above_non_zero: vec![false; cols],
+            col: 0,
+            left_non_zero: false,
+        }
+    }
+
+    /// The plane width (in blocks) this tracker was built for.
+    #[inline]
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    /// The current block column (`0..cols`).
+    #[inline]
+    pub fn col(&self) -> usize {
+        self.col
+    }
+
+    /// The §13.2 Table 26 [`DcContext`] for the **current** block —
+    /// the one about to be decoded at the current raster position.
+    ///
+    /// Combines the running left-neighbour flag with the stored
+    /// above-neighbour flag for the current column. At the left edge
+    /// (`col == 0`) the left flag is `false`; in the first row the
+    /// above flags are all `false`. Does not advance the tracker — call
+    /// [`record`](Self::record) once the block's predicted-DC non-zero
+    /// state is known.
+    #[inline]
+    pub fn context_for(&self) -> DcContext {
+        DcContext::from_neighbours(self.left_non_zero, self.above_non_zero[self.col])
+    }
+
+    /// Record the current block's predicted-DC non-zero state and
+    /// advance the raster position to the next block.
+    ///
+    /// `non_zero` is `true` when this block's reconstructed (predicted)
+    /// DC was non-zero. The flag becomes the **left** neighbour for the
+    /// next block in this row and the **above** neighbour for the block
+    /// directly below in the next row. Advancing past the last column
+    /// wraps to the next row: the left flag resets to `false` (the new
+    /// row's first block has no left neighbour) and the column counter
+    /// returns to 0, with the just-completed row's flags now serving as
+    /// the above row.
+    pub fn record(&mut self, non_zero: bool) {
+        self.above_non_zero[self.col] = non_zero;
+        self.left_non_zero = non_zero;
+        self.col += 1;
+        if self.col == self.cols {
+            // Wrap to the next row: no left neighbour for its first
+            // block, and the row just finished is now the "above" row
+            // (already written into `above_non_zero` column-by-column).
+            self.col = 0;
+            self.left_non_zero = false;
+        }
+    }
+}
+
 /// Convert an 11-entry node-probability vector into the 12-entry
 /// Huffman probability set per the §13.1 `DCTTokenBoolTreeToHuffProbs`
 /// transform.
@@ -1539,5 +1779,150 @@ mod tests {
             AcPrecContext::WasGreaterThanOne.to_string(),
             "AC_PREC_WAS_GREATER_THAN_ONE"
         );
+    }
+
+    // -------- DcContext (§13.2 Table 26) --------
+
+    #[test]
+    fn dc_context_indices_match_table_26_order() {
+        assert_eq!(DcContext::BothZero.index(), 0);
+        assert_eq!(DcContext::OneNonZero.index(), 1);
+        assert_eq!(DcContext::BothNonZero.index(), 2);
+        assert_eq!(DcContext::ALL.len(), NUM_DC_CONTEXTS);
+        for (i, &c) in DcContext::ALL.iter().enumerate() {
+            assert_eq!(c.index(), i);
+        }
+    }
+
+    #[test]
+    fn dc_context_from_index_round_trip() {
+        for &c in &DcContext::ALL {
+            assert_eq!(DcContext::from_index(c.index()), Some(c));
+        }
+        assert_eq!(DcContext::from_index(3), None);
+        assert_eq!(DcContext::from_index(usize::MAX), None);
+    }
+
+    #[test]
+    fn dc_context_from_neighbours_partitions_table_26() {
+        // Table 26: neither → 0, exactly one → 1, both → 2.
+        assert_eq!(
+            DcContext::from_neighbours(false, false),
+            DcContext::BothZero
+        );
+        assert_eq!(
+            DcContext::from_neighbours(true, false),
+            DcContext::OneNonZero
+        );
+        assert_eq!(
+            DcContext::from_neighbours(false, true),
+            DcContext::OneNonZero
+        );
+        assert_eq!(
+            DcContext::from_neighbours(true, true),
+            DcContext::BothNonZero
+        );
+    }
+
+    #[test]
+    fn dc_context_select_row_picks_the_right_dimension() {
+        // Build a per-plane bank with each context row distinctly tagged
+        // so select_row's indexing is observable.
+        let dc_probs = baseline_dc_probs();
+        let banks = dc_probs_to_node_contexts(&dc_probs);
+        for plane_bank in &banks {
+            for &ctx in &DcContext::ALL {
+                let row = ctx.select_row(plane_bank);
+                assert_eq!(row, &plane_bank[ctx.index()]);
+            }
+        }
+    }
+
+    #[test]
+    fn dc_context_display_names() {
+        assert_eq!(DcContext::BothZero.to_string(), "DC_CONTEXT_BOTH_ZERO");
+        assert_eq!(DcContext::OneNonZero.to_string(), "DC_CONTEXT_ONE_NON_ZERO");
+        assert_eq!(
+            DcContext::BothNonZero.to_string(),
+            "DC_CONTEXT_BOTH_NON_ZERO"
+        );
+    }
+
+    // -------- DcZeroContextTracker raster bookkeeping --------
+
+    #[test]
+    fn tracker_first_block_is_both_zero() {
+        // Top-left corner: no left, no above → both zero.
+        let t = DcZeroContextTracker::new(4);
+        assert_eq!(t.cols(), 4);
+        assert_eq!(t.col(), 0);
+        assert_eq!(t.context_for(), DcContext::BothZero);
+    }
+
+    #[test]
+    fn tracker_first_row_only_uses_left_neighbour() {
+        // First row has no above neighbours; context is driven entirely
+        // by the left-neighbour non-zero state.
+        let mut t = DcZeroContextTracker::new(3);
+        assert_eq!(t.context_for(), DcContext::BothZero); // col 0: no left
+        t.record(true); // block 0 had non-zero DC
+        assert_eq!(t.col(), 1);
+        // col 1: left non-zero, above absent → exactly one.
+        assert_eq!(t.context_for(), DcContext::OneNonZero);
+        t.record(false); // block 1 had zero DC
+                         // col 2: left zero, above absent → both zero.
+        assert_eq!(t.context_for(), DcContext::BothZero);
+        t.record(true);
+    }
+
+    #[test]
+    fn tracker_wraps_to_next_row_resetting_left() {
+        let mut t = DcZeroContextTracker::new(2);
+        // Row 0: record [true, true].
+        t.record(true); // col 0
+        t.record(true); // col 1 → wraps to row 1 col 0
+        assert_eq!(t.col(), 0);
+        // Row 1, col 0: no left (row start), above (col 0) was non-zero
+        // → exactly one.
+        assert_eq!(t.context_for(), DcContext::OneNonZero);
+        t.record(false); // block at row1 col0 had zero DC
+                         // Row 1, col 1: left zero, above (col 1) was non-zero → one.
+        assert_eq!(t.context_for(), DcContext::OneNonZero);
+        t.record(true);
+    }
+
+    #[test]
+    fn tracker_both_non_zero_when_left_and_above_set() {
+        let mut t = DcZeroContextTracker::new(2);
+        // Row 0: [true, true].
+        t.record(true);
+        t.record(true);
+        // Row 1, col 0: above non-zero, no left → one.
+        assert_eq!(t.context_for(), DcContext::OneNonZero);
+        t.record(true); // row1 col0 non-zero
+                        // Row 1, col 1: left non-zero AND above (col1) non-zero → both.
+        assert_eq!(t.context_for(), DcContext::BothNonZero);
+        t.record(true);
+    }
+
+    #[test]
+    fn tracker_single_column_plane() {
+        // A 1-column plane: every block has no left neighbour; the
+        // context is driven by the single above column only.
+        let mut t = DcZeroContextTracker::new(1);
+        assert_eq!(t.context_for(), DcContext::BothZero); // row 0
+        t.record(true);
+        // Row 1: above non-zero, no left → exactly one.
+        assert_eq!(t.col(), 0);
+        assert_eq!(t.context_for(), DcContext::OneNonZero);
+        t.record(false);
+        // Row 2: above zero, no left → both zero.
+        assert_eq!(t.context_for(), DcContext::BothZero);
+    }
+
+    #[test]
+    #[should_panic(expected = "cols > 0")]
+    fn tracker_rejects_zero_cols() {
+        let _ = DcZeroContextTracker::new(0);
     }
 }

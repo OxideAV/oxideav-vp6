@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 29 (2026-06-13).** The orphan-rebuild
+**Clean-room rebuild — round 30 (2026-06-14).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -1485,6 +1485,81 @@ sourced from
 - The §11.5 UMV-bordered *reference* buffer construction for inter
   prediction (already available via `umv::build_extended_buffer`);
   this round assembles the unbordered reconstruction planes only.
+
+### What round 30 lands
+
+- `tokens::DcContext` — the **§13.2 Table 26 DC node context**: the
+  deferred "DC-coefficient token-context wiring (Table 26's left/above
+  zero-DC context selection)" round 28 explicitly flagged as a natural
+  next-round target. The §13.2.1 arithmetic DC decoder does not read
+  from `DcProbs` directly; it reads from
+  `DcNodeContexts[plane][context]`, where `context` is selected per
+  block from whether the immediately adjacent **left** and **above**
+  blocks' predicted DCs were zero or non-zero. Table 26 enumerates the
+  three situations and `DcContext` names them on the canonical 0..=2
+  index:
+  - `BothZero` (0) — left's predicted DC was 0 **and** above's was 0.
+  - `OneNonZero` (1) — exactly one of left / above is non-zero.
+  - `BothNonZero` (2) — both are non-zero.
+  - `index` / `from_index` round-trip; `from_neighbours(left_non_zero,
+    above_non_zero)` (the Table 26 partition); `select_row(
+    &DcNodeContexts[plane])` (the §13.2.1
+    `ContPtr = DcNodeContexts[Plane][Context]` indexing returning the
+    11-entry node-probability row the round-16 `decode_dc` consumes);
+    and a `Display`. A **missing** neighbour (the frame's left edge has
+    no left block, the top edge no above block) counts as a **zero-DC**
+    neighbour per §13.2's "have 0 or non 0 dc values" note, so the
+    top-left corner block decodes with `BothZero`.
+- `tokens::DcZeroContextTracker` — the per-plane raster bookkeeping
+  companion that supplies the Table 26 context without the caller
+  re-deriving neighbour positions. As a plane's blocks are decoded in
+  raster order (left→right, top→bottom) it holds the running
+  left-neighbour non-zero flag plus one above-neighbour flag per
+  column. `context_for()` returns the current block's `DcContext`;
+  `record(non_zero)` records the block's own predicted-DC non-zero
+  state and advances the raster position, wrapping at the row end
+  (resetting the left flag — the new row's first block has no left
+  neighbour) with the just-completed row's flags becoming the above
+  row.
+- `block_decode::decode_block_coefficients_ctx` — the
+  context-resolving convenience over round-28's
+  `decode_block_coefficients`. Instead of a pre-resolved
+  `DcNodeContexts[plane][context]` row (which the §13.2.1 caller had to
+  select by hand), it takes the per-plane `DcNodeContexts[plane][3][11]`
+  bank plus a `DcContext` and performs the `[context]` selection
+  internally before invoking the base decoder — so a driver threading
+  a `DcZeroContextTracker` per plane calls it directly. Verified
+  byte-exact against the manual pre-resolved path.
+- Like §15/§16/§17/§11/§12/§14, this context selection is pure integer
+  index arithmetic over already-decoded neighbour DC state — it reads
+  **no BoolCoder bits**, picking *which* probability row the §13.2.1
+  tree walk consults, not consuming any. It advances the decoder past
+  round 29 without touching the contested §7.3 `Split` formula.
+- Test count: 534 → 547 (13 new, all green). `cargo fmt --check` and
+  `cargo clippy --all-targets --no-deps -- -D warnings` clean. No new
+  spec material read beyond §13.2 (Tables 25/26/27) of the staged
+  `vp6_format.pdf`; no errata change required.
+
+### What round 30 does NOT land
+
+- The per-frame / per-macroblock **driver** that walks the macroblock
+  grid, threads the §14 DC-prediction state into the
+  `DcZeroContextTracker`'s `record` calls, and decodes each block's
+  coefficients with its resolved context — still gated upstream on the
+  §7.3 BoolCoder degeneracy (errata #35 internal inconsistency, round
+  27) and the §10 `VP6_DecodeMode` MB-mode traversal DOCS-GAP (round
+  21). This round lands the Table 26 context primitive that driver
+  will call; the driver itself remains the immediate blocked target.
+- The §14 same-reference partition of the zero-DC context. §13.2
+  specifies the Table 26 test on the raw neighbour DC without further
+  qualifying it by reference frame (unlike the §14 *predictor*, which
+  disqualifies cross-reference neighbours). `DcZeroContextTracker`
+  therefore tracks the raw neighbour non-zero state; a driver that
+  needs per-reference partitioning can run one tracker per
+  plane × bucket.
+- Output scaling (§9 `ScalingMode` / `OutputHFragments` /
+  `OutputVFragments`) — carried forward from round 29 as a separate
+  output-stage concern.
 
 ## License
 
