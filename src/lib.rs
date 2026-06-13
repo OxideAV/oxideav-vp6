@@ -795,6 +795,41 @@
 //! §13.3.1 listing's `AcUpdateProbs[Prec][Plane][Band]` naming slip,
 //! and the listing's EOB `EncodedCoeffs++` / post-loop `--`
 //! choreography, are both documented on the module.
+//!
+//! ## Round 29 surface — §2/§13/§17 frame assembly
+//!
+//! * [`frame_assembly`] — the **block-to-plane assembly** stage that
+//!   the per-block reconstruction pipeline feeds. Prior rounds landed
+//!   the full single-block path (§13 entropy → §12 scan → §15 dequant →
+//!   §16 [`idct_block`] → §17 [`reconstruct_intra_block`] / [`inter`]),
+//!   each producing one reconstructed 8x8 block; this stage owns the
+//!   per-plane raster image buffers and writes each finished block into
+//!   its correct pixel position, accumulating the per-block output into
+//!   a full decoded YUV 4:2:0 image. Surfaces: [`Plane`] (a dense
+//!   raster `u8` plane with [`Plane::place_block`] /
+//!   [`Plane::place_block_at_pixel`] 8x8 writes and bounds-checked
+//!   placement); [`Frame`] (the three Y/U/V planes plus the §9
+//!   `HFragments` / `VFragments` geometry, with
+//!   [`Frame::place_macroblock_luma`] mapping the four in-MB luma
+//!   blocks to their §13-page-58 2x2 raster positions `0=TL, 1=TR,
+//!   2=BL, 3=BR`, [`Frame::place_macroblock_chroma`] placing the one
+//!   U + one V block per MB, and [`Frame::place_macroblock`] doing all
+//!   six); [`MB_LUMA_BLOCK_OFFSETS`] (the verbatim 2x2 offset table);
+//!   and [`mb_cols_for`] / [`mb_rows_for`] (the §2 4:2:0 chroma-grid
+//!   derivation, one chroma block per macroblock).
+//!
+//!   This stage is BoolCoder-independent — it consumes already-
+//!   reconstructed §17 pixel blocks and performs pure integer index
+//!   arithmetic plus 8x8 raster writes — so like
+//!   §15/§16/§17/§11/§12/§14 it advances the decoder without touching
+//!   the contested §7.3 `Split` formula. The §11.5 UMV border
+//!   extension stays in [`umv`] (applied to a reference-plane copy
+//!   before inter prediction reads it); these reconstruction planes
+//!   are unbordered. The per-frame driver that walks the macroblock
+//!   grid (mode → MV → coefficient → reconstruct → assemble) remains
+//!   gated upstream on the §7.3 BoolCoder and §10 mode-traversal
+//!   DOCS-GAPs; this round lands the assembly primitive that driver
+//!   will call.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -807,6 +842,7 @@ pub mod dc_pred;
 pub mod dct_decode;
 pub mod dequant;
 pub mod fourmv;
+pub mod frame_assembly;
 pub mod frame_header;
 pub mod huffman;
 pub mod idct;
@@ -843,6 +879,10 @@ pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
 pub use fourmv::{
     average_four_away_from_zero, decode_fourmv_block_mode, decode_fourmv_block_modes,
     derive_fourmv_chroma_mv, FOURMV_BLOCK_MODES, NUM_FOURMV_BLOCK_MODES, NUM_LUMA_BLOCKS_PER_MB,
+};
+pub use frame_assembly::{
+    mb_cols_for, mb_rows_for, AssemblyError, Frame, Plane, BLOCK_DIM, MB_LUMA_BLOCKS,
+    MB_LUMA_BLOCK_OFFSETS, MB_LUMA_DIM,
 };
 pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
 pub use huffman::{

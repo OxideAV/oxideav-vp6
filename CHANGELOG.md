@@ -6,6 +6,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 29, 2026-06-13)
+
+- `frame_assembly` module — the §2/§13/§17 block-to-plane frame
+  assembly stage, the natural successor to the per-block
+  reconstruction pipeline (rounds 2–6/28: §13 entropy → §12 scan →
+  §15 dequant → §16 `idct_block` → §17 reconstruct). Owns the
+  per-plane raster image buffers and writes each finished
+  reconstructed 8x8 block into its correct pixel position, so the
+  per-block decoder output accumulates into a full decoded YUV 4:2:0
+  image. Surfaces: `Plane` (a dense raster `u8` plane with
+  `place_block` / `place_block_at_pixel` bounds-checked 8x8 writes,
+  `with_block_grid` block-sized allocation, and `sample` /
+  `samples` / `samples_mut` accessors); `Frame` (the three Y/U/V
+  planes plus the §9 `HFragments` / `VFragments` geometry, with
+  `place_macroblock_luma` mapping the four in-MB luma blocks to their
+  §13-page-58 2x2 raster positions `0=TL, 1=TR, 2=BL, 3=BR`,
+  `place_macroblock_chroma` placing one U + one V block per
+  macroblock, and `place_macroblock` doing all six);
+  `MB_LUMA_BLOCK_OFFSETS` (the verbatim 2x2 luma offset table);
+  `mb_cols_for` / `mb_rows_for` (the §2 4:2:0 chroma-grid derivation,
+  one chroma block per macroblock, `ceil(fragments / 2)` MBs);
+  `BLOCK_DIM` / `MB_LUMA_DIM` / `MB_LUMA_BLOCKS` constants; and
+  `AssemblyError::OutOfBounds`. Odd-`HFragments` / odd-`VFragments`
+  partial edge macroblocks skip their off-grid overhang luma blocks
+  without error. BoolCoder-independent — pure integer index
+  arithmetic plus raster 8x8 writes over already-reconstructed §17
+  pixels — so it advances the decoder without touching the contested
+  §7.3 `Split` formula. The §11.5 UMV border stays in `umv` (applied
+  to a reference-plane copy); these reconstruction planes are
+  unbordered. Sourced exclusively from `vp6_format.pdf` §2 (page 9),
+  §9 (page 24) and §13 (page 58). 13 new unit tests pinning the
+  constant transcription, plane geometry from the §9 worked example
+  (320x240 → HFragments 40 / VFragments 30), exact 8x8 write region +
+  raster orientation, out-of-bounds rejection leaving the plane
+  untouched, even/odd 4:2:0 frame geometry, the macroblock 2x2 luma
+  ordering, one-chroma-block-per-MB placement, the full six-block
+  macroblock, the odd-fragment overhang skip, and an end-to-end test
+  driving the real `idct_block` + `intra_block_to_pixels` pipeline
+  into a frame plane. Test count: 521 → 534.
+
 ### Added (clean-room round 28, 2026-06-12)
 
 - `block_decode` module — the §13 per-block coefficient

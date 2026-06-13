@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 28 (2026-06-12).** The orphan-rebuild
+**Clean-room rebuild — round 29 (2026-06-13).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -1405,6 +1405,86 @@ sourced from
 - The §13.2 DC-coefficient *token-context* wiring (Table 26's
   left/above zero-DC context selection) — pure composition over
   `dc_pred`, a natural next-round target alongside this driver.
+
+### What round 29 lands
+
+- `frame_assembly` module — the §2/§13/§17 **block-to-plane frame
+  assembly** stage. The per-block reconstruction pipeline was already
+  complete in prior rounds (§13 entropy → §12 scan → §15 dequant →
+  §16 `idct_block` → §17 `reconstruct_intra_block` / `inter`), each
+  producing a single reconstructed 8x8 block. This stage owns the
+  per-plane raster image buffers and writes each finished block into
+  its correct pixel position, accumulating the per-block decoder
+  output into a full decoded YUV 4:2:0 image — the "frame assembly"
+  the codec needs to turn blocks into actual output pixels.
+  - `Plane` — a dense raster `u8` image plane (luma or one chroma
+    channel). `place_block(block_row, block_col, &block)` writes a
+    reconstructed 8x8 block at block-grid coordinates;
+    `place_block_at_pixel(top, left, &block)` writes at an arbitrary
+    pixel origin; both reject out-of-bounds placements
+    (`AssemblyError::OutOfBounds`) without a partial write.
+    `with_block_grid(cols, rows)` allocates a block-sized plane;
+    `sample` / `samples` / `samples_mut` read back the result.
+  - `Frame` — the three Y/U/V planes plus the §9 `HFragments` /
+    `VFragments` geometry. The luma plane is `HFragments * 8` x
+    `VFragments * 8` pixels (§9 worked example: a 320x240 image has
+    HFragments 40 / VFragments 30); the chroma planes are sized to
+    the macroblock grid (`mb_cols * 8` x `mb_rows * 8`), since each
+    macroblock contributes exactly one 8x8 block to each chroma plane
+    under §2's 4:2:0 sub-sampling.
+  - `Frame::place_macroblock_luma` maps the four in-macroblock luma
+    blocks to their §13 (page 58) 2x2 raster positions — `0=TL,
+    1=TR, 2=BL, 3=BR` (`MB_LUMA_BLOCK_OFFSETS`) — into the luma
+    plane; `place_macroblock_chroma` places the one U + one V block;
+    `place_macroblock` does all six in one call. Partial edge
+    macroblocks (when `HFragments` / `VFragments` are odd) skip their
+    off-grid overhang luma blocks without error.
+  - `mb_cols_for` / `mb_rows_for` — the §2 4:2:0 chroma-grid
+    derivation (`ceil(fragments / 2)` macroblocks per dimension).
+  - `BLOCK_DIM` (8), `MB_LUMA_DIM` (16), `MB_LUMA_BLOCKS` (4)
+    constants, transcribed from §2 / §16.
+- BoolCoder-independent: every operation is pure integer index
+  arithmetic plus a raster 8x8 write over already-reconstructed §17
+  pixel blocks. Like §15/§16/§17/§11/§12/§14 it reads **no BoolCoder
+  bits**, so it advances the decoder without touching the contested
+  §7.3 `Split` formula. The §11.5 Unrestricted-Motion-Vector border
+  extension stays in `umv` (applied to a *reference*-plane copy
+  before inter prediction reads it); these reconstruction planes are
+  unbordered.
+- 13 new unit tests pinning: the constant transcription against §2 /
+  §13 / §16; plane geometry from the §9 320x240 worked example; the
+  exact 8x8 write region with raster orientation preserved (no
+  row/col transpose) and no leakage outside the block; out-of-bounds
+  rejection leaving the plane untouched; even/odd 4:2:0 frame
+  geometry (mb-grid round-up); the macroblock 2x2 luma ordering;
+  one-chroma-block-per-MB placement; the full six-block macroblock;
+  the odd-fragment edge-MB overhang skip; and an **end-to-end** test
+  that drives the real `idct_block` + `intra_block_to_pixels`
+  pipeline for a DC-only block and assembles the genuine
+  reconstructed pixels into a frame plane (not synthetic markers) —
+  confirming the assembly stage lands actual decoded output.
+- Test count: 521 → 534. `cargo fmt --check` and `cargo clippy
+  --all-targets --no-deps -- -D warnings` clean.
+
+### What round 29 does NOT land
+
+- The per-frame / per-macroblock **driver** that walks the macroblock
+  grid in raster order (mode decode → MV decode → per-block
+  coefficient decode → reconstruct → assemble), threading the §14 DC
+  prediction state, the reference frame buffers and the §11.5 UMV
+  border. It is gated upstream on the §7.3 BoolCoder degeneracy
+  (errata #35 internal inconsistency, see round 27) and the §10
+  `VP6_DecodeMode` traversal DOCS-GAP (round 21); this round lands
+  the assembly primitive that driver will call once those gaps are
+  resolved.
+- Output scaling (§9 `ScalingMode` / `OutputHFragments` /
+  `OutputVFragments`) — the decoded frame may be presented at a
+  different resolution than its coded `HFragments` / `VFragments`;
+  the post-decode scale is a separate output-stage concern. The
+  assembled `Frame` here is at coded resolution.
+- The §11.5 UMV-bordered *reference* buffer construction for inter
+  prediction (already available via `umv::build_extended_buffer`);
+  this round assembles the unbordered reconstruction planes only.
 
 ## License
 
