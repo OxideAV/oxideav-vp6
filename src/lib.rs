@@ -857,6 +857,7 @@ pub mod near_mv;
 pub mod prob_update;
 pub mod raw_bits;
 pub mod reconstruct;
+pub mod scaling;
 pub mod scan;
 pub mod scan_update;
 pub mod tokens;
@@ -931,6 +932,7 @@ pub use prob_update::{
 };
 pub use raw_bits::{RawBitError, RawBitReader};
 pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};
+pub use scaling::{FrameGeometry, OutputScaling, ScalingMode, FRAGMENT_DIM};
 pub use scan::{
     raster_to_zigzag_block, zigzag_to_raster_block, DEFAULT_SCAN_ORDER,
     DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG,

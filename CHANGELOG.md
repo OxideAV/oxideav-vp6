@@ -6,6 +6,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 31, 2026-06-14)
+
+- `scaling` module — the §9 `ScalingMode` / `Output*Fragments` static
+  output-scaling surface (Table 2, page 24). BoolCoder-independent: pure
+  integer arithmetic over already-decoded fragment counts.
+  - `ScalingMode` — the four §9 named modes (`MaintainAspectRatio` (0),
+    `ScaleToFit` (1), `Center` (2), `Other` (3)) on the spec's listing
+    order, with `from_b2(value)` (decoded `b(2)` → mode, `None` outside
+    `0..=3`) and `index()` round-trip.
+  - `FrameGeometry` — `(h_fragments, v_fragments)` → pixel dimensions
+    (`luma_width`/`luma_height` = `fragments * 8`, per the §9 worked
+    example: 320x240 → HFragments 40 / VFragments 30) plus the §2 4:2:0
+    macroblock-grid round-up (`mb_cols`/`mb_rows` = `ceil(fragments / 2)`).
+  - `OutputScaling` — the desired output `FrameGeometry` paired with a
+    `ScalingMode`, with `is_identity(coded)` reporting whether a coded
+    geometry needs any resampling.
+  - `FRAGMENT_DIM` (8) — the §2/§16 transform-block edge.
+  - **DOCS-GAP** documented on the module: the staged `vp6_format.pdf`
+    names the four modes but does not specify the per-mode pixel-placement
+    algorithm (how CENTER positions / SCALE_TO_FIT stretches / etc.); the
+    resampling math is reported as a docs-gap candidate. The typed mode
+    surface and the dimension derivations the math would consume land here.
+- 11 new unit tests pinning: `FRAGMENT_DIM`; the §9 listing-order
+  discriminants; `from_b2` round-trip + out-of-range rejection
+  (`4..=255` → `None`); the 320x240 worked example; `luma_*` =
+  `fragments * 8`; the 4:2:0 mb-grid round-up (even exact, odd up); and
+  `OutputScaling::is_identity` (coded == output, mode-independent).
+- Test count: 547 → 558. `cargo fmt --check` and `cargo clippy
+  --all-targets --no-deps -- -D warnings` clean. No new spec material
+  read beyond §9 (Table 2) / §2 of the staged `vp6_format.pdf`; no errata
+  change required.
+
 ### Added (clean-room round 30, 2026-06-14)
 
 - `tokens::DcContext` — the §13.2 Table 26 DC node context (the

@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 30 (2026-06-14).** The orphan-rebuild
+**Clean-room rebuild — round 31 (2026-06-14).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -1560,6 +1560,73 @@ sourced from
 - Output scaling (§9 `ScalingMode` / `OutputHFragments` /
   `OutputVFragments`) — carried forward from round 29 as a separate
   output-stage concern.
+
+### What round 31 lands
+
+- `scaling` module — the spec §9 `ScalingMode` / `Output*Fragments`
+  static output-scaling surface (Table 2, page 24), the deferred
+  "Output scaling (§9 `ScalingMode` / `OutputHFragments` /
+  `OutputVFragments`)" item rounds 29 and 30 carried forward as a
+  separate output-stage concern. After a frame is decoded at its
+  **coded** resolution (`HFragments` x `VFragments` 8x8 blocks), §9
+  says it "*may be encoded at a different resolution to the eventual
+  size that it is presented on output*"; the header carries the output
+  geometry plus a two-bit `ScalingMode`. Surfaces:
+  - `ScalingMode` — the four §9 named modes
+    (`MaintainAspectRatio` (0), `ScaleToFit` (1), `Center` (2),
+    `Other` (3)) on the spec's listing order
+    ("*MAINTAIN_ASPECT_RATIO, SCALE_TO_FIT, CENTER, OTHER*"), with
+    `from_b2(value)` (a decoded `b(2)` field → mode, `None` for any
+    value outside `0..=3`) and an `index()` round-trip.
+  - `FrameGeometry` — a `(h_fragments, v_fragments)` pair (shared by
+    the coded and output descriptions) → pixel dimensions
+    (`luma_width` / `luma_height` = `fragments * 8`, pinned against
+    the §9 worked example: a 320x240 image has HFragments 40 /
+    VFragments 30) plus the §2 4:2:0 macroblock-grid round-up
+    (`mb_cols` / `mb_rows` = `ceil(fragments / 2)`, matching the
+    `frame_assembly` chroma-grid derivation).
+  - `OutputScaling` — the desired output `FrameGeometry` paired with a
+    `ScalingMode`, plus `is_identity(coded)` reporting whether a given
+    coded geometry already matches the output (no resampling needed,
+    mode-independent).
+  - `FRAGMENT_DIM` (8) — the §2 / §16 transform-block edge constant.
+- Like §15/§16/§17/§11/§12/§14 this stage reads **no BoolCoder bits** —
+  every value is pure integer arithmetic over already-decoded fragment
+  counts — so it advances the decoder past round 30 without touching
+  the contested §7.3 `Split` formula. The `Output*Fragments` /
+  `ScalingMode` fields are themselves `b(8)` / `b(2)` BoolCoder-coded
+  in Table 2's tail; this module describes their *meaning* once
+  decoded, leaving the read to the (still-blocked) §9 header-tail
+  parser.
+- **DOCS-GAP candidate (per-mode placement geometry):** the staged
+  `vp6_format.pdf` names the four scaling modes and states that output
+  geometry may differ from coded geometry, but it does **not** specify
+  the per-mode pixel-mapping algorithm — how a smaller coded image is
+  positioned within (CENTER) or stretched to (SCALE_TO_FIT) the output
+  rectangle, what aspect-preserving fit MAINTAIN_ASPECT_RATIO performs,
+  or what OTHER signals. §2 lists "*Scaling on output after decode*"
+  only as a feature bullet. The actual resampling/placement math is
+  therefore out of scope; the typed mode surface and the dimension
+  derivations that math would consume land here. The §9 listing supplies
+  the only ordering for the `b(2)` field, so the discriminants follow it
+  (`0..=3`).
+- Test count: 547 → 558 (11 new, all green). `cargo fmt --check` and
+  `cargo clippy --all-targets --no-deps -- -D warnings` clean. No new
+  spec material read beyond §9 (Table 2) / §2 of the staged
+  `vp6_format.pdf`; no errata change required.
+
+### What round 31 does NOT land
+
+- The per-mode pixel-resampling/placement algorithm for the four
+  `ScalingMode` values (DOCS-GAP candidate above — the math is
+  unspecified in the staged doc).
+- The §9 frame-header BoolCoder-tail parser that reads the
+  `Output*Fragments` / `ScalingMode` `b(8)` / `b(2)` fields — still
+  gated upstream on the §7.3 BoolCoder degeneracy (errata #35 internal
+  inconsistency, round 27).
+- The per-frame / per-macroblock **driver** — still gated on the §7.3
+  BoolCoder degeneracy and the §10 `VP6_DecodeMode` MB-mode traversal
+  DOCS-GAP (round 21).
 
 ## License
 
