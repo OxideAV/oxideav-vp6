@@ -849,6 +849,7 @@ pub mod idct;
 pub mod inter;
 pub mod interp;
 pub mod loopfilter;
+pub mod mode_prob_update;
 pub mod modes;
 pub mod mv_decode;
 pub mod mv_diff;
@@ -902,6 +903,12 @@ pub use interp::{
 pub use loopfilter::{
     bound, boundary_x, boundary_y, filter_horizontal_boundary, filter_vertical_boundary,
     prediction_loop_filter_function, PREDICTION_LOOP_FILTER_LIMIT_VALUES,
+};
+pub use mode_prob_update::{
+    apply_prob_difference, decode_mode_prob_difference, decode_mode_prob_update_value,
+    update_mode_probs, update_mode_probs_for_situation, FIGURE9_NODE_PROBS, LONG_DIFFERENCE_BITS,
+    SET_NEW_BASELINE_PROBS_FLAG, SIGN_PROB, UPDATE_FLAG_PROB, VECTOR_UPDATES_PRESENT_FLAG,
+    WHICH_VECTOR_BITS,
 };
 pub use modes::{
     build_mode_decision_tree, build_probability_mode_same, mode_decision_tree_node_probability,

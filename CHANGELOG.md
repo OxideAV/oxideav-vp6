@@ -6,6 +6,65 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 32, 2026-06-15)
+
+- `mode_prob_update` module — the §10 per-frame **mode-probability-update
+  bitstream** (Tables 7 / 8 / 9 and the Figure 9 magnitude tree), the
+  deferred "Mode Probability Updates bitstream" round 10 flagged. The
+  eighth BoolCoder-consuming layer; composes only round-15's
+  `BoolCoder::decode_bool` / `decode_b` over the verbatim §10 static
+  data in `modes`.
+  - `update_mode_probs` — the full driver, walking the three
+    `ModeAvailability` situations in spec order and mutating the
+    persistent `probXmitted[3][20]` table in place.
+  - `update_mode_probs_for_situation` — one situation's Table 7 / Table 8
+    walk: `SetNewBaselineProbs B(174)` → optional `WhichVector b(4)`
+    copying `VP6_MODE_VQ[situation][which]` into the row;
+    `VectorUpdatesPresentFlag B(254)` → optional 20 Table 9 records.
+  - `decode_mode_prob_update_value` — one Table 9 record:
+    `UpdateFlag B(205)`, then on update `Sign B(128)` + Figure 9
+    `Difference`, applied to the current value.
+  - `decode_mode_prob_difference` — the verbatim Figure 9 magnitude-tree
+    decode (`B(171)` / `B(83)` / `B(199)` / `B(140)` / `B(125)` /
+    `B(104)` / `b(7)` escape), returning the already-signed delta.
+  - `apply_prob_difference` — `0..=255` clamp (probXmitted entries are
+    counts the §10 tree builder reads through `1 + sum` denominators, so
+    `0` is valid — distinct from directly-read `B(prob)` node
+    probabilities, which forbid `0`).
+  - Flag/bit constants `SET_NEW_BASELINE_PROBS_FLAG` (174),
+    `VECTOR_UPDATES_PRESENT_FLAG` (254), `UPDATE_FLAG_PROB` (205),
+    `SIGN_PROB` (128), `WHICH_VECTOR_BITS` (4), `LONG_DIFFERENCE_BITS`
+    (7), `FIGURE9_NODE_PROBS`.
+  - **Spec inconsistency noted (resolved by dimension):** Table 9's
+    figure region labels the record list "Ten Sets of:", but the §10
+    prose states twice that `ModeProbUpdateVector` is "20 sets of
+    probability updates" and `probXmitted[3][20]`'s second dimension is
+    20 (ten modes × {same-as-prior, different-from-prior}). The 20-count
+    is the consistent reading; the module walks 20.
+- **Transcription fix:** corrected six `VP6_MODE_VQ` baseline-bank
+  vectors in `modes.rs` that had single-element shifts / trailing-value
+  errors against the §10 spec listing (situation 0 vectors 1 & 10;
+  situation 1 vectors 3 & 7; situation 2 vectors 7 & 15). All 48
+  vectors now match the spec verbatim. This bank is copied into
+  `probXmitted` by the new `SetNewBaselineProbs` path, so the
+  correctness matters for the layer landing this round.
+- 16 new unit tests pinning: the flag/bit constants vs spec; the
+  `0..=255` clamp (low + high saturation, zero pass-through); Figure 9
+  all-zero-stream fall-through to `sign * 24`, sign negation,
+  multiple-of-4 structural invariant, determinism, truncation surface;
+  the per-value flag-clear no-op (one bit consumed); the per-situation
+  no-baseline-no-update identity; the 20-record-length pin; the full
+  driver's all-zero identity, range/completion, determinism (with
+  BoolCoder position match) and the situation-indexed baseline-bank
+  shape. The high-probability flag-set / Figure-9 1-branch paths are
+  exercised only against a real conformant bitstream — the same
+  synthetic-stream limitation rounds 22 / 26 / 27 documented for
+  high-prob (`> 128`) reads under the round-15 BoolCoder (errata #35).
+- Test count: 558 → 574. `cargo fmt --check` and `cargo clippy
+  --all-targets --no-deps -- -D warnings` clean. No new spec material
+  read beyond §10 (Tables 5/6/7/8/9, Figure 9) of the staged
+  `vp6_format.pdf`; no errata change required.
+
 ### Added (clean-room round 31, 2026-06-14)
 
 - `scaling` module — the §9 `ScalingMode` / `Output*Fragments` static

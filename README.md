@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 31 (2026-06-14).** The orphan-rebuild
+**Clean-room rebuild — round 32 (2026-06-15).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -1627,6 +1627,95 @@ sourced from
 - The per-frame / per-macroblock **driver** — still gated on the §7.3
   BoolCoder degeneracy and the §10 `VP6_DecodeMode` MB-mode traversal
   DOCS-GAP (round 21).
+
+### What round 32 lands
+
+- `mode_prob_update` module — the spec §10 per-frame
+  **mode-probability-update bitstream** (Tables 7 / 8 / 9 and the
+  Figure 9 magnitude tree), the deferred "Mode Probability Updates
+  bitstream" round 10 flagged as BoolCoder-gated. The **eighth
+  BoolCoder-consuming layer** (after rounds 16's §13.2.1 DC, 17's
+  §13.3.1 AC, 19's §13.3.3.1 ZRL token, 20's §13.2/§13.3/§13.3.3
+  probability updates, 21's §11.1 MV component decode, 22's §11.2 MV
+  probability update and 26's §12.2 custom scan-order update). The §10
+  mode decoder reads from a persistent `probXmitted[3][20]` table; at
+  every I-frame it resets to `modes::VP6_BASELINE_XMITTED_PROBS`, for
+  P-frames it persists — and in **both** cases the frame header carries
+  this optional update bitstream that mutates the table before the
+  per-MB mode decode. Surfaces:
+  - `update_mode_probs` — the full driver, walking the three
+    `ModeAvailability` situations in `ModeAvailability::ALL` order
+    (NearestAndNear, NearestOnly, Neither) and mutating the persistent
+    `probXmitted[3][20]` table in place.
+  - `update_mode_probs_for_situation` — one situation's Table 7 / Table 8
+    walk: `SetNewBaselineProbs B(174)` → on `1`, `WhichVector b(4)`
+    copies `modes::VP6_MODE_VQ[situation][which]` into the
+    `probXmitted` row; `VectorUpdatesPresentFlag B(254)` → on `1`,
+    twenty Table 9 per-value records applied left-to-right.
+  - `decode_mode_prob_update_value` — one Table 9 record:
+    `UpdateFlag B(205)` (0-branch returns the value unchanged, one bit
+    consumed), then `Sign B(128)` + the Figure 9 `Difference`, applied
+    to the current value.
+  - `decode_mode_prob_difference` — the verbatim §10 Figure 9
+    magnitude-tree decode. The pseudo-code maps branch-for-branch:
+    `if B(171) return (sign*4)*(1+B(83))`; else `if !B(199)` the
+    small-difference subtree `B(140)→12 / B(125)→16 / B(104)→20 /
+    fall-through 24`, else the `b(7)` escape `sign * diff * 4`. Returns
+    the already-signed delta.
+  - `apply_prob_difference` — `0..=255` clamp. `probXmitted` entries are
+    counts the §10 decision-tree builder consumes through
+    `1 + probXmitted[...]` denominators, so a value of `0` is valid
+    (the baseline banks contain many zeros) — distinct from the
+    directly-read `B(prob)` node probabilities elsewhere in §13, which
+    forbid `0`.
+  - Flag/bit constants `SET_NEW_BASELINE_PROBS_FLAG` (174),
+    `VECTOR_UPDATES_PRESENT_FLAG` (254), `UPDATE_FLAG_PROB` (205),
+    `SIGN_PROB` (128), `WHICH_VECTOR_BITS` (4), `LONG_DIFFERENCE_BITS`
+    (7), `FIGURE9_NODE_PROBS`.
+- **Spec inconsistency noted (resolved by dimension):** the Table 9
+  figure region labels the record list "*Ten Sets of:*", but the §10
+  prose states **twice** that `ModeProbUpdateVector` is "*20 sets of
+  probability updates*" and the `probXmitted[3][20]` second dimension is
+  20 (ten modes, each with a same-as-prior and a different-from-prior
+  probability — Table 6). The 20-count is the consistent reading
+  (prose + array dimension agree); the "Ten Sets of" label is a spec
+  slip. This module walks 20 records per situation, matching
+  `PROB_XMITTED_ROW_LEN`. Same shape of resolution-by-dimension as
+  round 28's `AcUpdateProbs` naming slip.
+- **Transcription fix (same commit):** six `modes::VP6_MODE_VQ`
+  baseline-bank vectors had single-element shifts / trailing-value
+  errors against the §10 listing (situation 0 vectors 1 & 10;
+  situation 1 vectors 3 & 7; situation 2 vectors 7 & 15). All 48
+  vectors now match the spec verbatim. This bank is the one
+  `SetNewBaselineProbs` copies into `probXmitted`, so its correctness
+  is load-bearing for the layer landing this round.
+- Like the prior BoolCoder-consuming layers, the **high-probability**
+  flag reads (`B(174)` / `B(254)` / `B(205)`) and the Figure 9 1-branch
+  leaves (12 / 16 / 20 / the `4*(1+B(83))` and `b(7)` escape) are
+  exercised only against a real conformant `.vp6` bitstream: on
+  synthetic streams those `> 128` reads take their 0-branch under the
+  round-15 BoolCoder (errata #35 degeneracy, round 27 diagnosis), so the
+  synthetic-stream-reachable Figure 9 leaf is the `sign * 24`
+  fall-through. The same limitation rounds 22 / 26 / 27 documented.
+- Test count: 558 → 574 (16 new, all green). `cargo fmt --check` and
+  `cargo clippy --all-targets --no-deps -- -D warnings` clean. No new
+  spec material read beyond §10 (Tables 5/6/7/8/9, Figure 9) of the
+  staged `vp6_format.pdf`; no errata change required.
+
+### What round 32 does NOT land
+
+- The §10 `VP6_DecodeMode` MB-mode traversal itself — DOCS-GAP
+  candidate carried forward from round 21 (the `B(Stats[0])` /
+  `B(Stats[2])` else-branch indentation ambiguity), unaddressed by the
+  staged errata. This round prepares the `probXmitted` table that
+  traversal consults; the traversal stays deferred.
+- Sample-exact stream-driven validation of the high-prob flag paths /
+  Figure 9 1-branches — needs a real encoder-produced `.vp6`
+  inter-frame fixture (the synthetic-stream limitation above).
+- The per-frame driver that calls `update_mode_probs` at the right
+  point in the frame header (after the §9 BoolCoder tail) and the
+  intra-vs-inter `probXmitted` seeding — still gated on the §7.3
+  BoolCoder degeneracy (errata #35 internal inconsistency, round 27).
 
 ## License
 
