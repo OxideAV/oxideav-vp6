@@ -6,6 +6,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 33, 2026-06-15)
+
+- `mode_decode` module — the §10 `VP6_DecodeMode` macroblock
+  coding-mode traversal (Figure 10), the **ninth BoolCoder-consuming
+  layer** and the resolution of the DOCS-GAP candidate carried forward
+  from round 21 (the page-36 pseudo-code's `B(Stats[0])` /
+  `B(Stats[2])` else-branch indentation ambiguity). Resolved entirely
+  from the staged spec: Figure 10 (page 34) plus the
+  `ModeDecisionTree[k][i][n]` node-mass equations (page 35) pin the
+  nine-node binary-tree topology unambiguously, and the BoolCoder
+  polarity (the node probability's numerator is always the
+  `B(node) == 0` left-subtree mass) fixes which bit follows which
+  child; tracing the literal page-36 pseudo-code under that polarity
+  reproduces the same leaves, confirming the indentation was a
+  typesetting artifact.
+  - `decode_mode(bc, prob_mode_same, last_mode, &stats)` — the full
+    traversal: root `B(probModeSame)` "same as last" bit (repeat
+    `last_mode` on 1, descend on 0) then the Figure 10 tree walk.
+  - `descend_mode_tree(bc, &stats)` — the nine-node descent in
+    isolation, for callers that have already consumed the root bit.
+  - `decode_mode_from_probs(bc, &prob_xmitted, availability,
+    last_mode)` — convenience deriving `probModeSame` and the nine
+    `ModeDecisionTree` node probabilities from a live
+    `probXmitted[3][20]` table (the bank round 32's `mode_prob_update`
+    mutates per frame) via round 10's `modes` helpers before walking.
+  - Composes only round-15's `BoolCoder::decode_bool` over round 10's
+    static `modes` surface — no new spec material beyond §10 (Figure
+    10, the node-mass equations, the `VP6_DecodeMode` pseudo-code), no
+    new errata, no third-party VP6 source consulted.
+- 12 new unit tests pinning: the root "same as last" repeat; the
+  descent on a root miss; the two extreme leaves (all-0 →
+  `InterNoMv`, all-1 → `GoldNearMv`); the node-0 partition (inter vs
+  Golden subtree); the `decode_mode` vs `decode_mode_from_probs`
+  agreement with byte-exact BoolCoder-state match across all
+  `availability × last_mode` pairs against the baseline `probXmitted`;
+  determinism; the canonical-mode output invariant; the truncation
+  surface; and the same-as-last single-bit short-circuit.
+- Test count: 574 → 586. `cargo fmt --check` and `cargo clippy
+  --all-targets --no-deps -- -D warnings` clean.
+
 ### Added (clean-room round 32, 2026-06-15)
 
 - `mode_prob_update` module — the §10 per-frame **mode-probability-update

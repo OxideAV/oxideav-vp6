@@ -5,7 +5,7 @@ A pure-Rust VP6 video codec for the
 
 ## Status
 
-**Clean-room rebuild — round 32 (2026-06-15).** The orphan-rebuild
+**Clean-room rebuild — round 33 (2026-06-15).** The orphan-rebuild
 scaffold from 2026-05-18 is being replaced incrementally by parsers
 sourced from
 [On2 Technologies' VP6 Bitstream & Decoder Specification](https://github.com/OxideAV/oxideav/blob/master/docs/video/vp6/vp6_format.pdf)
@@ -1716,6 +1716,67 @@ sourced from
   point in the frame header (after the §9 BoolCoder tail) and the
   intra-vs-inter `probXmitted` seeding — still gated on the §7.3
   BoolCoder degeneracy (errata #35 internal inconsistency, round 27).
+
+### What round 33 lands
+
+- `mode_decode` module — the spec §10 `VP6_DecodeMode` macroblock
+  coding-mode traversal, the **ninth BoolCoder-consuming layer** and
+  the resolution of the long-standing DOCS-GAP candidate carried
+  forward from round 21 (the page-36 pseudo-code's `B(Stats[0])` /
+  `B(Stats[2])` else-branch indentation ambiguity). The ambiguity is
+  resolved **entirely from the staged spec**: Figure 10 (page 34)
+  together with the `ModeDecisionTree[k][i][n]` node-mass equations
+  (page 35) pin the nine-node binary-tree topology unambiguously, and
+  the BoolCoder polarity (the node probability's numerator is always
+  the `B(node) == 0` left-subtree mass) fixes which bit follows which
+  child. Tracing the literal page-36 pseudo-code under that polarity
+  reproduces the same leaves, confirming the printed indentation was a
+  typesetting artifact rather than a second valid reading. Surfaces:
+  - `decode_mode(bc, prob_mode_same, last_mode, &stats)` — the full
+    traversal. Reads the root `B(probModeSame)` "same as last" bit
+    (repeat `last_mode` on 1, descend on 0), then walks the Figure 10
+    tree reading at most four `B(ModeDecisionTree[node])` bits.
+  - `descend_mode_tree(bc, &stats)` — the nine-node descent in
+    isolation, for callers that have already consumed the root bit.
+  - `decode_mode_from_probs(bc, &prob_xmitted, availability,
+    last_mode)` — convenience that derives `probModeSame` (via
+    round 10's `modes::probability_mode_same`) and the nine
+    `ModeDecisionTree` node probabilities (via
+    `modes::mode_decision_tree_node_probability`) from a live
+    `probXmitted[3][20]` table (the bank round 32's `mode_prob_update`
+    mutates per frame) before walking.
+- Composes only round-15's `BoolCoder::decode_bool` over round 10's
+  static `modes` surface — no new spec material beyond §10 (Figure 10,
+  the node-mass equations, the `VP6_DecodeMode` pseudo-code) and no new
+  errata. With the per-block coefficient driver (round 28), the
+  frame-assembly stage (round 29) and the §11 MV decode (rounds
+  21/24/25), the only remaining gate on the full P-frame decode loop is
+  the §7.3 BoolCoder degeneracy at the §9 frame-header tail (errata #35
+  internal inconsistency, round 27).
+- 12 new unit tests pinning: the root "same as last" repeat; the
+  descent on a root miss; the two extreme leaves (all-0 bits →
+  `InterNoMv`, all-1 bits → `GoldNearMv`); the node-0 partition
+  (zero stream → inter subtree, ones stream → Golden subtree); the
+  two-entry-point agreement (`decode_mode` vs `decode_mode_from_probs`)
+  with byte-exact BoolCoder-state match across all
+  `availability × last_mode` pairs against the baseline `probXmitted`;
+  determinism; the canonical-mode output invariant; the truncation
+  surface; and the same-as-last single-bit short-circuit.
+- Test count: 574 → 586. `cargo fmt --check` and `cargo clippy
+  --all-targets --no-deps -- -D warnings` clean.
+
+### What round 33 does NOT land
+
+- The per-MB driver loop that resolves `ModeAvailability` from the
+  decoded neighbour grid (via round 24's `near_mv`), threads
+  `last_mode` across the raster, and routes the decoded mode into the
+  §11 MV decode / §17 reconstruction. `mode_decode` decodes one MB's
+  mode given the per-`(availability, last_mode)` probability row; the
+  surrounding raster bookkeeping is a caller-side concern.
+- The full P-frame decode entry point. Still gated on the §9
+  frame-header BoolCoder tail (errata #35 internal inconsistency,
+  round 27); once that is supplied, this round's `decode_mode` is the
+  MB-mode element the per-frame driver consumes.
 
 ## License
 
