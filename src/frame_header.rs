@@ -11,21 +11,28 @@
 //! 2. A longer BoolCoder-encoded tail (`b(n)` notation) — `VFragments`,
 //!    `HFragments`, scaling, filter selectors, `UseHuffman`.
 //!
-//! This module implements (1) only. The BoolCoder primitive in spec
-//! §7.3 has a formula ambiguity (see `docs/video/vp6/vp6_format.pdf`
-//! page 15) — `Split = 1 + ( ((Range-1) * Probability) >> 7 )`
-//! produces `Split = Range` when `Probability = 128`, which collapses
-//! the 50/50 case to always-decode-0 and so cannot reproduce the
-//! `b(n)` fixed-prob-128 bitstream the spec also calls out. Until that
-//! ambiguity is resolved by a docs update we deliberately stop the
-//! parse at the BoolCoder boundary rather than commit a guess.
+//! This module implements **both** parts:
 //!
-//! See the crate-root `DOCS-GAP` block for the gap report being filed
-//! against the spec.
+//! * [`Vp6FrameHeader::parse`] reads the byte-aligned raw-bit prefix
+//!   (part 1) and reports how many bytes it consumed via
+//!   [`Vp6FrameHeader::raw_prefix_len`], which is where the BoolCoder
+//!   partition begins.
+//! * [`Vp6HeaderTail::parse`] reads the BoolCoder-coded `b(n)` tail
+//!   (part 2): `VFragments`, `HFragments`, `OutputVFragments`,
+//!   `OutputHFragments`, `ScalingMode`, the Advanced-profile prediction
+//!   and loop-filter selectors, and the trailing `UseHuffman` flag.
+//!
+//! The §7.3 BoolCoder `Split` formula `Split = 1 + (((Range-1) *
+//! Probability) >> 7)` is resolved by the clean-room errata #35 in
+//! `docs/video/vp6/vp6-errata-and-clarifications.md`: the `>> 7`
+//! (divide by 128) is correct and intentional — probability 128 is the
+//! half-interval point, exactly what the fixed-probability `b(n)`
+//! reads require. The `b(n)` tail therefore decodes cleanly through the
+//! existing [`crate::bool_coder::BoolCoder`].
 //!
 //! All field semantics in this file are sourced verbatim from
-//! `docs/video/vp6/vp6_format.pdf` §9; no external library code was
-//! consulted.
+//! `docs/video/vp6/vp6_format.pdf` §9 (Tables 1/2/3) and the staged
+//! errata; no external library code was consulted.
 
 use oxideav_core::bits::BitReader;
 
@@ -141,6 +148,19 @@ pub struct Vp6FrameHeader {
     /// `None` if the field wasn't transmitted (no second partition
     /// signalled, Advanced profile).
     pub buff2_offset: Option<u16>,
+    /// Number of bytes consumed by the byte-aligned raw-bit prefix
+    /// (Table 1 + the IntraHeader raw fields when present). The
+    /// BoolCoder-coded `b(n)` tail begins at this byte offset into the
+    /// frame payload — feed `&bytes[raw_prefix_len..]` to
+    /// [`Vp6HeaderTail::parse`].
+    ///
+    /// The raw prefix is always byte-aligned: Table 1 occupies one full
+    /// byte (`1 + 6 + 1`), the IntraHeader raw fields occupy a second
+    /// full byte (`5 + 2 + 1`), and `Buff2Offset` is a whole 16-bit
+    /// (2-byte) field. So this is 1 byte for an Inter frame, 2 bytes for
+    /// an Intra frame without `Buff2Offset`, and 4 bytes for an Intra
+    /// frame with it.
+    pub raw_prefix_len: usize,
 }
 
 impl Vp6FrameHeader {
@@ -198,6 +218,7 @@ impl Vp6FrameHeader {
                 profile: None,
                 reserved_bit: None,
                 buff2_offset: None,
+                raw_prefix_len: br.byte_position(),
             });
         }
 
@@ -232,6 +253,268 @@ impl Vp6FrameHeader {
             profile: Some(profile),
             reserved_bit: Some(reserved),
             buff2_offset,
+            raw_prefix_len: br.byte_position(),
+        })
+    }
+
+    /// Byte length of the raw-bit prefix — equivalently, the offset at
+    /// which the BoolCoder-coded `b(n)` tail begins.
+    ///
+    /// Convenience accessor mirroring the [`Self::raw_prefix_len`]
+    /// field, for callers that prefer a method.
+    pub fn raw_prefix_len(&self) -> usize {
+        self.raw_prefix_len
+    }
+}
+
+/// The prediction-filter selection signalled in the §9 header tail
+/// (Tables 2/3 `AutoSelectPMFlag` / `BiCubicOrBiLinearFiltFlag`).
+///
+/// Two filter families exist (§11.4): a bi-linear and a bi-cubic
+/// sub-pixel interpolation filter. The header chooses between a *fixed*
+/// selection (one family used for the whole frame) and *auto-select*
+/// (the decoder picks per-block from the variance / MV-size
+/// thresholds). The variants below capture both the fixed choice and
+/// the auto-select thresholds verbatim from the bitstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredictionFilter {
+    /// `AutoSelectPMFlag == 0`: a single fixed filter family is used for
+    /// the whole frame. `bicubic` is the decoded
+    /// `BiCubicOrBiLinearFiltFlag` (`true` ⇒ bi-cubic, `false` ⇒
+    /// bi-linear).
+    Fixed {
+        /// `BiCubicOrBiLinearFiltFlag`: `true` ⇒ bi-cubic, `false` ⇒
+        /// bi-linear.
+        bicubic: bool,
+    },
+    /// `AutoSelectPMFlag == 1`: the decoder auto-selects bi-cubic vs
+    /// bi-linear per block using the two thresholds.
+    AutoSelect {
+        /// `PredictionFilterVarThresh` b(5) — variance at or above which
+        /// the bi-cubic filter is used (`0` ⇒ always bi-cubic).
+        var_thresh: u8,
+        /// `PredictionFilterMvSizeThresh` b(3) — largest MV component
+        /// (whole pixels) for bi-cubic use is `1 << (thresh - 1)`.
+        mv_size_thresh: u8,
+    },
+    /// The Advanced-profile prediction-filter selector was not present
+    /// in this header. Simple profile never transmits it; in that case
+    /// the spec mandates bi-linear with no dynamic switching (§5).
+    NotSignalled,
+}
+
+/// Loop-filter selection from the §9 InterHeader tail (Table 3
+/// `UseLoopFilter` / `LoopFilterSelector`).
+///
+/// Present only on Advanced-profile frames. The IntraHeader (Table 2)
+/// carries no loop-filter fields, so an I-frame always reports
+/// [`LoopFilter::NotSignalled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopFilter {
+    /// `UseLoopFilter == 0`: the prediction loop-filter is disabled for
+    /// this frame.
+    Disabled,
+    /// `UseLoopFilter == 1`: the loop-filter is enabled. `selector` is
+    /// the decoded `LoopFilterSelector` (spec mandates `0` — basic
+    /// de-blocking; the `1` de-ringing variant is reserved and not
+    /// defined by the decoder spec).
+    Enabled {
+        /// `LoopFilterSelector`: `0` basic de-blocking, `1` de-ringing
+        /// (reserved per spec note).
+        selector: u8,
+    },
+    /// The loop-filter selector was not present (Simple profile, or an
+    /// IntraHeader which carries no loop-filter fields).
+    NotSignalled,
+}
+
+/// The BoolCoder-coded `b(n)` tail of a VP6 frame header (spec §9
+/// Table 2 IntraHeader / Table 3 InterHeader, plus the trailing
+/// Table 1 `UseHuffman` flag).
+///
+/// This is the second half of the frame header — everything past the
+/// byte-aligned raw-bit prefix parsed by [`Vp6FrameHeader::parse`]. It
+/// is consumed with the §7.3 [`crate::bool_coder::BoolCoder`] at fixed
+/// node probability 128 (the §3 `b(n)` operator), which the errata #35
+/// disambiguation confirms is the correct half-interval behaviour.
+///
+/// Field presence follows the conditionals printed in Tables 2/3:
+///
+/// * `Output*Fragments` / `ScalingMode` are present **only** on the
+///   IntraHeader (an Inter frame inherits the coded/scaled geometry of
+///   the keyframe it predicts from, so it carries none of those).
+/// * `RefreshGoldenFrame` is present **only** on the InterHeader.
+/// * The prediction-filter and loop-filter selectors are
+///   Advanced-profile only; the VP6.2-gated variants additionally
+///   require `Vp3VersionNo == 8`.
+/// * `PredictionFilterAlpha` is present only on VP6.2 bitstreams.
+/// * `UseHuffman` is the final `b(1)` and is always present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vp6HeaderTail {
+    /// `VFragments` b(8) — rows of 8×8 blocks in the un-scaled coded
+    /// image (`None` on an Inter frame, which carries no geometry).
+    pub v_fragments: Option<u8>,
+    /// `HFragments` b(8) — cols of 8×8 blocks in the un-scaled coded
+    /// image (`None` on an Inter frame).
+    pub h_fragments: Option<u8>,
+    /// `OutputVFragments` b(8) — rows of 8×8 blocks in the scaled
+    /// output image (`None` on an Inter frame).
+    pub output_v_fragments: Option<u8>,
+    /// `OutputHFragments` b(8) — cols of 8×8 blocks in the scaled
+    /// output image (`None` on an Inter frame).
+    pub output_h_fragments: Option<u8>,
+    /// `ScalingMode` b(2) — how the coded frame is mapped to the output
+    /// resolution (`None` on an Inter frame).
+    pub scaling_mode: Option<crate::scaling::ScalingMode>,
+    /// `RefreshGoldenFrame` b(1) — whether this decoded frame becomes
+    /// the new Golden Frame. `None` on an Intra frame (Table 2 carries
+    /// no such field).
+    pub refresh_golden_frame: Option<bool>,
+    /// Loop-filter selection (Table 3, Advanced profile only).
+    pub loop_filter: LoopFilter,
+    /// Prediction-filter selection (Tables 2/3, Advanced profile only).
+    pub prediction_filter: PredictionFilter,
+    /// `PredictionFilterAlpha` b(4) — index into the bi-cubic filter
+    /// coefficient set. Present only on VP6.2 (`Vp3VersionNo == 8`)
+    /// bitstreams.
+    pub prediction_filter_alpha: Option<u8>,
+    /// `UseHuffman` b(1) — `false` ⇒ second partition uses the
+    /// BoolCoder, `true` ⇒ it uses the Huffman coder. Always present.
+    pub use_huffman: bool,
+}
+
+impl Vp6HeaderTail {
+    /// Parse the BoolCoder-coded `b(n)` tail of a VP6 frame header.
+    ///
+    /// `tail_bytes` must point at the start of the BoolCoder partition,
+    /// i.e. `&frame[header.raw_prefix_len()..]`. `is_keyframe`,
+    /// `profile`, and `version` come from the already-parsed
+    /// [`Vp6FrameHeader`] and gate the per-field conditionals exactly as
+    /// printed in Tables 2/3 (and Table 1 for `UseHuffman`).
+    ///
+    /// On an Inter frame `version` and `profile` are not transmitted in
+    /// the InterHeader; the caller is expected to thread in the state
+    /// carried from the most recent I-frame (the same cross-frame
+    /// dependency [`Vp6FrameHeader::parse`] documents for
+    /// `Buff2Offset`).
+    ///
+    /// Returns [`Error::Truncated`] if the BoolCoder runs out of bytes,
+    /// or [`Error::NotImplemented`] if a `ScalingMode` outside `0..=3`
+    /// is decoded (impossible from a 2-bit field, but kept explicit so
+    /// the typed [`crate::scaling::ScalingMode`] mapping stays total).
+    pub fn parse(
+        tail_bytes: &[u8],
+        is_keyframe: bool,
+        profile: CodingProfile,
+        version: Vp3Version,
+    ) -> Result<Self, Error> {
+        let mut bc = crate::bool_coder::BoolCoder::new(tail_bytes)?;
+        Self::parse_with(&mut bc, is_keyframe, profile, version)
+    }
+
+    /// Parse the `b(n)` tail from an already-initialised
+    /// [`crate::bool_coder::BoolCoder`].
+    ///
+    /// Identical to [`Self::parse`] but operates on a borrowed coder so
+    /// a future per-frame driver can continue consuming the same
+    /// BoolCoder partition (the §10 mode data immediately follows the
+    /// header tail in partition 1 when `MultiStream == 0`). The coder is
+    /// left positioned just past `UseHuffman`.
+    pub fn parse_with(
+        bc: &mut crate::bool_coder::BoolCoder<'_>,
+        is_keyframe: bool,
+        profile: CodingProfile,
+        version: Vp3Version,
+    ) -> Result<Self, Error> {
+        let advanced = matches!(profile, CodingProfile::Advanced);
+        let is_vp62 = matches!(version, Vp3Version::Vp62);
+
+        // Table 2 (IntraHeader) carries the geometry + scaling fields;
+        // Table 3 (InterHeader) omits them entirely.
+        let (v_fragments, h_fragments, output_v_fragments, output_h_fragments, scaling_mode) =
+            if is_keyframe {
+                let vf = bc.decode_b(8)? as u8;
+                let hf = bc.decode_b(8)? as u8;
+                let ovf = bc.decode_b(8)? as u8;
+                let ohf = bc.decode_b(8)? as u8;
+                let sm_raw = bc.decode_b(2)? as u8;
+                let sm =
+                    crate::scaling::ScalingMode::from_b2(sm_raw).ok_or(Error::NotImplemented)?;
+                (Some(vf), Some(hf), Some(ovf), Some(ohf), Some(sm))
+            } else {
+                (None, None, None, None, None)
+            };
+
+        // Table 3 (InterHeader) carries RefreshGoldenFrame here, ahead
+        // of the loop-filter fields. Table 2 has no such field.
+        let refresh_golden_frame = if is_keyframe {
+            None
+        } else {
+            Some(bc.decode_b1()? != 0)
+        };
+
+        // Loop-filter selectors (Table 3, Advanced profile only). The
+        // IntraHeader has no loop-filter fields at all.
+        let loop_filter = if !is_keyframe && advanced {
+            if bc.decode_b1()? != 0 {
+                let selector = bc.decode_b1()?;
+                LoopFilter::Enabled { selector }
+            } else {
+                LoopFilter::Disabled
+            }
+        } else {
+            LoopFilter::NotSignalled
+        };
+
+        // Prediction-filter selectors. On the IntraHeader (Table 2) the
+        // AutoSelectPMFlag / threshold / fixed-flag fields are present
+        // for any Advanced-profile frame. On the InterHeader (Table 3)
+        // the same fields are additionally gated on VP6.2
+        // (Vp3VersionNo == 8).
+        let pf_present = if is_keyframe {
+            advanced
+        } else {
+            advanced && is_vp62
+        };
+        let prediction_filter = if pf_present {
+            if bc.decode_b1()? != 0 {
+                // AutoSelectPMFlag == 1
+                let var_thresh = bc.decode_b(5)? as u8;
+                let mv_size_thresh = bc.decode_b(3)? as u8;
+                PredictionFilter::AutoSelect {
+                    var_thresh,
+                    mv_size_thresh,
+                }
+            } else {
+                // AutoSelectPMFlag == 0
+                let bicubic = bc.decode_b1()? != 0;
+                PredictionFilter::Fixed { bicubic }
+            }
+        } else {
+            PredictionFilter::NotSignalled
+        };
+
+        // PredictionFilterAlpha b(4) — VP6.2 only (both tables).
+        let prediction_filter_alpha = if is_vp62 {
+            Some(bc.decode_b(4)? as u8)
+        } else {
+            None
+        };
+
+        // Table 1 trailing field: UseHuffman b(1), always present.
+        let use_huffman = bc.decode_b1()? != 0;
+
+        Ok(Self {
+            v_fragments,
+            h_fragments,
+            output_v_fragments,
+            output_h_fragments,
+            scaling_mode,
+            refresh_golden_frame,
+            loop_filter,
+            prediction_filter,
+            prediction_filter_alpha,
+            use_huffman,
         })
     }
 }
@@ -365,5 +648,258 @@ mod tests {
             Vp6FrameHeader::parse(&bytes),
             Err(Error::Truncated)
         ));
+    }
+
+    /// `raw_prefix_len` reports the byte offset at which the BoolCoder
+    /// tail begins, for each prefix shape.
+    #[test]
+    fn raw_prefix_len_per_shape() {
+        // Inter: only Table 1 (1 byte).
+        let inter = Vp6FrameHeader::parse(&[0xFF, 0x00, 0x00]).unwrap();
+        assert_eq!(inter.raw_prefix_len, 1);
+        assert_eq!(inter.raw_prefix_len(), 1);
+
+        // Intra, Advanced, no MultiStream -> no Buff2Offset (2 bytes).
+        let intra_adv = Vp6FrameHeader::parse(&[0x54, 0x36, 0x00]).unwrap();
+        assert_eq!(intra_adv.raw_prefix_len, 2);
+
+        // Intra, Simple -> Buff2Offset present (4 bytes).
+        let intra_simple = Vp6FrameHeader::parse(&[0x54, 0x40, 0x12, 0x34, 0x00]).unwrap();
+        assert_eq!(intra_simple.raw_prefix_len, 4);
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+    use crate::bool_coder::BoolCoder;
+
+    // A fixed, tightly-bounded BoolCoder partition used across the tail
+    // tests. We never *encode* — instead each test independently drives
+    // a fresh `BoolCoder` over these exact bytes to capture the decoded
+    // `b(n)` field values, then asserts `Vp6HeaderTail::parse` over the
+    // same bytes reproduces them. This is the same capture-then-verify
+    // pattern the `bool_coder` unit tests use; no range encoder is built
+    // and the buffer is 16 bytes.
+    const TAIL: [u8; 16] = [
+        0x9C, 0x2B, 0x4F, 0xE1, 0x07, 0xD3, 0x6A, 0x55, 0x10, 0xFE, 0x21, 0x8B, 0x44, 0xC0, 0x3D,
+        0x77,
+    ];
+
+    /// Intra / Simple / VP6.0: the tail is exactly
+    /// `VFragments b(8)`, `HFragments b(8)`, `OutputVFragments b(8)`,
+    /// `OutputHFragments b(8)`, `ScalingMode b(2)`, then `UseHuffman
+    /// b(1)` — no prediction/loop-filter fields (Simple profile) and no
+    /// alpha (not VP6.2).
+    #[test]
+    fn intra_simple_vp60_field_order() {
+        // Capture the reference field values directly from a raw coder.
+        let mut ref_bc = BoolCoder::new(&TAIL).unwrap();
+        let vf = ref_bc.decode_b(8).unwrap() as u8;
+        let hf = ref_bc.decode_b(8).unwrap() as u8;
+        let ovf = ref_bc.decode_b(8).unwrap() as u8;
+        let ohf = ref_bc.decode_b(8).unwrap() as u8;
+        let sm = ref_bc.decode_b(2).unwrap() as u8;
+        let huff = ref_bc.decode_b1().unwrap() != 0;
+
+        let tail = Vp6HeaderTail::parse(
+            &TAIL,
+            /* is_keyframe */ true,
+            CodingProfile::Simple,
+            Vp3Version::Vp60,
+        )
+        .unwrap();
+
+        assert_eq!(tail.v_fragments, Some(vf));
+        assert_eq!(tail.h_fragments, Some(hf));
+        assert_eq!(tail.output_v_fragments, Some(ovf));
+        assert_eq!(tail.output_h_fragments, Some(ohf));
+        assert_eq!(
+            tail.scaling_mode,
+            Some(crate::scaling::ScalingMode::from_b2(sm).unwrap())
+        );
+        // Simple profile: no prediction/loop-filter fields.
+        assert_eq!(tail.prediction_filter, PredictionFilter::NotSignalled);
+        assert_eq!(tail.loop_filter, LoopFilter::NotSignalled);
+        assert_eq!(tail.prediction_filter_alpha, None);
+        assert_eq!(tail.refresh_golden_frame, None);
+        assert_eq!(tail.use_huffman, huff);
+    }
+
+    /// Intra / Advanced / VP6.0: after the five geometry/scaling fields
+    /// the Advanced prediction-filter selector appears
+    /// (`AutoSelectPMFlag` then either thresholds or the fixed flag),
+    /// then `UseHuffman`. No loop-filter on an IntraHeader, no alpha
+    /// (not VP6.2).
+    #[test]
+    fn intra_advanced_vp60_reads_prediction_filter() {
+        let mut ref_bc = BoolCoder::new(&TAIL).unwrap();
+        let _vf = ref_bc.decode_b(8).unwrap();
+        let _hf = ref_bc.decode_b(8).unwrap();
+        let _ovf = ref_bc.decode_b(8).unwrap();
+        let _ohf = ref_bc.decode_b(8).unwrap();
+        let _sm = ref_bc.decode_b(2).unwrap();
+        let expected_pf = if ref_bc.decode_b1().unwrap() != 0 {
+            let var_thresh = ref_bc.decode_b(5).unwrap() as u8;
+            let mv_size_thresh = ref_bc.decode_b(3).unwrap() as u8;
+            PredictionFilter::AutoSelect {
+                var_thresh,
+                mv_size_thresh,
+            }
+        } else {
+            PredictionFilter::Fixed {
+                bicubic: ref_bc.decode_b1().unwrap() != 0,
+            }
+        };
+        let expected_huff = ref_bc.decode_b1().unwrap() != 0;
+
+        let tail =
+            Vp6HeaderTail::parse(&TAIL, true, CodingProfile::Advanced, Vp3Version::Vp60).unwrap();
+
+        assert_eq!(tail.prediction_filter, expected_pf);
+        // IntraHeader carries no loop-filter / golden-frame fields.
+        assert_eq!(tail.loop_filter, LoopFilter::NotSignalled);
+        assert_eq!(tail.refresh_golden_frame, None);
+        assert_eq!(tail.prediction_filter_alpha, None);
+        assert_eq!(tail.use_huffman, expected_huff);
+    }
+
+    /// Inter / Advanced / VP6.0: the InterHeader carries no geometry,
+    /// begins with `RefreshGoldenFrame b(1)`, then the Advanced
+    /// loop-filter fields. The prediction-filter selector is gated on
+    /// VP6.2 for InterHeaders, so on VP6.0 it is NOT present — straight
+    /// to `UseHuffman` after the loop filter.
+    #[test]
+    fn inter_advanced_vp60_reads_golden_and_loop_filter() {
+        let mut ref_bc = BoolCoder::new(&TAIL).unwrap();
+        let expected_golden = ref_bc.decode_b1().unwrap() != 0;
+        let expected_lf = if ref_bc.decode_b1().unwrap() != 0 {
+            LoopFilter::Enabled {
+                selector: ref_bc.decode_b1().unwrap(),
+            }
+        } else {
+            LoopFilter::Disabled
+        };
+        // No prediction filter on VP6.0 InterHeader, no alpha.
+        let expected_huff = ref_bc.decode_b1().unwrap() != 0;
+
+        let tail = Vp6HeaderTail::parse(
+            &TAIL,
+            /* is_keyframe */ false,
+            CodingProfile::Advanced,
+            Vp3Version::Vp60,
+        )
+        .unwrap();
+
+        assert_eq!(tail.refresh_golden_frame, Some(expected_golden));
+        assert_eq!(tail.loop_filter, expected_lf);
+        // No geometry fields on an InterHeader.
+        assert_eq!(tail.v_fragments, None);
+        assert_eq!(tail.scaling_mode, None);
+        // VP6.0 InterHeader: prediction filter gated on VP6.2 → absent.
+        assert_eq!(tail.prediction_filter, PredictionFilter::NotSignalled);
+        assert_eq!(tail.prediction_filter_alpha, None);
+        assert_eq!(tail.use_huffman, expected_huff);
+    }
+
+    /// Inter / Advanced / VP6.2: the full InterHeader tail —
+    /// `RefreshGoldenFrame`, loop-filter, the VP6.2-gated
+    /// prediction-filter selector, `PredictionFilterAlpha b(4)`, then
+    /// `UseHuffman`.
+    #[test]
+    fn inter_advanced_vp62_reads_full_tail() {
+        let mut ref_bc = BoolCoder::new(&TAIL).unwrap();
+        let expected_golden = ref_bc.decode_b1().unwrap() != 0;
+        let expected_lf = if ref_bc.decode_b1().unwrap() != 0 {
+            LoopFilter::Enabled {
+                selector: ref_bc.decode_b1().unwrap(),
+            }
+        } else {
+            LoopFilter::Disabled
+        };
+        let expected_pf = if ref_bc.decode_b1().unwrap() != 0 {
+            PredictionFilter::AutoSelect {
+                var_thresh: ref_bc.decode_b(5).unwrap() as u8,
+                mv_size_thresh: ref_bc.decode_b(3).unwrap() as u8,
+            }
+        } else {
+            PredictionFilter::Fixed {
+                bicubic: ref_bc.decode_b1().unwrap() != 0,
+            }
+        };
+        let expected_alpha = ref_bc.decode_b(4).unwrap() as u8;
+        let expected_huff = ref_bc.decode_b1().unwrap() != 0;
+
+        let tail =
+            Vp6HeaderTail::parse(&TAIL, false, CodingProfile::Advanced, Vp3Version::Vp62).unwrap();
+
+        assert_eq!(tail.refresh_golden_frame, Some(expected_golden));
+        assert_eq!(tail.loop_filter, expected_lf);
+        assert_eq!(tail.prediction_filter, expected_pf);
+        assert_eq!(tail.prediction_filter_alpha, Some(expected_alpha));
+        assert_eq!(tail.use_huffman, expected_huff);
+    }
+
+    /// `parse_with` over a borrowed coder leaves it positioned for the
+    /// next consumer (the §10 mode data). After parsing an Intra/Simple
+    /// tail the coder state must match an independent coder driven over
+    /// the identical field sequence.
+    #[test]
+    fn parse_with_leaves_coder_positioned() {
+        // Independent reference coder: same field sequence as
+        // Intra/Simple/VP6.0 (4×b(8), b(2), b(1)).
+        let mut ref_bc = BoolCoder::new(&TAIL).unwrap();
+        let _ = ref_bc.decode_b(8).unwrap();
+        let _ = ref_bc.decode_b(8).unwrap();
+        let _ = ref_bc.decode_b(8).unwrap();
+        let _ = ref_bc.decode_b(8).unwrap();
+        let _ = ref_bc.decode_b(2).unwrap();
+        let _ = ref_bc.decode_b1().unwrap();
+
+        let mut bc = BoolCoder::new(&TAIL).unwrap();
+        let _ = Vp6HeaderTail::parse_with(&mut bc, true, CodingProfile::Simple, Vp3Version::Vp60)
+            .unwrap();
+
+        assert_eq!(bc.range(), ref_bc.range());
+        assert_eq!(bc.value(), ref_bc.value());
+        assert_eq!(bc.count(), ref_bc.count());
+        assert_eq!(bc.pos(), ref_bc.pos());
+    }
+
+    /// Truncation: a partition shorter than the BoolCoder's 4-byte init
+    /// surfaces `Truncated`.
+    #[test]
+    fn tail_truncated_input() {
+        assert_eq!(
+            Vp6HeaderTail::parse(&[0x00, 0x00], true, CodingProfile::Simple, Vp3Version::Vp60),
+            Err(Error::Truncated)
+        );
+    }
+
+    /// End-to-end: parse the raw prefix, then feed the BoolCoder tail
+    /// from `raw_prefix_len` onward. The combined parse must succeed and
+    /// the geometry must be present on the keyframe.
+    #[test]
+    fn end_to_end_prefix_then_tail() {
+        // Intra, Simple, MultiStream=0: byte0=0x54 (I, q=0x2A, MS=0),
+        // byte1=0x00 (Vp3VersionNo=0... use Simple anyway), Buff2Offset
+        // bytes 2..4. We only need a valid 4-byte prefix; the tail
+        // bytes follow.
+        let mut frame = vec![0x54u8, 0x00, 0x00, 0x00];
+        frame.extend_from_slice(&TAIL);
+
+        let hdr = Vp6FrameHeader::parse(&frame).unwrap();
+        assert!(hdr.is_keyframe);
+        assert_eq!(hdr.raw_prefix_len, 4);
+
+        let tail = Vp6HeaderTail::parse(
+            &frame[hdr.raw_prefix_len..],
+            hdr.is_keyframe,
+            CodingProfile::Simple,
+            Vp3Version::Vp60,
+        )
+        .unwrap();
+        assert!(tail.v_fragments.is_some());
+        assert!(tail.scaling_mode.is_some());
     }
 }

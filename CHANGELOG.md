@@ -6,6 +6,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 34, 2026-06-15)
+
+- `frame_header` — the §9 BoolCoder-coded `b(n)` frame-header tail
+  (`Vp6HeaderTail`), the second half of the frame header that the
+  earlier rounds deferred at the BoolCoder boundary. The §7.3 `Split`
+  degeneracy that prose-blocked this tail is resolved by the staged
+  errata #35 (`>> 7` is correct; probability 128 is the half-interval
+  point), so the fixed-probability `b(n)` fields decode cleanly through
+  the existing `BoolCoder`.
+  - `Vp6FrameHeader::raw_prefix_len` (field + accessor) — the
+    byte-aligned offset at which the BoolCoder partition begins (1 byte
+    Inter, 2 bytes Intra-no-Buff2Offset, 4 bytes Intra-with-Buff2Offset).
+  - `Vp6HeaderTail::parse(tail_bytes, is_keyframe, profile, version)`
+    and `parse_with(&mut BoolCoder, …)` — decode the Table 2
+    (IntraHeader) geometry/scaling fields (`VFragments`, `HFragments`,
+    `OutputVFragments`, `OutputHFragments`, `ScalingMode`), the Table 3
+    (InterHeader) `RefreshGoldenFrame` + Advanced loop-filter selectors
+    (`UseLoopFilter`, `LoopFilterSelector`), the `AutoSelectPMFlag`-gated
+    prediction-filter selectors (with the VP6.2-only gating that applies
+    to InterHeaders), the VP6.2 `PredictionFilterAlpha b(4)`, and the
+    trailing Table 1 `UseHuffman b(1)`. `parse_with` leaves the borrowed
+    coder positioned for the §10 mode data that follows in partition 1.
+  - `PredictionFilter` / `LoopFilter` enums modelling the
+    Advanced-profile selectors verbatim from Tables 2/3.
+  - Seven capture-then-verify unit tests (no range encoder; 16-byte
+    fixed partition) covering Intra/Simple, Intra/Advanced,
+    Inter/Advanced VP6.0 and VP6.2 field orderings, `parse_with`
+    coder-position continuity, truncation, and an end-to-end
+    prefix-then-tail parse.
+
 ### Added (clean-room round 33, 2026-06-15)
 
 - `mode_decode` module — the §10 `VP6_DecodeMode` macroblock

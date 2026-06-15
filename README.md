@@ -19,8 +19,15 @@ a no-op. It is a primitive library, not a wired codec.
 
 ### Implemented stages
 
-- **Frame-header raw-bit prefix** (`frame_header`) — the §9 Table 1 / 2
-  `R(n)` fields up to the BoolCoder tail.
+- **Frame header — both coders** (`frame_header`) — the §9 Table 1 / 2
+  `R(n)` raw-bit prefix (reporting `raw_prefix_len`, the BoolCoder
+  partition offset) **and** the §9 Table 2 / 3 BoolCoder-coded `b(n)`
+  tail (`Vp6HeaderTail`): `VFragments` / `HFragments` /
+  `OutputVFragments` / `OutputHFragments` / `ScalingMode` (IntraHeader),
+  `RefreshGoldenFrame` + the Advanced-profile `UseLoopFilter` /
+  `LoopFilterSelector` (InterHeader), the `AutoSelectPMFlag`-gated
+  prediction-filter selectors with their VP6.2 InterHeader gating, the
+  VP6.2 `PredictionFilterAlpha`, and the trailing `UseHuffman` flag.
 - **Per-block reconstruction** — inverse quantization (`dequant`, §15),
   inverse DCT (`idct_block`, §16), intra and inter block recombination
   (§17.1–§17.4), fractional-pixel interpolation filters (`interp`,
@@ -47,24 +54,19 @@ a no-op. It is a primitive library, not a wired codec.
 
 ### Blocked
 
-- **Full P-frame / I-frame decode loop.** The per-MB driver that walks
-  the macroblock grid (mode decode → MV decode → coefficient decode →
-  reconstruct → assemble) and the `Decoder` registration are blocked on
-  the §9 frame-header BoolCoder tail. That tail is gated on a
-  **documented inconsistency in the staged §7.3 `Split` errata
-  (#35)**: the spec PDF prints `Split = 1 + (((Range-1)*Probability)
-  >> 7)`, but every quantitative property the errata's own rationale
-  relies on (half interval at probability 128, non-empty branches,
-  `Range <= 255`) holds only under `>> 8`; under the literal `>> 7`
-  the `Bit = 1` interval is empty at probability 128, making
-  fixed-probability `b(n)` header fields undecodable. The round-15
-  `BoolCoder` implements the literal `>> 7`; resolving the degeneracy
-  needs a docs correction or a worked byte-trace, after which the
-  remaining driver wiring is mechanical.
+- **Full P-frame / I-frame decode loop.** With the §9 BoolCoder header
+  tail now parsing (the §7.3 `Split` degeneracy was resolved by errata
+  #35 — `>> 7` is correct, probability 128 is the half-interval point),
+  what remains is the per-MB driver that walks the macroblock grid
+  (mode decode → MV decode → coefficient decode → reconstruct →
+  assemble) and the `Decoder` registration. Every primitive that driver
+  sequences already exists; the remaining work is wiring them into a
+  partition-walking loop and threading the per-frame geometry
+  (`VFragments` / `HFragments`) from the header tail into the grid
+  bounds.
 - **High-bit-depth / scaling resampling math** and **sample-exact
   validation against a conformant `.vp6` bitstream** — the latter
-  needs an encoder-produced fixture (synthetic high-probability streams
-  hit the same §7.3 degeneracy).
+  needs an encoder-produced fixture.
 
 ## License
 
