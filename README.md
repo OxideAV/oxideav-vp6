@@ -38,8 +38,11 @@ a no-op. It is a primitive library, not a wired codec.
   DCT-token tables (`tokens`, §13), the Huffman tree builder
   (`huffman`, §7.2), the AC zero-run-length tables (`zrl`, §13.3.3),
   and the raw-bit reader (`raw_bits`, §3).
-- **BoolCoder-consuming layers** — the §7.3 binary arithmetic decoder
-  (`bool_coder`), the §13.2.1 DC and §13.3.1 AC arithmetic decoders
+- **BoolCoder primitive — decoder + encoder** — the §7.3 binary
+  arithmetic decoder (`bool_coder::BoolCoder`) and its exact inverse,
+  `bool_coder::BoolEncoder` (derived solely from the §7.3 decode
+  equations; encode→decode round-trips bit-for-bit), the §13.2.1 DC and
+  §13.3.1 AC arithmetic decoders
   (`dct_decode`), the §13.3.3.1 zero-run traversal, the per-frame
   probability-update bitstreams (`prob_update` / `mv_prob_update` /
   `mode_prob_update` / `scan_update`), the §11.1 motion-vector

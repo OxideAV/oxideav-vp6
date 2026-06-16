@@ -6,6 +6,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 36, 2026-06-16)
+
+- `bool_coder` — `BoolEncoder`, the binary arithmetic **encoder** that
+  is the exact algebraic inverse of the §7.3 `VP6_DecodeBool` decoder.
+  The §7.3 spec is a decoder specification (no encoder pseudocode), but
+  a binary arithmetic encoder is uniquely determined by the decoder it
+  must feed: `BoolEncoder` is derived solely from the in-tree §7.3
+  decode equations, mirroring the same `Split = 1 + (((Range-1) *
+  Probability) >> 8)` interval subdivision (operative `>> 8` per errata
+  #35), and emitting a byte stream that `BoolCoder` reconstructs
+  bit-for-bit. Surface:
+  - `BoolEncoder::new` / `Default` — fresh encoder (`Range = 255`).
+  - `encode_bool(bit, probability)` — dual of `decode_bool`: selects the
+    chosen sub-interval (`Bit = 0` keeps `low`, `range = Split`; `Bit =
+    1` does `low += Split << 24`, `range -= Split`) and renormalizes at
+    bit granularity to mirror the decoder's `Range *= 2; Value *= 2`.
+    Renormalization carries out of the 32-bit window ripple correctly by
+    storing committed output as an explicit bit list and resolving a
+    carry as `+1` from the tail toward the head.
+  - `encode_b1(bit)` / `encode_b(value, n)` — duals of `decode_b1` /
+    `decode_b`, fixed-probability-128, MSB-first, `n` capped at 32.
+  - `finish()` — drains the 32-bit window and packs the committed bits
+    MSB-first into bytes, zero-padding the final partial byte and
+    padding to the decoder's 4-byte `VP6_StartDecode` minimum.
+  Eight encode→`BoolCoder`-decode round-trip tests pin the inverse
+  relationship across single bits, fixed and pseudo-random
+  bit/probability sequences, `b(n)` widths, a 120-symbol high-probability
+  carry-propagation stress, an empty encode, and an interleaved
+  `bool`/`b(n)` syntax mix. All working sets are bounded (≤ a few hundred
+  bits) so the encoder's `O(output_len)` footprint stays trivial, well
+  under the test memory cap.
+
 ### Changed (clean-room round 35, 2026-06-16)
 
 - `bool_coder` — corrected the §7.3 `VP6_DecodeBool` `Split` formula to

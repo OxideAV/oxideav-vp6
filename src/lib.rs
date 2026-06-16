@@ -872,7 +872,7 @@ pub use block_decode::{
     decode_block_coefficients, decode_block_coefficients_ctx, decode_block_to_raster,
     dequantize_to_raster, AcProbBank, BlockCoeffs, DequantizedBlock, ZeroRunProbBank, BLOCK_SIZE,
 };
-pub use bool_coder::BoolCoder;
+pub use bool_coder::{BoolCoder, BoolEncoder};
 pub use dc_pred::{
     average_both_neighbours, sign as dc_sign, DcPredictionContext, Neighbour, ReferenceBucket,
 };

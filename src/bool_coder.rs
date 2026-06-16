@@ -288,6 +288,251 @@ impl<'a> BoolCoder<'a> {
     }
 }
 
+/// VP6 binary arithmetic **encoder** — the exact inverse of the §7.3
+/// [`BoolCoder`] decoder.
+///
+/// ## Provenance
+///
+/// The §7.3 VP6 specification (`docs/video/vp6/vp6_format.pdf`,
+/// pages 14–15) is a *decoder* specification: it prints
+/// `VP6_StartDecode` / `VP6_DecodeBool` and the renormalization loop,
+/// but no encoder pseudocode. A binary arithmetic encoder is, however,
+/// **uniquely determined** by the decoder it must feed: the encoder's
+/// only job is to emit a byte stream that `VP6_StartDecode` /
+/// `VP6_DecodeBool` reconstruct bit-for-bit. This module is therefore
+/// derived **solely** from the §7.3 decode equations in the in-tree
+/// spec — it is the algebraic dual of [`BoolCoder::decode_bool`], not a
+/// transcription of any third-party encoder. No third-party VP6 source
+/// has been consulted at any stage. The round-trip tests below pin the
+/// inverse relationship to the in-crate decoder.
+///
+/// ## How the inverse is constructed
+///
+/// The decoder models the still-undecoded bitstream as a 32-bit,
+/// left-aligned arithmetic `Value` and narrows `Range` per bit:
+///
+/// * `Split = 1 + ( ((Range-1) * Probability) >> 8 )`  (operative shift
+///   per errata #35; the §7.3 PDF's printed `>> 7` is a typo).
+/// * `Bit = 0` selects the low sub-interval `[0, Split << 24)`:
+///   `Range = Split`.
+/// * `Bit = 1` selects the high sub-interval `[Split << 24, Range << 24)`:
+///   `Range -= Split`, and the decoder subtracts `Split << 24` from
+///   `Value` (rebasing the high sub-interval to zero).
+///
+/// The encoder mirrors this with two state words:
+///
+/// * `range` — identical to the decoder's `Range` (starts at 255,
+///   renormalized to stay `>= 128`).
+/// * `low` — the bottom of the current coding interval, tracked in the
+///   **same `<< 24`-aligned domain** as the decoder's `Value`, but in a
+///   wider [`u64`] accumulator so a renormalization carry can ripple up
+///   past bit 31 into already-buffered output bytes.
+///
+/// Encoding one bit at probability `p`:
+///
+/// * compute the identical `Split`;
+/// * `Bit = 0`: keep `low`, set `range = Split` (the decoder's
+///   `Range = Split`);
+/// * `Bit = 1`: `low += Split << 24`, set `range -= Split` (mirroring the
+///   decoder's `Value -= Split << 24` / `Range -= Split`).
+///
+/// Renormalization is performed **at bit granularity**, exactly
+/// mirroring the decoder's `Range *= 2; Value *= 2` loop: while
+/// `range < 128`, double `range` and shift `low` left by one bit,
+/// shifting the bit that leaves the 32-bit window out to the byte
+/// buffer (with carry propagation). Because the encoder renorm shifts
+/// the same number of times the decoder renorm does (both gated on
+/// `range < 128` with identical `range` evolution), the emitted bits
+/// line up one-for-one with the decoder's `Value *= 2` byte pulls.
+///
+/// ## Memory bound
+///
+/// The encoder buffers its output in a `Vec<u8>` whose length is
+/// proportional to the number of bits encoded (one output bit per input
+/// bit, plus renormalization, plus a 4-byte flush). It holds no
+/// per-symbol scratch and never materializes an interval table, so its
+/// working set is `O(output_len)` with a tiny constant. Callers driving
+/// long round-trip tests should keep the bit count bounded; the tests
+/// here stay well under a few kilobytes.
+#[derive(Debug, Clone)]
+pub struct BoolEncoder {
+    /// Already-committed output **bits**, most-significant first, in the
+    /// order the decoder consumes them (the first pushed bit is bit 7 of
+    /// `bytes[0]`, the top of the decoder's initial 32-bit `Value`).
+    ///
+    /// Keeping renormalized bits as an explicit `0`/`1` list — rather
+    /// than packing them eagerly — makes carry propagation trivially
+    /// correct: a carry out of the 32-bit window is just `+1` added to
+    /// the integer these bits represent, rippled from the tail toward
+    /// the head. The list is packed into bytes only at [`Self::finish`].
+    /// For the bounded inputs this encoder is used with, the list stays
+    /// small (one entry per encoded bit plus renorm).
+    bits: Vec<u8>,
+    /// Bottom of the current coding interval, kept in the **same 32-bit
+    /// domain as the decoder's `Value`** (the active comparison byte sits
+    /// at bits 31..24). A renormalization doubling (`low <<= 1`) shifts
+    /// the top bit, bit 31, out into `bits`. Stored in a [`u64`] purely
+    /// so the `low += split << 24` addition can be inspected for a
+    /// carry out of bit 31.
+    low: u64,
+    /// Current `Range`, identical in meaning and evolution to the
+    /// decoder's `Range`. Starts at 255.
+    range: u32,
+}
+
+impl Default for BoolEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BoolEncoder {
+    /// Create a fresh encoder. Mirrors `VP6_StartDecode`'s post-init
+    /// invariant `Range = 255`. The first encoded bit's renormalization
+    /// output forms the most-significant bit of the stream, which the
+    /// decoder loads as the top of its initial 32-bit `Value` window.
+    pub fn new() -> Self {
+        Self {
+            bits: Vec::new(),
+            // `low` lives in the same 32-bit domain as the decoder's
+            // `Value`; bit 32 is transient carry space, resolved
+            // immediately after each interval update.
+            low: 0,
+            range: 255,
+        }
+    }
+
+    /// Renormalization shift, mirroring the decoder's `Value *= 2`:
+    /// double the window, committing the bit that leaves bit 31 to the
+    /// output bit list.
+    fn shift_out_top_bit(&mut self) {
+        // Any carry out of bit 31 must already have been resolved by
+        // [`Self::resolve_carry`] before we get here, so `low` occupies
+        // bits 0..=31 only.
+        debug_assert!(self.low < (1u64 << 32));
+        let top = ((self.low >> 31) & 1) as u8;
+        self.low = (self.low << 1) & ((1u64 << 32) - 1);
+        self.bits.push(top);
+    }
+
+    /// Resolve a carry out of bit 31 of `low`: it represents `+1` added
+    /// to the integer already committed to `bits`, rippled from the most
+    /// recently emitted bit toward the oldest. Because every committed
+    /// bit is stored explicitly, the ripple is exact regardless of byte
+    /// alignment.
+    fn resolve_carry(&mut self) {
+        if self.low & (1u64 << 32) == 0 {
+            return;
+        }
+        self.low &= (1u64 << 32) - 1;
+        let mut i = self.bits.len();
+        while i > 0 {
+            i -= 1;
+            if self.bits[i] == 0 {
+                self.bits[i] = 1;
+                return;
+            }
+            self.bits[i] = 0;
+        }
+        // A carry rippling off the front would mean the cumulative coded
+        // value exceeded the number of emitted bits — impossible for an
+        // encode that started from `low = 0`. The guard makes any logic
+        // error surface loudly instead of silently corrupting output.
+        debug_assert!(false, "BoolEncoder carry rippled off the bit buffer");
+    }
+
+    /// Encode one bit `bit` (0 or 1) at node probability `probability`.
+    ///
+    /// The dual of [`BoolCoder::decode_bool`]: the same `Split` is
+    /// computed, the chosen sub-interval is selected, and `range` is
+    /// renormalized back to `>= 128`, emitting one output bit per
+    /// doubling — exactly the doublings the decoder will perform.
+    pub fn encode_bool(&mut self, bit: u8, probability: u8) {
+        // Identical Split to the decoder (errata #35 operative `>> 8`).
+        let t = (self.range - 1) * u32::from(probability);
+        let split = 1 + (t >> 8);
+
+        if bit == 0 {
+            self.range = split;
+        } else {
+            // Mirror the decoder's `Value -= Split << 24` by moving the
+            // interval bottom up to the start of the high sub-interval.
+            // The addition may carry out of bit 31; resolve it at once so
+            // `low` is back in its 32-bit domain before renormalizing.
+            self.low += u64::from(split) << 24;
+            self.resolve_carry();
+            self.range -= split;
+        }
+
+        // Renormalize to mirror the decoder's `while Range < 128`.
+        while self.range < 128 {
+            self.range <<= 1;
+            self.shift_out_top_bit();
+        }
+    }
+
+    /// Encode a single fixed-probability-128 bit (`b(1)`), the dual of
+    /// [`BoolCoder::decode_b1`].
+    pub fn encode_b1(&mut self, bit: u8) {
+        self.encode_bool(bit, 128);
+    }
+
+    /// Encode the low `n` bits of `value` at fixed probability 128,
+    /// **most-significant-bit first** — the dual of
+    /// [`BoolCoder::decode_b`], so a value written here decodes back
+    /// identically. `n` is capped at 32.
+    pub fn encode_b(&mut self, value: u32, n: u32) {
+        let n = n.min(32);
+        for i in (0..n).rev() {
+            let bit = ((value >> i) & 1) as u8;
+            self.encode_bool(bit, 128);
+        }
+    }
+
+    /// Finish encoding and return the completed byte stream.
+    ///
+    /// Flushes enough trailing bits so the decoder's 32-bit `Value`
+    /// window is fully primed for every bit that was encoded. The
+    /// decoder prefills 4 bytes and then pulls one byte per 8
+    /// renormalization doublings, so flushing 32 more bits (the current
+    /// 32-bit window contents, top bit first) guarantees the decoder can
+    /// reproduce every encoded bit before the stream is exhausted. Any
+    /// partially-filled output byte is zero-padded on the right.
+    pub fn finish(mut self) -> Vec<u8> {
+        // Drain the 32 bits currently held in the window so the decoder
+        // has every encoded bit available before the stream ends.
+        // `shift_out_top_bit` commits bit 31 each call, so 32 calls
+        // empty the window MSB-first.
+        for _ in 0..32 {
+            self.shift_out_top_bit();
+        }
+
+        // Pack the committed bit list MSB-first into bytes, zero-padding
+        // the final partial byte on the right.
+        let mut out = Vec::with_capacity(self.bits.len() / 8 + 5);
+        for chunk in self.bits.chunks(8) {
+            let mut byte = 0u8;
+            for (i, &b) in chunk.iter().enumerate() {
+                byte |= b << (7 - i);
+            }
+            out.push(byte);
+        }
+
+        // The decoder requires at least 4 bytes (the `VP6_StartDecode`
+        // prefill). A stream this short only happens for a near-empty
+        // encode; pad it out so `BoolCoder::new` accepts it.
+        while out.len() < 4 {
+            out.push(0);
+        }
+        out
+    }
+
+    /// Current `Range`. Exposed for diagnostics / testing.
+    pub fn range(&self) -> u32 {
+        self.range
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,5 +901,161 @@ mod tests {
             assert_eq!(bc_bulk.count(), bc_step.count());
             assert_eq!(bc_bulk.pos(), bc_step.pos());
         }
+    }
+
+    // ---------------------------------------------------------------
+    // BoolEncoder — round-trip against the §7.3 decoder.
+    //
+    // The encoder has no spec pseudocode of its own; its correctness
+    // criterion is purely that `BoolCoder` decodes back exactly what was
+    // encoded. Every test below therefore encodes a known (bit,
+    // probability) sequence and asserts the decoder reproduces it.
+    // Working sets are bounded (≤ a few hundred bits) so the memory
+    // footprint stays trivial.
+    // ---------------------------------------------------------------
+
+    /// A small deterministic pseudo-random generator so the round-trip
+    /// fuzz tests are reproducible without pulling in a crate. (xorshift)
+    fn xorshift32(state: &mut u32) -> u32 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *state = x;
+        x
+    }
+
+    /// Encode then decode a single `b(1)` for both bit values at a range
+    /// of probabilities; the decoder must return the encoded bit.
+    #[test]
+    fn encode_decode_single_bit_roundtrip() {
+        for bit in [0u8, 1] {
+            for prob in [1u8, 7, 64, 128, 200, 255] {
+                let mut enc = BoolEncoder::new();
+                enc.encode_bool(bit, prob);
+                let bytes = enc.finish();
+                let mut dec = BoolCoder::new(&bytes).expect("4+ bytes");
+                let got = dec.decode_bool(prob).expect("not truncated");
+                assert_eq!(got, bit, "single bit {bit} at prob {prob} must round-trip");
+            }
+        }
+    }
+
+    /// A fixed multi-bit sequence at a fixed probability round-trips in
+    /// order.
+    #[test]
+    fn encode_decode_fixed_sequence_roundtrip() {
+        let bits = [1u8, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0];
+        for prob in [1u8, 30, 128, 211, 255] {
+            let mut enc = BoolEncoder::new();
+            for &b in &bits {
+                enc.encode_bool(b, prob);
+            }
+            let bytes = enc.finish();
+            let mut dec = BoolCoder::new(&bytes).expect("4+ bytes");
+            for (i, &b) in bits.iter().enumerate() {
+                let got = dec.decode_bool(prob).expect("not truncated");
+                assert_eq!(got, b, "bit {i} at prob {prob} mismatch");
+            }
+        }
+    }
+
+    /// `encode_b` / `decode_b` are inverses for MSB-first multi-bit
+    /// integers across a range of widths and values.
+    #[test]
+    fn encode_b_decode_b_roundtrip() {
+        for n in 1..=16u32 {
+            for &value in &[0u32, 1, (1 << n) - 1, 0xA5A5 & ((1u32 << n) - 1)] {
+                let mut enc = BoolEncoder::new();
+                enc.encode_b(value, n);
+                let bytes = enc.finish();
+                let mut dec = BoolCoder::new(&bytes).expect("4+ bytes");
+                let got = dec.decode_b(n).expect("not truncated");
+                assert_eq!(got, value, "b({n}) value {value:#x} must round-trip");
+            }
+        }
+    }
+
+    /// Mixed probabilities and bit values — the realistic case where
+    /// `Split` varies symbol to symbol and renormalization carries can
+    /// ripple. Bounded at 256 symbols so the working set is tiny.
+    #[test]
+    fn encode_decode_mixed_probabilities_roundtrip() {
+        let mut state = 0x1234_5678u32;
+        let mut bits = Vec::with_capacity(256);
+        let mut probs = Vec::with_capacity(256);
+        for _ in 0..256 {
+            bits.push((xorshift32(&mut state) & 1) as u8);
+            // probability in 1..=255 (never 0, which §7.3 forbids).
+            probs.push((1 + (xorshift32(&mut state) % 255)) as u8);
+        }
+
+        let mut enc = BoolEncoder::new();
+        for i in 0..bits.len() {
+            enc.encode_bool(bits[i], probs[i]);
+        }
+        let bytes = enc.finish();
+
+        let mut dec = BoolCoder::new(&bytes).expect("4+ bytes");
+        for i in 0..bits.len() {
+            let got = dec.decode_bool(probs[i]).expect("not truncated");
+            assert_eq!(got, bits[i], "symbol {i} (prob {}) mismatch", probs[i]);
+        }
+    }
+
+    /// Carry-stress: encode many `Bit = 1` decisions at high probability,
+    /// where `low += Split << 24` repeatedly nudges the interval bottom
+    /// upward and forces carry propagation through already-buffered
+    /// bytes. The decoder must still reconstruct every bit.
+    #[test]
+    fn encode_decode_carry_propagation_roundtrip() {
+        // All-ones at high probability maximizes the cumulative `low`
+        // additions, exercising multi-byte carry ripple.
+        for prob in [200u8, 240, 254, 255] {
+            let bits = [1u8; 120];
+            let mut enc = BoolEncoder::new();
+            for &b in &bits {
+                enc.encode_bool(b, prob);
+            }
+            let bytes = enc.finish();
+            let mut dec = BoolCoder::new(&bytes).expect("4+ bytes");
+            for (i, &b) in bits.iter().enumerate() {
+                let got = dec.decode_bool(prob).expect("not truncated");
+                assert_eq!(got, b, "carry-stress bit {i} at prob {prob}");
+            }
+        }
+    }
+
+    /// An empty encode still produces a decoder-acceptable (≥ 4-byte)
+    /// stream.
+    #[test]
+    fn encode_empty_produces_valid_stream() {
+        let enc = BoolEncoder::new();
+        let bytes = enc.finish();
+        assert!(bytes.len() >= 4, "decoder requires a 4-byte prefill");
+        // Constructible by the decoder.
+        assert!(BoolCoder::new(&bytes).is_ok());
+    }
+
+    /// Interleaved `encode_bool` and `encode_b` round-trip when the
+    /// decoder reads them back in the matching `decode_bool` /
+    /// `decode_b` order — the realistic syntax-element mix.
+    #[test]
+    fn encode_decode_interleaved_b_and_bool_roundtrip() {
+        let mut enc = BoolEncoder::new();
+        // bool(1, 200), b(0b1011, 4), bool(0, 30), b(0x2A, 6), bool(1,128)
+        enc.encode_bool(1, 200);
+        enc.encode_b(0b1011, 4);
+        enc.encode_bool(0, 30);
+        enc.encode_b(0x2A, 6);
+        enc.encode_bool(1, 128);
+        let bytes = enc.finish();
+
+        let mut dec = BoolCoder::new(&bytes).expect("4+ bytes");
+        assert_eq!(dec.decode_bool(200).expect("ok"), 1);
+        assert_eq!(dec.decode_b(4).expect("ok"), 0b1011);
+        assert_eq!(dec.decode_bool(30).expect("ok"), 0);
+        assert_eq!(dec.decode_b(6).expect("ok"), 0x2A);
+        assert_eq!(dec.decode_bool(128).expect("ok"), 1);
     }
 }
