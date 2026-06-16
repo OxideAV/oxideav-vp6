@@ -6,15 +6,44 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed (clean-room round 35, 2026-06-16)
+
+- `bool_coder` — corrected the §7.3 `VP6_DecodeBool` `Split` formula to
+  the operative `>> 8` shift, following the rewritten errata #35
+  (Issue #115): the spec PDF prints `Split = 1 + (((Range-1) *
+  Probability) >> 7)`, but that shift is a transcription typo. Under the
+  printed `>> 7` the coder is degenerate — at `Probability = 128` it
+  gives `Split = Range` (an empty `Bit = 1` interval) and at
+  `Probability = 255` it gives `Split > Range` (a negative interval).
+  The operative `>> 8` keeps `1 ≤ Split ≤ Range − 1` for every
+  `Probability ∈ [1,255]`, `Range ∈ [128,255]`, and makes probability
+  128 the equiprobable half-interval point. Added
+  `split_bounded_for_all_probabilities_and_ranges`, a grid test that
+  pins the `1 ≤ Split ≤ Range − 1` invariant so a regression back to
+  `>> 7` fails immediately.
+- Threaded the correction through every BoolCoder-consuming module's
+  documentation and tests (`frame_header`, `dct_decode`, `mv_decode`,
+  `mode_decode`, `prob_update`, `mv_prob_update`, `mode_prob_update`,
+  `scan_update`, `block_decode`, `fourmv`, crate-root `lib.rs`): the
+  earlier "`>> 7` is correct / probability 128 is `Split = Range` /
+  `Split = 507 > Range` self-correcting corner" commentary was based on
+  the now-superseded errata reading and has been replaced with the
+  `>> 8` analysis. Three tests whose expected decoded outcomes depended
+  on the old `>> 7` Split values were re-derived against `>> 8` with
+  fresh hand-traced fixtures (`dct_decode::decode_ac_coefficient_zero_run_outcome`,
+  `dct_decode::decode_ac_zero_run_greater_than_eight_with_zero_extrabits_yields_nine`,
+  `scan_update::walk_applies_updates_under_forced_flags`).
+
 ### Added (clean-room round 34, 2026-06-15)
 
 - `frame_header` — the §9 BoolCoder-coded `b(n)` frame-header tail
   (`Vp6HeaderTail`), the second half of the frame header that the
   earlier rounds deferred at the BoolCoder boundary. The §7.3 `Split`
   degeneracy that prose-blocked this tail is resolved by the staged
-  errata #35 (`>> 7` is correct; probability 128 is the half-interval
-  point), so the fixed-probability `b(n)` fields decode cleanly through
-  the existing `BoolCoder`.
+  errata #35 (the operative shift is `>> 8`; probability 128 is the
+  half-interval point — see the round-35 "Changed" note above for the
+  correction history), so the fixed-probability `b(n)` fields decode
+  cleanly through the existing `BoolCoder`.
   - `Vp6FrameHeader::raw_prefix_len` (field + accessor) — the
     byte-aligned offset at which the BoolCoder partition begins (1 byte
     Inter, 2 bytes Intra-no-Buff2Offset, 4 bytes Intra-with-Buff2Offset).

@@ -678,12 +678,11 @@ mod tests {
     /// Sign-bit application contract: the sign-bit reassembly formula
     /// `(value ^ -SignBit) + SignBit` is equivalent to "if sign is 1,
     /// negate; else leave alone". This is the §13.2.1 / §13.3.1
-    /// reconstruction step. We can't easily drive `b(1)` (fixed
-    /// probability 128) to 1 against an arbitrary bitstream because
-    /// errata #35 documents that probability 128 with the §7.3 `Split`
-    /// formula gives `Split = Range` exactly, which pins well-formed
-    /// `b(1)` reads to the 0-branch. The reconstruction arithmetic is
-    /// however a pure-integer identity verifiable in isolation.
+    /// reconstruction step. Rather than hand-craft a bitstream whose
+    /// `b(1)` (fixed probability 128, operative `>> 8` Split per errata
+    /// #35: `Split ≈ Range/2`) lands on each sign value, the
+    /// reconstruction arithmetic is verified as the pure-integer
+    /// identity it is, in isolation.
     #[test]
     fn sign_reconstruction_identity_holds() {
         for magnitude in [1i32, 2, 3, 5, 11, 67, 2114] {
@@ -890,14 +889,14 @@ mod tests {
     }
 
     /// End-to-end `decode_dc` against an all-zero stream with
-    /// `node_probs[ZERO] = 255` (strong 1-bias at the root). The
-    /// `Split` formula at prob 255, Range 255 gives `Split = 508`
-    /// which is *greater than Range*: `Split<<24 = 0x1FC00_0000`
-    /// (u64). Compare `Value=0 < 0x1FC00_0000` → 0-branch. So even
-    /// a "1-biased" root with `Value=0` actually takes the 0-branch,
-    /// returning `ZERO_TOKEN` → DC = 0. This pins the edge-case
-    /// arithmetic the implementation uses (`u64` widening for the
-    /// `Split<<24` comparison, errata #35).
+    /// `node_probs[ZERO] = 255` (strong 1-bias at the root). Under the
+    /// operative `>> 8` Split (errata #35) prob 255 at Range 255 gives
+    /// `Split = 1 + (254 * 255 >> 8) = 254 = Range - 1`, so the 1-wide
+    /// `Bit = 1` interval needs `Value >= 254 << 24 = 0xFE00_0000`.
+    /// With `Value = 0` the comparison `0 < 0xFE00_0000` is true, so
+    /// the read takes the 0-branch regardless of the 1-bias —
+    /// returning `ZERO_TOKEN` → DC = 0. (An all-zero `Value` always
+    /// takes the 0-branch since `Split >= 1`.)
     #[test]
     fn decode_dc_root_high_prob_with_zero_value_short_circuits() {
         let mut node_probs = [255u8; NUM_TREE_NODES];
@@ -907,7 +906,7 @@ mod tests {
         let dc = decode_dc(&mut bc, &node_probs).expect("not truncated");
         assert_eq!(
             dc, 0,
-            "Split=508 > Range=255 but Value=0 still satisfies Value < Split<<24 → 0-branch → ZERO_TOKEN"
+            "Value=0 < Split<<24 → 0-branch even with prob-255 root → ZERO_TOKEN → DC=0"
         );
     }
 
@@ -1112,20 +1111,20 @@ mod tests {
         );
     }
 
-    /// `decode_ac_token` ZERO/EOB inversion: with
-    /// `node_probs[EOB_CONTEXT_NODE] = 255` (strong 1-bias) the
-    /// `B(EOB)` read against an all-zero stream still picks the
-    /// 0-branch (Value=0 < Split=508 shifted — Split>Range edge from
-    /// errata #35), which under the §13.3.1 inversion gives
-    /// EOB_TOKEN. We then verify the 1-branch outcome (ZERO_TOKEN)
-    /// via the opposite probability+stream choice.
+    /// `decode_ac_token` ZERO/EOB inversion: against an all-zero stream
+    /// every `B(prob)` read picks the 0-branch (Value=0 is below any
+    /// `Split << 24` since the operative `>> 8` Split is always `>= 1`,
+    /// errata #35), so both the root ZERO node and the EOB node read 0;
+    /// under the §13.3.1 inversion that gives EOB_TOKEN. The opposite
+    /// (ZERO_TOKEN) outcome is verified by
+    /// `decode_ac_coefficient_zero_run_outcome`.
     #[test]
     fn decode_ac_token_eob_inversion_branches() {
         // Pin the root to take the 0-branch (ZERO sub-branch) and the
         // EOB node to take the 0-branch (→ EOB_TOKEN under the §13.3.1
-        // inversion). All-zero stream + prob=1 root works:
-        //   Split = 1 + ((255-1)*1 >> 7) = 1 + 1 = 2. Split<<24
-        //   = 0x0200_0000 > Value=0 → 0-branch.
+        // inversion). All-zero stream works at any probability:
+        //   Split = 1 + ((255-1)*1 >> 8) = 1 + 0 = 1. Split<<24
+        //   = 0x0100_0000 > Value=0 → 0-branch.
         let mut node_probs = [1u8; NUM_TREE_NODES];
         node_probs[TreeNode::EndOfBlock.index()] = 1;
         let bytes = [0u8; 8];
@@ -1157,19 +1156,21 @@ mod tests {
     /// EOB node takes the 1-branch (under the §13.3.1 inversion,
     /// 1-branch at EOB-node = ZERO_TOKEN).
     ///
-    /// Construction: pin `ZERO_CONTEXT_NODE` prob to 255 and
-    /// `EOB_CONTEXT_NODE` prob to 1, all-0xFF stream. Then the root
-    /// Split is `1 + ((255-1)*255 >> 7) = 508`; `Split << 24` is much
-    /// greater than `Value = 0xFFFF_FFFF`, so the root takes the
-    /// 0-branch (ZERO subtree). The EOB Split is `1 + ((255-1)*1 >> 7)
-    /// = 2`; `Split << 24 = 0x0200_0000 < Value`, so EOB takes the
-    /// 1-branch — which under the §13.3.1 inversion is `ZERO_TOKEN`.
+    /// Construction (operative `>> 8` Split, errata #35): pin
+    /// `ZERO_CONTEXT_NODE` prob to 255 and `EOB_CONTEXT_NODE` prob to
+    /// 1, with a leading byte `0xFD` (initial `Value = 0xFDFF_FFFF`).
+    /// The root Split is `1 + ((255-1)*255 >> 8) = 254`; `Split << 24 =
+    /// 0xFE00_0000 > Value = 0xFDFF_FFFF`, so the root takes the
+    /// 0-branch (ZERO subtree), updating `Range = 254`. The EOB Split
+    /// is `1 + ((254-1)*1 >> 8) = 1`; `Split << 24 = 0x0100_0000 <
+    /// Value`, so EOB takes the 1-branch — which under the §13.3.1
+    /// inversion is `ZERO_TOKEN`.
     #[test]
     fn decode_ac_coefficient_zero_run_outcome() {
         let mut node_probs = [1u8; NUM_TREE_NODES];
         node_probs[TreeNode::Zero.index()] = 255;
         node_probs[TreeNode::EndOfBlock.index()] = 1;
-        let bytes = [0xFFu8; 16];
+        let bytes = [0xFDu8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
         let mut bc = bc_over(&bytes);
         let outcome = decode_ac_coefficient(&mut bc, AcPrecContext::WasOne, 5, &node_probs)
             .expect("not truncated");
@@ -1425,10 +1426,11 @@ mod tests {
     /// `decode_ac_token` against the baseline AC probabilities and an
     /// all-zero stream from the very-first AC position (with the §13.2
     /// DC having seeded `Prec = WasZero` via `seed_from_dc(0)`). The
-    /// baseline AC probabilities are all 128, which the §7.3 errata
-    /// #35 documents as the half-interval where `Split = Range = 255`
-    /// against `Range = 255` — every `B(128)` against `Value <
-    /// 0xFF00_0000` reads 0. So at the first AC position the root
+    /// baseline AC probabilities are all 128, the §7.3 half-interval
+    /// point (operative `>> 8` Split, errata #35: `Split = 128` at
+    /// `Range = 255`) — every `B(128)` against the all-zero `Value = 0`
+    /// reads 0 (`0 < Split << 24 = 0x8000_0000`). So at the first AC
+    /// position the root
     /// `B(ZERO_CONTEXT_NODE)` reads 0 (Prec context doesn't matter at
     /// EncodedCoeffs=1), then the EOB-node read also reads 0 → the
     /// inversion gives `EOB_TOKEN`. The first-AC-position decode of
@@ -1451,10 +1453,11 @@ mod tests {
     /// All-zero byte stream against a `[1; 14]` probability row.
     ///
     /// At `Probability = 1, Range = 255` the §7.3 `Split` formula
-    /// yields `Split = 1 + ((254 * 1) >> 7) = 1 + 1 = 2`, so the
-    /// 0-branch is `Value < (Split << 24) = 0x0200_0000`. With
-    /// `Value = 0` the comparison is always true → every
-    /// `decode_bool` returns `0`. Following the §13.3.3.1 tree with
+    /// (operative `>> 8`, errata #35) yields
+    /// `Split = 1 + ((254 * 1) >> 8) = 1 + 0 = 1`, so the 0-branch is
+    /// `Value < (Split << 24) = 0x0100_0000`. With `Value = 0` the
+    /// comparison is always true → every `decode_bool` returns `0`.
+    /// Following the §13.3.3.1 tree with
     /// every internal-node read returning `0`:
     /// `>4 = false → >2 = false → >1 = false → ZeroRunCount = 1 + 0 = 1`.
     #[test]
@@ -1510,25 +1513,27 @@ mod tests {
     /// `(RunLength - 9)` value of `0`), so the result is exactly `9`
     /// (the minimum of the `> 8` escape's `9 + (0..=63)` range).
     ///
-    /// Setup: use a moderate `1`-bias probability for the first two
-    /// internal reads (`> 4`, `> 8`) and a `0`-bias probability for
-    /// the six extrabits. We pick probabilities that don't trigger
-    /// the §7.3 `Split >= Range` edge documented in errata #35:
-    /// `Probability = 64` gives `Split = 1 + (254 * 64 >> 7) = 128`,
-    /// which keeps `Range = 127` after the 1-branch (safe for the
-    /// renorm loop). The extrabit positions use `Probability = 200`,
-    /// which at `Range = 255` gives `Split = 1 + (254 * 200 >> 7) =
-    /// 397`. Errata #35 documents that `Split > Range` collapses to
-    /// the 0-branch for any `Value`, so every extrabit reads `0`.
+    /// Setup (operative `>> 8` Split, errata #35): the first two
+    /// internal reads (`> 4`, `> 8`) use probability `1` so
+    /// `Split = 1 + (254 * 1 >> 8) = 1`; a high-valued stream
+    /// (`0xF0FF_0000` initial `Value`) keeps `Value >= Split << 24 =
+    /// 0x0100_0000`, so both fire their 1-branch (entering the `> 8`
+    /// escape). The six extrabits use probability `255` so
+    /// `Split = 1 + ((Range-1) * 255 >> 8) = Range - 1`; as the high
+    /// bits drain out of `Value`, each extrabit read finds
+    /// `Value < Split << 24` and takes the 0-branch, so the six-bit
+    /// `(RunLength - 9)` suffix is `0` and the run is exactly `9`.
     #[test]
     fn decode_ac_zero_run_greater_than_eight_with_zero_extrabits_yields_nine() {
-        let mut probs = [200u8; NUM_ZRL_NODES];
-        // Internal nodes `>4` and `>8`: probability 64 → Split = 128.
-        // With an all-FF stream, the 1-branch fires (Value >= Split <<
-        // 24 = 0x8000_0000), Range becomes 127, renorm doubles to 254.
-        probs[ZrlNode::GreaterThan4.index()] = 64;
-        probs[ZrlNode::GreaterThan8.index()] = 64;
-        let bytes = [0xFFu8; 64];
+        let mut probs = [255u8; NUM_ZRL_NODES];
+        // Internal nodes `>4` and `>8`: probability 1 → Split = 1, the
+        // 1-branch fires for the high-valued leading bytes, entering
+        // the `> 8` escape.
+        probs[ZrlNode::GreaterThan4.index()] = 1;
+        probs[ZrlNode::GreaterThan8.index()] = 1;
+        let mut bytes = [0u8; 64];
+        bytes[0] = 0xF0;
+        bytes[1] = 0xFF;
         let mut bc = bc_over(&bytes);
         let n = decode_ac_zero_run(&mut bc, ZrlBand::Band0, &probs).expect("not truncated");
         assert_eq!(
@@ -1537,27 +1542,20 @@ mod tests {
         );
     }
 
-    /// Targeted byte stream that hits the `> 8` escape but with
-    /// **all extrabits = 0** (smallest "run > 8" output). The first
-    /// two internal reads (`>4`, `>8`) must both go 1-branch, and
-    /// the six extrabits must all go 0-branch. We mix `0xFF` (forces
-    /// the 1-branch) with `0x00` (forces the 0-branch) bytes
-    /// implicitly by relying on the BoolCoder's internal state
-    /// transitions; rather than hand-craft those byte boundaries, we
-    /// drive the test by using a probability vector that makes every
-    /// internal read the 1-branch regardless of stream content and a
-    /// separate vector that makes every read the 0-branch — and
-    /// verify the combined output via the `Probability = 255`
-    /// shortcut (errata #35: `Split = 1 + (254*255 >> 7) = 1 + 506 =
-    /// 507`, so `Split << 24 > Value` for any `Value`, locking the
-    /// 0-branch).
+    /// A full row of `Probability = 255` against a moderate stream
+    /// drives every Figure 16 read to its 0-branch, landing on the
+    /// leftmost leaf (run-length 1). Under the operative `>> 8` Split
+    /// (errata #35) `Probability = 255` gives `Split = Range - 1`
+    /// (e.g. `254` at `Range = 255`), so the 1-wide `Bit = 1` interval
+    /// needs `Value >= 0xFE00_0000`; the `0xA5A5_A5A5` stream stays
+    /// well below that, locking the 0-branch on every read.
     #[test]
     fn decode_ac_zero_run_prob_extremes_for_each_node_force_branch() {
-        // For probability 255, errata #35 documents Split = 507 → the
-        // (Split << 24) shifted form exceeds any 32-bit Value, so the
-        // 0-branch fires for every read. The full Figure 16 walk with
-        // every read going 0 lands on the leftmost leaf:
-        // `>4 false → >2 false → >1 false → 1 + 0 = 1`.
+        // Probability 255 → Split = Range - 1 (operative `>> 8` Split,
+        // errata #35), so the 0-branch fires unless `Value` reaches the
+        // top 1-wide interval. The 0xA5 stream never does, so the full
+        // Figure 16 walk goes 0 on every read and lands on the leftmost
+        // leaf: `>4 false → >2 false → >1 false → 1 + 0 = 1`.
         let probs_high = [255u8; NUM_ZRL_NODES];
         let bytes = [0xA5u8; 64];
         let mut bc = bc_over(&bytes);
@@ -1570,7 +1568,9 @@ mod tests {
     /// distinction holds: the 0-branch of `B(prob[0])` is the
     /// "run length 1..=4" subtree, and the 1-branch is the "5+"
     /// subtree. We pin this by driving the first read to 0 via
-    /// `probs[0] = 255` (Split=507 → 0-branch); every subsequent
+    /// `probs[0] = 255` (operative `>> 8` Split, errata #35:
+    /// `Split = Range - 1`, and the `0xCD` stream stays below the
+    /// top 1-wide `Bit = 1` interval → 0-branch); every subsequent
     /// read also takes the 0-branch (full row of 255s) and we land
     /// on `1 + 0 = 1` (in the 1..=4 subtree).
     #[test]
@@ -1605,12 +1605,12 @@ mod tests {
     /// Determinism: two BoolCoders fed the same bytes against the
     /// same probability row produce identical results.
     ///
-    /// We use moderate probabilities (`Probability = 64` rather than
-    /// the canonical 128) so the `Split = Range = 255` edge that
-    /// errata #35 documents can't drive an infinite renorm even on
-    /// the all-FF stream. At `prob=64, Range=255` the §7.3 formula
-    /// yields `Split = 128`, which keeps `Range >= 127` after either
-    /// branch and never blows up.
+    /// We use `Probability = 64`: at `Range = 255` the §7.3 formula
+    /// (operative `>> 8` Split, errata #35) yields
+    /// `Split = 1 + (254 * 64 >> 8) = 64`, a well-centred partition
+    /// that keeps both sub-intervals comfortably wide. (Under the
+    /// operative `>> 8` Split the coder is non-degenerate at every
+    /// probability, so this is purely for a readable trace.)
     #[test]
     fn decode_ac_zero_run_determinism() {
         let probs = [64u8; NUM_ZRL_NODES];
@@ -1695,10 +1695,7 @@ mod tests {
         // baseline probs (all 128) and an all-zero stream the
         // 0-branch fires (Value 0 < Split<<24); then the EOB-node
         // read also takes the 0-branch (Value still 0; Split<<24 >
-        // 0) → DctToken::EndOfBlock, not Zero. So we instead use a
-        // probability row that forces the EOB-node 1-branch by
-        // making `Split` shrink to 1 (probability = 255: errata #35
-        // Split = 507 → 0-branch on `Value < Split<<24` always).
+        // 0) → DctToken::EndOfBlock, not Zero.
         //
         // To deterministically obtain the `Zero` token (and thus the
         // ZeroRun outcome) we use `node_probs[EOB_CONTEXT_NODE] = 1`

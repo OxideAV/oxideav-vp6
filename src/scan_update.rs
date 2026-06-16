@@ -163,8 +163,9 @@ pub const DEFAULT_BAND_ASSIGNMENT: BandAssignment = {
 /// probability bank — [`COEFF_BAND_UPDATE_FLAG_PROBS`] for the
 /// published §12.2 listing. (Parameterised like the
 /// [`crate::prob_update`] drivers so the walk can be exercised under
-/// flag banks inside the round-15 BoolCoder's self-correcting
-/// envelope; cf. errata #35's `Split > Range` commentary.)
+/// chosen flag banks; under the operative `>> 8` Split (errata #35)
+/// the BoolCoder is non-degenerate for every probability, so any bank
+/// in `1..=255` is well-defined.)
 ///
 /// Intra-vs-inter seeding is the caller's responsibility: §12.2 has
 /// intra frames reset `assignment` to [`DEFAULT_BAND_ASSIGNMENT`]
@@ -468,13 +469,14 @@ mod tests {
     /// `NewCoeffBand` is "present only if both ScanOrderUpdateFlag
     /// and CoeffBandUpdateFlag are 1").
     ///
-    /// The moderate `[128; 64]` flag bank keeps the round-15
-    /// BoolCoder inside its self-correcting envelope on synthetic
-    /// streams (same rationale as the [`crate::prob_update`] driver
-    /// tests; the published [`COEFF_BAND_UPDATE_FLAG_PROBS`] bank —
-    /// whose tail saturates at 255 — is exercised under realistic
-    /// VP6 bitstreams once the per-frame driver round lands; cf.
-    /// errata #35's `Split > Range` commentary).
+    /// The moderate `[128; 64]` flag bank gives a deterministic,
+    /// readable branch trace (same rationale as the
+    /// [`crate::prob_update`] driver tests); under the operative
+    /// `>> 8` Split (errata #35) the BoolCoder is non-degenerate for
+    /// every probability, so the published
+    /// [`COEFF_BAND_UPDATE_FLAG_PROBS`] bank — whose tail saturates at
+    /// 255 — is equally well-defined and is exercised under realistic
+    /// VP6 bitstreams once the per-frame driver round lands.
     #[test]
     fn all_zero_stream_walk_is_a_no_op() {
         let bytes = [0u8; 64];
@@ -488,28 +490,39 @@ mod tests {
     }
 
     /// A low flag probability forces the 1-branch on every
-    /// `CoeffBandUpdateFlag` (`flag_prob = 1` gives `Split = 2`, so
-    /// any stream whose running value keeps its top byte at >= 2
-    /// decodes 63 consecutive set flags), exercising the
-    /// `NewCoeffBand` `b(4)` path for all 63 coefficients. The
-    /// chosen stream decodes every `b(4)` to band 0, so the
-    /// post-walk assignment is exactly all-band-0 with the DC dummy
-    /// untouched.
+    /// `CoeffBandUpdateFlag` (operative `>> 8` Split, errata #35:
+    /// `flag_prob = 1` gives `Split = 1`, so any stream whose running
+    /// value keeps its top byte at `>= 1` decodes 63 consecutive set
+    /// flags), exercising the `NewCoeffBand` `b(4)` path for all 63
+    /// coefficients. Over an all-`0xFF` stream every flag fires and
+    /// every `b(4)` reads a band in `0..=15`, so the post-walk
+    /// assignment rewrites all 63 AC positions (the DC dummy at index
+    /// 0 stays untouched) and is no longer the default.
     #[test]
     fn walk_applies_updates_under_forced_flags() {
-        let bytes = [
-            0x80u8, 0x55, 0xAA, 0x33, 0xCC, 0x66, 0x99, 0x5A, 0xA5, 0x3C, 0xC3, 0x69,
-        ]
-        .repeat(8);
+        let bytes = [0xFFu8; 64];
         let mut bc = BoolCoder::new(&bytes).expect("init");
         let flag_probs = [1u8; 64];
-        let mut assignment = DEFAULT_BAND_ASSIGNMENT;
-        decode_coeff_band_updates(&mut bc, &flag_probs, &mut assignment).expect("walk");
-        assert_eq!(assignment[0], 0, "DC dummy never written");
-        for (c, &band) in assignment.iter().enumerate().skip(1) {
-            assert_eq!(band, 0, "coefficient {c} must be rewritten to band 0");
+        // Sentinel value outside the `0..=15` band space so we can
+        // confirm every AC position was actually rewritten by a
+        // `b(4)` read (which can only produce `0..=15`).
+        let mut sentinel = DEFAULT_BAND_ASSIGNMENT;
+        for s in sentinel.iter_mut().skip(1) {
+            *s = 0xFF;
         }
-        assert_ne!(assignment, DEFAULT_BAND_ASSIGNMENT);
+        let mut assignment = sentinel;
+        decode_coeff_band_updates(&mut bc, &flag_probs, &mut assignment).expect("walk");
+        assert_eq!(assignment[0], sentinel[0], "DC dummy never written");
+        for (c, &band) in assignment.iter().enumerate().skip(1) {
+            assert!(
+                band < NUM_SCAN_BANDS as u8,
+                "coefficient {c} must be rewritten to a valid band (got {band})"
+            );
+        }
+        assert_ne!(
+            assignment, sentinel,
+            "forced flags must rewrite at least one AC position"
+        );
     }
 
     /// The walk only ever writes Table 16 band numbers: `NewCoeffBand`

@@ -384,24 +384,22 @@ mod tests {
     // The published §11.2 `UpdateIsMvShortProbabilities` /
     // `UpdateMvSignProbabilities` / `UpdateShortVectorNodeProbabilities`
     // / `UpdateLongVectorBitProbabilities` flag-probability banks
-    // cluster near 255 (smallest entry is 231). At any `probability >
-    // 128`, the §7.3 `Split` formula evaluates to `Split > Range`
-    // immediately (e.g. `Split = 471` at `Range = 255, Probability =
-    // 237`). The clean-room errata #35 commentary documents this as
-    // a "statistically pathological" corner that the round-15
-    // BoolCoder primitive does not specifically self-correct in
-    // synthetic tests — repeated 0-branch reads at high `probability`
-    // drive the implementation's internal `range` accumulator past
-    // `u32` capacity over a stream of cumulative reads. Real VP6
-    // bitstreams produced by a conformant encoder steer the BoolCoder
-    // through a renormalization-respecting trajectory the synthetic
-    // streams in this test module do not replicate.
+    // cluster near 255 (smallest entry is 231). Under the operative
+    // `>> 8` Split (errata #35) the BoolCoder is non-degenerate at
+    // every such probability: at `Range = 255, Probability = 237`,
+    // `Split = 1 + (254 * 237 >> 8) = 236 = Range - 19`, a valid
+    // partition (the earlier note that the printed `>> 7` gave
+    // `Split = 471 > Range` is exactly the spec typo errata #35
+    // corrects). There is no "pathological corner" and no `range`
+    // overflow; the implementation's `Range`/`Value` stay bounded for
+    // every probability in `1..=255`.
     //
-    // The tests below therefore exercise the **driver shape and
-    // static surfaces** rather than the BoolCoder trajectory under
-    // the published high-probability flag banks. The full Table 13
-    // walk against a §11.2-conformant bitstream remains a follow-up
-    // (an integration test bound to a real .vp6 fixture).
+    // The tests below still exercise the **driver shape and static
+    // surfaces** as their primary contract. A full Table 13 walk
+    // against a §11.2-conformant bitstream remains a follow-up (an
+    // integration test bound to a real .vp6 fixture) — not because the
+    // synthetic-stream BoolCoder is unsafe, but because verifying the
+    // *decoded* update values needs a conformant encoder's bytes.
 
     /// Verbatim §11.2 default tables — pinned in a test so a
     /// transcription drift in either spec or impl trips immediately.
@@ -467,20 +465,15 @@ mod tests {
     }
 
     // The remaining tests verify the §11.2 driver under truncation
-    // and against synthetic high-probability streams. These are
-    // BoolCoder-mediated and require careful stream construction to
-    // stay inside the round-15 primitive's self-correcting envelope
-    // (see the module-level note above).
+    // and against synthetic high-probability streams. Under the
+    // operative `>> 8` Split (errata #35) these streams decode
+    // deterministically at every probability in `1..=255` (see the
+    // note above).
     //
-    // For now: validate truncation only. Beyond truncation, the
-    // round-15 BoolCoder primitive at `Probability > 128` over
-    // synthetic streams drives the implementation's internal `range`
-    // accumulator into a regime the round-15 self-correction logic
-    // doesn't cover (the spec's `Range = u8` semantics differs from
-    // the implementation's `Range = u32`); exercising the full Table
-    // 13 walk under those flag-probabilities is therefore deferred
-    // behind a separate integration test against a real .vp6
-    // fixture, listed as a round-22 follow-up.
+    // Verifying the *decoded* update values under the published
+    // flag-probabilities still requires a conformant encoder's bytes,
+    // so the full Table 13 walk against a real .vp6 bitstream remains
+    // a follow-up integration test.
 
     /// Static check: the per-axis helper functions exist and have the
     /// expected `(BoolCoder, &mut MvProbs, axis) -> Result` shape.

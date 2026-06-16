@@ -340,12 +340,11 @@ mod tests {
     /// Every decoded per-block mode is one of the four reduced
     /// modes [`FOURMV_BLOCK_MODES`] surfaces — the §10 prose's
     /// "reduced set of four modes" invariant. Validates across a
-    /// sweep of seed byte streams whose top-byte profile keeps the
-    /// BoolCoder away from the `Range == 0` pathological case the
-    /// round-15 errata #35 commentary records (a sustained all-`0xFF`
-    /// top-byte profile drives `Range` to 0 at `Probability = 128`,
-    /// freezing the renormalization loop; valid VP6 bitstreams do
-    /// not exhibit that profile).
+    /// sweep of seed byte streams. Under the operative `>> 8` Split
+    /// (errata #35) the BoolCoder is non-degenerate at every
+    /// probability (`Split ≈ Range/2` at `Probability = 128`, never
+    /// collapsing `Range`), so the invariant holds for any seed
+    /// profile.
     #[test]
     fn decoded_mode_is_always_in_reduced_set() {
         let seeds: [&[u8]; 4] = [

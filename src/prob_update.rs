@@ -300,21 +300,19 @@ mod tests {
     /// which always makes `Value < (Split << 24)` false for a non-zero
     /// `Value`), so `NewNodeProbFlag == 1` and a `b(7)` is consumed.
     ///
-    /// Conversely at `flag_prob == 255` the formula puts `Split == Range`
-    /// at the start of the stream, which collapses to the 0-branch
-    /// (this is the errata-#35 "Split == Range ⇒ 0-branch" disambiguation
-    /// pinned by the round-15 BoolCoder tests). So
-    /// `NewNodeProbFlag == 0` and no `b(7)` is read.
+    /// Conversely at `flag_prob == 255` the operative `>> 8` Split
+    /// formula (errata #35) puts `Split = 1 + (254*255 >> 8) = 254 =
+    /// Range - 1` at the start of an all-zero stream, leaving a 1-wide
+    /// `Bit = 1` interval that an all-zero `Value` never reaches, so the
+    /// 0-branch is taken. Thus `NewNodeProbFlag == 0` and no `b(7)` is
+    /// read.
     #[test]
     fn flag_prob_255_returns_none() {
-        // Initial Value = first 4 bytes (big-endian) = 0xAA00_AAAA.
-        // At Range = 255, Probability = 255, Split = 1 + (254*255 >> 7)
-        //   = 1 + 506 = 507... wait, that overflows the u8 Range domain.
-        // Hmm — the §7.3 spec keeps Range as a value-from-0-255, so the
-        // formula's intermediate ((Range-1) * Probability) can exceed
-        // 255 before the >> 7 brings it back into range. Let me just
-        // assert behaviourally: Probability = 255 over a moderate
-        // stream lands NewNodeProbFlag = 0.
+        // At Range = 255, Probability = 255, the operative `>> 8` Split
+        // is `1 + (254*255 >> 8) = 1 + 253 = 254 = Range - 1`. Over an
+        // all-zero stream `Value` starts at 0, well below
+        // `Split << 24`, so the 0-branch is taken and NewNodeProbFlag
+        // resolves to 0.
         let bytes = [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let mut bc = bc_over(&bytes);
         let pre_pos = bc.pos();
@@ -333,9 +331,9 @@ mod tests {
         // `0x80` leading byte → initial Value's top byte is exactly at
         // the half-interval point of the first b(128) read; subsequent
         // bytes are `0x55` alternation so the renormalization sequence
-        // doesn't collapse Range to 0 (which would put the BoolCoder
-        // primitive in the pathological errata-#35 corner that's out of
-        // scope for this round's tests).
+        // keeps feeding the decoder fresh bits. Under the operative
+        // `>> 8` Split (errata #35) the coder is non-degenerate for
+        // every probability, so no pathological corner exists here.
         let bytes = [0x80u8, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA];
         let mut bc = bc_over(&bytes);
         let out = decode_new_node_prob(&mut bc, 1).expect("not truncated");
@@ -373,20 +371,18 @@ mod tests {
     /// `update_dc_probs` against a half-interval-alternating byte stream
     /// is well-defined: every Table 24 record decodes deterministically,
     /// and the resulting `DcProbs` bank stays inside `1..=255`. The
-    /// stream pattern + the moderate flag probabilities are chosen so
-    /// the BoolCoder state doesn't fall into the errata-#35
-    /// `Range = 0` corner (which is its own concern, separate to the
-    /// update-bitstream driver under test; cf. errata #35 commentary on
-    /// `Split > Range`).
+    /// stream pattern + the moderate flag probabilities exercise the
+    /// driver over a representative bit budget. Under the operative
+    /// `>> 8` Split (errata #35) the BoolCoder is non-degenerate for
+    /// every `Probability ∈ [1,255]`, so there is no `Range = 0` corner
+    /// to avoid; a moderate flag bank simply keeps the test's expected
+    /// branch sequence stable.
     ///
     /// The published `VP6_DC_UPDATE_PROBS` table contains values up to
-    /// `255`; under arbitrary synthetic byte streams that combination
-    /// can drive `Range` toward `0` via the `(Range - 1) * 255 >> 7`
-    /// `Split` path. This test substitutes a moderate flag bank
-    /// (`[128; NUM_PLANES][NUM_TREE_NODES]`) so the round-15 BoolCoder
-    /// stays inside its self-correcting envelope; the published table
-    /// is exercised under realistic VP6 bitstreams once the per-frame
-    /// driver round lands.
+    /// `255`. This test substitutes a moderate flag bank
+    /// (`[128; NUM_PLANES][NUM_TREE_NODES]`) for a deterministic,
+    /// readable branch trace; the published table is exercised under
+    /// realistic VP6 bitstreams once the per-frame driver round lands.
     #[test]
     fn update_dc_probs_well_defined_on_realistic_stream() {
         let bytes = [
@@ -531,12 +527,11 @@ mod tests {
     /// The semantics-level guarantee here: the update driver writes
     /// into the persistent bank only when `decode_new_node_prob`
     /// returns `Some(prob)`. A `None` return path is a no-op on the
-    /// bank. (Constructing a stream where *every* node decodes `None`
-    /// across the full Table 22 walk would require driving the round-15
-    /// BoolCoder along a 0-branch-only path at high flag-probability,
-    /// which sits in the errata-#35 statistically-pathological corner
-    /// of the §7.3 primitive; that corner is out of scope for this
-    /// round's tests.)
+    /// bank. (This test exercises a single `None` decode; the full
+    /// Table 22 all-`None` walk is verified end-to-end by the driver
+    /// tests above. Under the operative `>> 8` Split, errata #35, the
+    /// BoolCoder is non-degenerate at every probability, so the
+    /// all-zero stream simply drives every node to its 0-branch.)
     #[test]
     fn none_return_is_a_noop_on_the_bank() {
         // flag_prob = 200, all-zero stream → first decode_new_node_prob

@@ -436,13 +436,15 @@ mod tests {
     }
 
     /// DC-then-immediate-EOB trace, hand-computed from the §7.3
-    /// arithmetic. Stream `0x40 0x40 0x40 0x40 …`; DC node probs with
-    /// `ZERO = 1` (Split = 2, Value 0x40404040 ≥ 0x02000000 → 1 →
-    /// non-zero), `ONE = 255` (Split = 501 > Range → 0-branch →
-    /// magnitude-1 leaf), sign `b(1)` 0 (top byte stays below Range)
+    /// arithmetic (operative `>> 8` Split, errata #35). Stream
+    /// `0x40 0x40 0x40 0x40 …` (`Value = 0x4040_4040`); DC node probs
+    /// with `ZERO = 1` (`Split = 1`, `Value ≥ 0x0100_0000` → 1 →
+    /// non-zero), `ONE = 255` (`Split = 253`, `Value 0x3F40_4040 <
+    /// 0xFD00_0000` → 0-branch → magnitude-1 leaf), sign `b(1)` 0
     /// → DC = +1, seeding `Prec = WasOne`. AC row `[Y][WasOne][band0]`
-    /// has `ZERO = 255` (Split ≈ 2·Range → 0) and `EOB = 255`
-    /// (likewise 0) → EOB leaf immediately. Net: DC-only block.
+    /// has `ZERO = 255` and `EOB = 255` (both `Split = Range - 1`, the
+    /// residual `Value` staying below `Split << 24` → 0-branch) → EOB
+    /// leaf immediately. Net: DC-only block.
     #[test]
     fn dc_only_block_eob_at_first_ac() {
         let bytes = [0x40u8; 16];

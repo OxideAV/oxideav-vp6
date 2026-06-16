@@ -331,8 +331,9 @@
 //! * [`bool_coder`] / [`BoolCoder`] — the spec §7.3 binary arithmetic
 //!   decoder: `VP6_StartDecode` (the four-byte big-endian prefill of
 //!   `Value`, `Range = 255`, `Count = 8`, `Pos = 4`), `VP6_DecodeBool`
-//!   (the `Split = 1 + ( ((Range-1) * Probability) >> 7 )` per-bit
-//!   step), and the renormalization loop that doubles `Range`/`Value`
+//!   (the `Split = 1 + ( ((Range-1) * Probability) >> 8 )` per-bit
+//!   step — the §7.3 PDF prints `>> 7`, an errata-#35 spec typo), and
+//!   the renormalization loop that doubles `Range`/`Value`
 //!   while `Range < 128` and pulls fresh bytes when `Count` reaches
 //!   zero. Surfaces three call shapes for the §10/§11/§13 consumers:
 //!   [`BoolCoder::decode_bool`] (single bit at arbitrary node
@@ -346,21 +347,22 @@
 //!
 //!   The earlier DOCS-GAP block in the round-1/2 commentary documented
 //!   what looked like a self-contradiction in the §7.3 `Split` formula:
-//!   at `Probability = 128, Range = 255` the formula evaluates to
-//!   `Split = 255 = Range`, which makes the 0-branch unconditional and
-//!   collapses every `b(n)` read to zero. The newly-staged
+//!   under the §7.3 PDF's printed `>> 7`, at `Probability = 128,
+//!   Range = 255` the formula evaluates to `Split = 255 = Range`, which
+//!   makes the 0-branch unconditional and collapses every `b(n)` read
+//!   to zero. The
 //!   `docs/video/vp6/vp6-errata-and-clarifications.md` entry **#35**
-//!   resolves the gap by clean-room analysis: the `>> 7` (divide by
-//!   128) is correct and intentional precisely because it makes
-//!   probability 128 the half-interval point — exactly what the
-//!   spec's `b(x)` notation requires. The `Split == Range` edge case
-//!   at `Probability = 128, Range = 255` is statistically the
-//!   half-interval boundary; it does collapse to the 0-branch when
-//!   `Value < 0xFF00_0000`, which is the correct half-probability-128
-//!   semantics for a `Value` whose top byte is below `0xFF`. The
-//!   formula is bit-exact as printed; only the spec's evaluation
-//!   order ("multiply → shift-by-7 → add-1", unsigned integer) needed
-//!   pinning down.
+//!   resolves the gap by clean-room analysis: the printed `>> 7` is a
+//!   **spec typo**; the operative shift is `>> 8` (divide by 256),
+//!   under which `Probability = 128` is the half-interval point
+//!   (`Split ≈ Range/2`) — exactly what the spec's `b(x)` notation
+//!   requires — and `1 <= Split <= Range - 1` holds for every
+//!   `Probability ∈ [1,255]`, `Range ∈ [128,255]`, so both decode
+//!   sub-intervals stay non-empty. (Under the printed `>> 7`,
+//!   probability 128 gives the degenerate `Split = Range` and
+//!   probability 255 gives `Split > Range`; neither can be decoded.)
+//!   The corrected evaluation order is "multiply → shift-by-8 → add-1",
+//!   unsigned integer.
 //!
 //!   The §7.3 BoolCoder primitive is what every remaining BoolCoder-
 //!   coded layer in the codec (frame-header tail, §10 mode decoding,

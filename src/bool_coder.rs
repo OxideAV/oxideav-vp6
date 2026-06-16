@@ -17,19 +17,27 @@
 //!   definitions.
 //! * `vp6-errata-and-clarifications.md` entry **#35** — the clean-room
 //!   disambiguation that pins down the `Split` formula's evaluation
-//!   order (`multiply → shift-right-by-7 → add-1`), confirms
-//!   `>> 7` (not `>> 8`) is correct, and observes that probability
-//!   `128` is the half-interval point so a `b(n)` read at fixed
-//!   probability 128 partitions `Range` (almost) evenly.
+//!   order (`multiply → shift-right-by-8 → add-1`) and establishes that
+//!   the §7.3 PDF's printed `>> 7` is a **spec typo**: the operative
+//!   shift is `>> 8` (divide by 256), under which probability `128` is
+//!   the half-interval point so a `b(n)` read at fixed probability 128
+//!   partitions `Range` (almost) evenly.
 //!
 //! No third-party VP6 source has been consulted at any stage.
 //!
 //! ## The `Split` formula (errata #35)
 //!
-//! As printed in §7.3:
+//! As **printed** in §7.3 (the shift count `7` is a transcription
+//! typo — see errata #35):
 //!
 //! ```text
-//! Split = 1 + ( ((Range-1) * Probability) >> 7 )
+//! Split = 1 + ( ((Range-1) * Probability) >> 7 )   // printed
+//! ```
+//!
+//! The **operative** formula errata #35 establishes:
+//!
+//! ```text
+//! Split = 1 + ( ((Range-1) * Probability) >> 8 )   // correct
 //! ```
 //!
 //! Errata #35 nails the evaluation order in unsigned integer
@@ -40,17 +48,22 @@
 //!    `Range >= 128`); `Probability` is in `1..=255` (§7.3 forbids
 //!    `Probability == 0`). The product fits in 16 bits, so 32-bit
 //!    arithmetic is more than sufficient.
-//! 2. Arithmetic shift right by **7**: `s = t >> 7`. The shift applies
+//! 2. Arithmetic shift right by **8**: `s = t >> 8`. The shift applies
 //!    only to `t`, not to `1 + t`.
 //! 3. Add **1 after** the shift: `Split = 1 + s`.
 //!
-//! The `>> 7` (divide by 128) is correct and intentional: it makes
-//! `Probability = 128` the half-interval point (an even split), which
-//! is exactly what a binary arithmetic coder needs for the
-//! fixed-probability `b(x)` reads called out in §3. A `>> 8` (divide
-//! by 256) would yield only a quarter-range split at `Probability =
-//! 128`, contradicting the spec's pervasive use of probability 128 to
-//! mean "equiprobable."
+//! The `>> 8` (divide by 256) is the only shift that makes the coder
+//! function. It keeps `1 <= Split <= Range - 1` for every
+//! `Probability ∈ [1,255]` and `Range ∈ [128,255]`, so both the
+//! `Bit = 0` sub-interval `[0, Split)` and the `Bit = 1` sub-interval
+//! `[Split, Range)` are non-empty. At `Probability = 128` it gives
+//! `Split = 1 + ((Range-1) >> 1) ≈ Range/2` — the equiprobable split a
+//! fixed-probability `b(x)` read needs. The printed `>> 7` (divide by
+//! 128) is degenerate: at `Probability = 128` it yields `Split = Range`
+//! (collapsing the `Bit = 1` interval to width 0) and at
+//! `Probability = 255` it yields `Split > Range` (a negative `Bit = 1`
+//! interval) — neither can be decoded, so `>> 7` cannot be the
+//! operative shift.
 //!
 //! The `<< 24` alignment in the comparison `Value < (Split << 24)`
 //! and the update `Value = Value - (Split << 24)` aligns the 8-bit
@@ -155,37 +168,34 @@ impl<'a> BoolCoder<'a> {
     /// Returns [`Error::Truncated`] if the renormalization loop tries
     /// to read past the end of the byte stream.
     pub fn decode_bool(&mut self, probability: u8) -> Result<u8, Error> {
-        // §7.3 Split formula per errata #35: multiply → shift-7 → add-1.
-        // Range is in 1..=255 on entry (post-renormalization invariant
-        // `128 <= Range <= 255`, maintained by the loop at the bottom).
-        // (Range - 1) * Probability fits in 16 bits (max 254 * 255 =
-        // 64770), so u32 arithmetic is more than enough for `t`.
+        // §7.3 Split formula per errata #35: multiply → shift-8 → add-1.
+        // The §7.3 PDF prints `>> 7`, but that is a transcription typo:
+        // `>> 7` makes `Split = Range` at probability 128 (empty
+        // `Bit = 1` interval) and `Split > Range` at probability 255
+        // (negative interval). The operative shift is `>> 8`, which
+        // keeps `1 <= Split <= Range - 1` for every `Probability` in
+        // `1..=255` and `Range` in `128..=255`.
         //
-        // Errata #35 observes that `1 + ((Range-1)*255 >> 7)` can yield
-        // `Split = 507` when both `Range` and `Probability` are at their
-        // maxima — a `Split` that's mathematically greater than `Range`.
-        // The errata's analysis is that this combination is statistically
-        // pathological (a valid coder never lands on it because the
-        // renormalization invariant + the spec's `Probability != 0` rule
-        // make `Split > Range` self-correcting through the
-        // 1-branch update `Range -= Split`). The implementation here
-        // simply does the arithmetic in `u64` for the `Split << 24`
-        // alignment so the comparison and subtraction are well-defined
-        // even at the edge.
+        // Range is in 1..=255 on entry (post-renormalization invariant
+        // `128 <= Range <= 255`, maintained by the loop at the bottom);
+        // `Probability` is in `1..=255` (§7.3 forbids 0). The product
+        // `(Range - 1) * Probability` fits in 16 bits (max 254 * 255 =
+        // 64770), so u32 arithmetic is more than enough.
         let t = (self.range - 1) * u32::from(probability);
-        let split = 1 + (t >> 7);
+        let split = 1 + (t >> 8);
 
         // §7.3 branch: align the 8-bit Split against the top byte of
-        // the 32-bit Value. Compute the shifted value in `u64` to admit
-        // the `Split = 507` edge case without overflowing.
-        let split_shifted_u64 = u64::from(split) << 24;
-        let value_u64 = u64::from(self.value);
-        let bit = if value_u64 < split_shifted_u64 {
+        // the 32-bit Value. With `Split <= Range - 1 <= 254`, the
+        // shifted quantity `Split << 24 <= 0xFE00_0000` fits in u32,
+        // but the comparison and subtraction are done in u32 directly
+        // (no overflow possible since `Split <= 254`).
+        let split_shifted = split << 24;
+        let bit = if self.value < split_shifted {
             self.range = split;
             0u8
         } else {
             self.range -= split;
-            self.value = (value_u64 - split_shifted_u64) as u32;
+            self.value -= split_shifted;
             1u8
         };
 
@@ -214,10 +224,10 @@ impl<'a> BoolCoder<'a> {
     ///
     /// Equivalent to [`Self::decode_bool`] with `probability = 128`.
     /// At probability 128 the [`Split`](Self::decode_bool) formula
-    /// gives an (almost) even partition of `Range` — exactly the
-    /// half-interval property errata #35 documents — so the bit
-    /// behaves statistically like a raw bit pulled straight from the
-    /// underlying bitstream.
+    /// (operative `>> 8`, per errata #35) gives `Split ≈ Range/2` — an
+    /// (almost) even partition of `Range` — so the bit behaves
+    /// statistically like a raw bit pulled straight from the underlying
+    /// bitstream.
     pub fn decode_b1(&mut self) -> Result<u8, Error> {
         self.decode_bool(128)
     }
@@ -336,74 +346,104 @@ mod tests {
     }
 
     /// The §7.3 `Split` formula's specific value at the canonical
-    /// half-interval point: `Probability = 128, Range = 255` gives
-    /// `Split = 1 + ((254 * 128) >> 7) = 1 + 254 = 255` (errata #35
-    /// summary table). Drive a single decode where `Value` is just
-    /// below `Split << 24 = 0xFF00_0000` so the 0-branch is taken,
-    /// then verify the post-state matches: `Range = 255` (unchanged
-    /// because no renormalization is needed at `Split = 255`).
+    /// half-interval point under the operative `>> 8` shift (errata
+    /// #35): `Probability = 128, Range = 255` gives
+    /// `Split = 1 + ((254 * 128) >> 8) = 1 + 127 = 128` — an
+    /// equiprobable partition of `Range`, exactly what a
+    /// fixed-probability bit needs. (The printed `>> 7` would instead
+    /// give `Split = 255 = Range`, an empty `Bit = 1` interval — the
+    /// degeneracy errata #35 rules out.) Drive a single decode where
+    /// `Value` is just below `Split << 24 = 0x8000_0000` so the
+    /// 0-branch is taken, then verify the post-state: `Range = Split =
+    /// 128` (no renormalization needed at exactly 128).
     #[test]
     fn split_formula_canonical_half_interval_value() {
         // Manually arrange Value at the edge of the 0-branch
         // interval. Construct a byte stream whose initial big-endian
-        // 32-bit Value is 0xFEFF_FFFF (one below 0xFF00_0000).
-        let bytes = [0xFE, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+        // 32-bit Value is 0x7FFF_FFFF (one below 0x8000_0000).
+        let bytes = [0x7F, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
         let mut bc = BoolCoder::new(&bytes).expect("4+ bytes");
-        assert_eq!(bc.value(), 0xFEFF_FFFF);
+        assert_eq!(bc.value(), 0x7FFF_FFFF);
         assert_eq!(bc.range(), 255);
 
         let bit = bc.decode_bool(128).expect("not truncated");
-        assert_eq!(bit, 0, "Value 0xFEFFFFFF < 0xFF000000: 0-branch");
-        assert_eq!(bc.range(), 255, "Split = 255 → Range becomes Split = 255");
-        // No renormalization triggered (Range >= 128 already).
+        assert_eq!(bit, 0, "Value 0x7FFFFFFF < 0x80000000: 0-branch");
+        assert_eq!(bc.range(), 128, "Split = 128 → Range becomes Split = 128");
+        // No renormalization triggered (Range == 128, loop entry is
+        // `Range < 128`).
         assert_eq!(bc.count(), 8);
         assert_eq!(bc.pos(), 4);
     }
 
+    /// Errata #35 degeneracy guard: under the operative `>> 8` shift,
+    /// `Split` is bounded `1 <= Split <= Range - 1` for **every**
+    /// `Probability ∈ [1,255]` and `Range ∈ [128,255]`, so both decode
+    /// sub-intervals stay non-empty. The printed `>> 7` violates this
+    /// (Split reaches or exceeds Range at high probabilities); this
+    /// test pins the operative bound across the whole grid so a future
+    /// regression back to `>> 7` is caught immediately.
+    #[test]
+    fn split_bounded_for_all_probabilities_and_ranges() {
+        for range in 128u32..=255 {
+            for prob in 1u32..=255 {
+                let t = (range - 1) * prob;
+                let split = 1 + (t >> 8);
+                // Both decode sub-intervals must be non-empty:
+                // `1 <= Split <= Range - 1`, i.e. `Split >= 1 && Split
+                // < Range`.
+                assert!(
+                    split >= 1 && split < range,
+                    "range {range}, prob {prob}: Split {split} not in 1..={}",
+                    range - 1
+                );
+            }
+        }
+    }
+
     /// Renormalization byte-pull: arrange a probability that
     /// produces a small `Range` post-decode and verify the loop
-    /// pulls the next byte from the stream into `Value`. With
-    /// `Range = 255, Probability = 1`: `Split = 1 + (254 * 1 >> 7) =
-    /// 1 + 1 = 2`. Comparison `Value < 2 << 24 = 0x0200_0000`. If
-    /// `Value = 0x0100_0000` (below threshold) → 0-branch, `Range =
-    /// 2`. Then renormalization doubles `Range` 6 times to reach
-    /// 128, doubling `Value` alongside.
+    /// renormalizes back to 128, doubling `Value` alongside. With
+    /// `Range = 255, Probability = 1` (operative `>> 8`):
+    /// `Split = 1 + (254 * 1 >> 8) = 1 + 0 = 1`. Comparison
+    /// `Value < 1 << 24 = 0x0100_0000`. If `Value = 0x0080_0000`
+    /// (below threshold) → 0-branch, `Range = 1`. Then renormalization
+    /// doubles `Range` 7 times to reach 128, doubling `Value`
+    /// alongside (`0x0080_0000 << 7 = 0x4000_0000`).
     #[test]
     fn split_formula_small_split_renormalization() {
-        // Initial big-endian: Value = 0x0100_0000.
-        let bytes = [0x01, 0x00, 0x00, 0x00, 0xA5, 0x5A, 0xC3, 0x3C];
+        // Initial big-endian: Value = 0x0080_0000.
+        let bytes = [0x00, 0x80, 0x00, 0x00, 0xA5, 0x5A, 0xC3, 0x3C];
         let mut bc = BoolCoder::new(&bytes).expect("4+ bytes");
-        assert_eq!(bc.value(), 0x0100_0000);
+        assert_eq!(bc.value(), 0x0080_0000);
 
         let bit = bc.decode_bool(1).expect("not truncated");
-        assert_eq!(bit, 0, "Value 0x01000000 < Split<<24 0x02000000");
-        // Post-decode pre-renorm: Range = 2, Value = 0x0100_0000.
-        // Renormalization: 6 doublings take Range from 2 to 128,
-        // Value goes from 0x0100_0000 to 0x4000_0000. After 8
-        // doublings Count would hit 0 and a fresh byte would be
-        // pulled in. With 6 doublings to exit Count was 8 → 2, and
-        // no fresh byte is needed (yet).
+        assert_eq!(bit, 0, "Value 0x00800000 < Split<<24 0x01000000");
+        // Post-decode pre-renorm: Range = 1, Value = 0x0080_0000.
+        // Renormalization: 7 doublings take Range from 1 to 128,
+        // Value goes from 0x0080_0000 to 0x4000_0000. Count was 8 → 1,
+        // and no fresh byte is needed (yet — Count never reaches 0).
         assert_eq!(bc.range(), 128);
         assert_eq!(bc.value(), 0x4000_0000);
-        assert_eq!(bc.count(), 2, "8 - 6 = 2 bits remaining");
+        assert_eq!(bc.count(), 1, "8 - 7 = 1 bit remaining");
         assert_eq!(bc.pos(), 4, "no byte pulled yet");
     }
 
-    /// Renormalization byte-pull: force a deeper shift so the loop
+    /// Renormalization byte-pull: drive enough decodes that the loop
     /// actually pulls a byte from the stream.
     ///
-    /// Step-by-step trace from the §7.3 pseudocode:
+    /// Step-by-step trace from the §7.3 pseudocode under the operative
+    /// `>> 8` shift (errata #35):
     /// * Initial: `Range = 255, Value = 0, Count = 8, Pos = 4`.
-    /// * 1st `decode_bool(1)`: `Split = 1 + (254 * 1 >> 7) = 1 + 1 = 2`.
-    ///   Compare `0 < 0x0200_0000` → 0-branch. `Range = 2`. Renorm:
-    ///   6 doublings to reach 128. `Count = 8 - 6 = 2`. No byte pull
-    ///   yet.
-    /// * 2nd `decode_bool(1)`: `Split = 1 + (127 * 1 >> 7) = 1 + 0 = 1`.
+    /// * 1st `decode_bool(1)`: `Split = 1 + (254 * 1 >> 8) = 1 + 0 = 1`.
     ///   Compare `0 < 0x0100_0000` → 0-branch. `Range = 1`. Renorm:
-    ///   need 7 doublings to reach 128. After 2 doublings `Count =
-    ///   0`, which triggers a byte pull (`Value |= bytes[4] = 0xA5`,
-    ///   `Pos = 5`, `Count = 8`). Then 5 more doublings to exit:
-    ///   `Count = 8 - 5 = 3`, `Range = 128`.
+    ///   7 doublings to reach 128. `Count = 8 - 7 = 1`. No byte pull
+    ///   yet (Count never reaches 0).
+    /// * 2nd `decode_bool(1)`: `Range = 128`, `Split = 1 + (127 * 1 >>
+    ///   8) = 1 + 0 = 1`. Compare `0 < 0x0100_0000` → 0-branch. `Range
+    ///   = 1`. Renorm: need 7 doublings to reach 128. After 1 doubling
+    ///   `Count = 0`, which triggers a byte pull (`Value |= bytes[4] =
+    ///   0xA5`, `Pos = 5`, `Count = 8`). Then 6 more doublings to exit:
+    ///   `Count = 8 - 6 = 2`, `Range = 128`.
     #[test]
     fn renormalization_pulls_byte_from_stream() {
         let bytes = [0x00, 0x00, 0x00, 0x00, 0xA5, 0x5A, 0xC3, 0x3C];
@@ -411,12 +451,12 @@ mod tests {
 
         let _ = bc.decode_bool(1).expect("not truncated");
         assert_eq!(bc.pos(), 4, "first decode renorm doesn't reach Count == 0");
-        assert_eq!(bc.count(), 2);
+        assert_eq!(bc.count(), 1);
         assert_eq!(bc.range(), 128);
 
         let _ = bc.decode_bool(1).expect("not truncated");
         assert_eq!(bc.pos(), 5, "Pos advances to 5 after consuming bytes[4]");
-        assert_eq!(bc.count(), 3, "Count = 8 - 5 doublings after refill = 3");
+        assert_eq!(bc.count(), 2, "Count = 8 - 6 doublings after refill = 2");
         assert_eq!(bc.range(), 128, "renormalized back to 128");
     }
 

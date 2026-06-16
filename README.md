@@ -55,8 +55,10 @@ a no-op. It is a primitive library, not a wired codec.
 ### Blocked
 
 - **Full P-frame / I-frame decode loop.** With the §9 BoolCoder header
-  tail now parsing (the §7.3 `Split` degeneracy was resolved by errata
-  #35 — `>> 7` is correct, probability 128 is the half-interval point),
+  tail now parsing (the §7.3 `Split` shift was corrected by errata #35 —
+  the spec prints `>> 7`, but the operative shift is `>> 8`, under which
+  probability 128 is the half-interval point and `1 ≤ Split ≤ Range − 1`
+  holds for every probability),
   what remains is the per-MB driver that walks the macroblock grid
   (mode decode → MV decode → coefficient decode → reconstruct →
   assemble) and the `Decoder` registration. Every primitive that driver

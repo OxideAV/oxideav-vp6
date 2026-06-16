@@ -449,9 +449,10 @@ mod tests {
     /// `Stats[0]=0 → Stats[1]=0 → Vector = B(Stats[2])` and produces
     /// magnitude 0 (since `B(Stats[2]) == 0` too).
     ///
-    /// At prob=1 against zero stream: `Split = 1 + (254*1 >> 7) = 2`,
-    /// `Split << 24 = 0x02000000`, `Value = 0`, comparison is true →
-    /// `Bit = 0`. So every `B(1)` against zero-stream yields 0.
+    /// At prob=1 against zero stream (operative `>> 8` Split, errata
+    /// #35): `Split = 1 + (254*1 >> 8) = 1`, `Split << 24 = 0x01000000`,
+    /// `Value = 0`, comparison is true → `Bit = 0`. So every `B(1)`
+    /// against zero-stream yields 0.
     #[test]
     fn short_magnitude_all_zero_path_yields_zero() {
         let short = [1u8; NUM_SHORT_MV_NODES];
@@ -465,13 +466,13 @@ mod tests {
     /// for every `B(prob)` because `Value = 0xFFFFFFFF` is the
     /// largest possible initial state.
     ///
-    /// At prob=1 against ones stream: `Split = 2`, `Split << 24 =
-    /// 0x02000000`, `Value = 0xFFFFFFFF`, comparison is false →
-    /// `Bit = 1`. The short tree walks
-    /// `Stats[0]=1 → Stats[4]=1 → Vector = 4 + 2 + B(Stats[6])` and
-    /// produces magnitude 7. (Errata-#35: prob=1 with a high `Value`
-    /// produces `Bit = 1` because the 1-branch interval covers the
-    /// vast majority of the range.)
+    /// At prob=1 against ones stream (operative `>> 8` Split, errata
+    /// #35): `Split = 1`, `Split << 24 = 0x01000000`,
+    /// `Value = 0xFFFFFFFF`, comparison is false → `Bit = 1`. The short
+    /// tree walks `Stats[0]=1 → Stats[4]=1 → Vector = 4 + 2 +
+    /// B(Stats[6])` and produces magnitude 7. (At prob=1 with a high
+    /// `Value` the 1-branch interval `[Split, Range)` covers nearly the
+    /// whole range, so the read is `Bit = 1`.)
     #[test]
     fn short_magnitude_max_path_yields_seven() {
         let short = [1u8; NUM_SHORT_MV_NODES];
@@ -484,9 +485,9 @@ mod tests {
     /// Short-MV magnitude always falls in `0..=7`, regardless of the
     /// probability vector or the input bit stream. Sweep over the
     /// VP6-staged §11.1 default probability rows (`x` and `y` axes)
-    /// against several byte streams. §11.1 probability values are
-    /// bounded in `1..=235` so the §7.3 errata-#35 `Range = Prob =
-    /// 255` pathological edge is not reachable here.
+    /// against several byte streams. Under the operative `>> 8` Split
+    /// (errata #35) the BoolCoder is non-degenerate at every
+    /// probability, so the magnitude bound holds for any prob row.
     #[test]
     fn short_magnitude_range_invariant() {
         let probs_corners: [[u8; NUM_SHORT_MV_NODES]; 2] =
@@ -593,10 +594,9 @@ mod tests {
     /// traversal-order mapping by constructing a stream where only
     /// the third of the seven traversal reads (which contributes to
     /// bit position 7) decodes to 1, and all others to 0. Since the
-    /// zero-stream + prob=255 reliably yields `Bit = 0` (errata-#35:
-    /// `Split = 507 > Range`, so the 0-branch fires), and the
-    /// zero-stream + prob=1 yields `Bit = 0` too (`Value = 0` so the
-    /// comparison is `0 < 0x02000000` → true → 0), we cannot use
+    /// zero-stream yields `Bit = 0` at any probability (`Value = 0` is
+    /// below any `Split << 24`, the operative `>> 8` Split keeping
+    /// `Split >= 1`, errata #35), we cannot use
     /// the zero stream to force a 1-branch without specially crafting
     /// the byte sequence. Instead test the magnitude formula
     /// algebraically: setting bit 7 directly via `B(size[2]) == 1`
@@ -626,9 +626,10 @@ mod tests {
     }
 
     /// MV-component decode composes magnitude + sign correctly: at
-    /// zero stream + low `is_short` (so `B(is_short)` decodes to 0
-    /// per errata-#35: `Value = 0` < `Split << 24` always) the long
-    /// path is taken; at low size probs against zero stream every
+    /// zero stream + low `is_short` (so `B(is_short)` decodes to 0:
+    /// `Value = 0` < `Split << 24` always, operative `>> 8` Split per
+    /// errata #35) the long path is taken; at low size probs against
+    /// zero stream every
     /// `B(size[k])` yields 0, so `vector & 0xF0 == 0` triggers the
     /// implicit-bit-3 branch and the magnitude is `0x08`. Sign at
     /// low prob + zero stream yields 0 → final signed = `+8`.
@@ -647,9 +648,10 @@ mod tests {
     }
 
     /// MV-component decode against high `is_short` prob + zero stream
-    /// → `B(255)` yields 0 (per errata-#35 derivation:
-    /// `Split = 507 > Range = 255`, so `Split << 24 > Value = 0`
-    /// → 0-branch) → long path is taken. At zero stream + high
+    /// → `B(255)` yields 0 (operative `>> 8` Split, errata #35:
+    /// `Split = 254 = Range - 1`, so `Split << 24 = 0xFE00_0000 >
+    /// Value = 0` → 0-branch) → long path is taken. At zero stream +
+    /// high
     /// size probs every `B(size[k])` yields 0; vector & 0xF0 == 0
     /// triggers implicit bit 3; magnitude `0x08`. Sign at high
     /// prob + zero stream yields 0 → final signed = `+8`.
@@ -693,9 +695,9 @@ mod tests {
     /// `-7..=7`, long path yields `-255..=-8` ∪ `8..=255` (where
     /// `>127` is encoder-side out-of-spec but decoder-formula valid).
     /// Sweep over §11.1 default probability vectors against several
-    /// byte streams. Probabilities are §11.1-staged (max value 253),
-    /// well clear of the §7.3 errata-#35 `Range = Prob = 255`
-    /// pathological edge case.
+    /// byte streams. Under the operative `>> 8` Split (errata #35) the
+    /// BoolCoder is non-degenerate at every probability in `1..=255`,
+    /// so the signed-range bound holds for any prob vector.
     #[test]
     fn component_decode_range_invariant() {
         let prob_choices: [MvProbs; 2] =

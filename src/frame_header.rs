@@ -22,13 +22,14 @@
 //!   `OutputHFragments`, `ScalingMode`, the Advanced-profile prediction
 //!   and loop-filter selectors, and the trailing `UseHuffman` flag.
 //!
-//! The §7.3 BoolCoder `Split` formula `Split = 1 + (((Range-1) *
-//! Probability) >> 7)` is resolved by the clean-room errata #35 in
-//! `docs/video/vp6/vp6-errata-and-clarifications.md`: the `>> 7`
-//! (divide by 128) is correct and intentional — probability 128 is the
-//! half-interval point, exactly what the fixed-probability `b(n)`
-//! reads require. The `b(n)` tail therefore decodes cleanly through the
-//! existing [`crate::bool_coder::BoolCoder`].
+//! The §7.3 BoolCoder `Split` formula is `Split = 1 + (((Range-1) *
+//! Probability) >> 8)` per the clean-room errata #35 in
+//! `docs/video/vp6/vp6-errata-and-clarifications.md` (the §7.3 PDF
+//! prints `>> 7`, a spec typo): the operative `>> 8` (divide by 256)
+//! makes probability 128 the half-interval point, exactly what the
+//! fixed-probability `b(n)` reads require. The `b(n)` tail therefore
+//! decodes cleanly through the existing
+//! [`crate::bool_coder::BoolCoder`].
 //!
 //! All field semantics in this file are sourced verbatim from
 //! `docs/video/vp6/vp6_format.pdf` §9 (Tables 1/2/3) and the staged

@@ -237,9 +237,10 @@ mod tests {
     // is always true for `Split >= 1`, so any probability yields bit 0.
     const FORCE0: u8 = 128;
     // Per-node probability that forces the BoolCoder 1-branch on the
-    // ones stream: at `Probability = 1`, `Split = 1 + ((Range-1) >> 7)`
-    // is tiny, so `Value = 0xFFFF_FFFF < (Split << 24)` is false and
-    // bit 1 fires (the idiom round 21's `mv_decode` tests use).
+    // ones stream: at `Probability = 1`, `Split = 1 + ((Range-1) >> 8)`
+    // is tiny (operative `>> 8` per errata #35), so
+    // `Value = 0xFFFF_FFFF < (Split << 24)` is false and bit 1 fires
+    // (the idiom round 21's `mv_decode` tests use).
     const FORCE1: u8 = 1;
 
     // A BoolCoder over an all-zero byte stream: with the FORCE0

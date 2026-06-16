@@ -287,8 +287,9 @@ mod tests {
     // --- Figure 9 magnitude tree ------------------------------------------
 
     // A stream of all-zero bytes drives every `B(prob)` to its 0-branch
-    // for moderate probabilities inside the round-15 BoolCoder's
-    // self-correcting envelope (errata #35). For Figure 9 that path is:
+    // for any probability: with `Value == 0` the comparison
+    // `0 < (Split << 24)` is always true (operative `>> 8` Split,
+    // errata #35, keeps `Split >= 1`). For Figure 9 that path is:
     // B(171)==0 -> B(199)==0 -> B(140)==0 -> B(125)==0 -> B(104)==0
     // -> return sign * 24.
     #[test]
