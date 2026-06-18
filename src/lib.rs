@@ -850,6 +850,7 @@ pub mod huffman;
 pub mod idct;
 pub mod inter;
 pub mod interp;
+pub mod intra_frame;
 pub mod loopfilter;
 pub mod mode_decode;
 pub mod mode_prob_update;
@@ -903,6 +904,7 @@ pub use interp::{
     bicubic_block, bicubic_point, bilinear_block, bilinear_point, var_16_point, BICUBIC_FILTER_SET,
     BICUBIC_VP61_INDEX, BILINEAR_CHROMA_FILTERS, BILINEAR_LUMA_FILTERS,
 };
+pub use intra_frame::{decode_intra_frame, IntraProbs};
 pub use loopfilter::{
     bound, boundary_x, boundary_y, filter_horizontal_boundary, filter_vertical_boundary,
     prediction_loop_filter_function, PREDICTION_LOOP_FILTER_LIMIT_VALUES,

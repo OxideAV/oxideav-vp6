@@ -36,7 +36,11 @@
 //! The transform uses seven fixed-point cosine constants (`xC1S7` …
 //! `xC7S1`), each a Q16 representation of `cos(k·π/16)`. Every product
 //! `(C * coeff) >> 16` performs the multiply-then-descale that keeps
-//! the intermediate values bounded. The first (row) pass writes its
+//! the intermediate values bounded. The multiply itself is evaluated
+//! in 64-bit: for a conformant §15-dequantized coefficient (magnitude
+//! up to ≈ 2114 × 376) the product `C * coeff` exceeds `i32::MAX`, so
+//! the pre-`>> 16` product must be 64-bit even though the descaled
+//! result fits `i32`. The first (row) pass writes its
 //! results without a final shift; the second (column) pass applies a
 //! `>> 4` descale to each output, which is the transform's overall
 //! normalisation. This matches a standard separable IDCT: no descale
@@ -82,19 +86,34 @@ const XC7S1: i32 = 12785;
 /// uses these outputs directly; the column pass shifts each by `>> 4`.
 #[inline]
 fn butterfly(ip: [i32; 8]) -> [i32; 8] {
-    let a = ((XC1S7 * ip[1]) >> 16) + ((XC7S1 * ip[7]) >> 16);
-    let b = ((XC7S1 * ip[1]) >> 16) - ((XC1S7 * ip[7]) >> 16);
-    let c = ((XC3S5 * ip[3]) >> 16) + ((XC5S3 * ip[5]) >> 16);
-    let d = ((XC3S5 * ip[5]) >> 16) - ((XC5S3 * ip[3]) >> 16);
+    // Each `(C * coeff) >> 16` multiply is evaluated in `i64`. The
+    // cosine constants reach 64277 and a dequantized §15 coefficient
+    // reaches ≈ 2114 × 376 ≈ 795 k, so the product `C * coeff` reaches
+    // ≈ 5.1e10 — well past `i32::MAX` (≈ 2.1e9). The spec's §16
+    // pseudocode writes the multiply and the `>> 16` descale as one
+    // expression with no declared width; the only width that holds the
+    // pre-shift product for conformant input is 64-bit. After the
+    // `>> 16` descale every term is back in the coefficient's own scale
+    // and the butterfly sums fit `i32`, so the function's `i32`
+    // input/output contract is preserved — only the intermediate
+    // products widen.
+    #[inline]
+    fn m(c: i32, v: i32) -> i32 {
+        ((c as i64 * v as i64) >> 16) as i32
+    }
+    let a = m(XC1S7, ip[1]) + m(XC7S1, ip[7]);
+    let b = m(XC7S1, ip[1]) - m(XC1S7, ip[7]);
+    let c = m(XC3S5, ip[3]) + m(XC5S3, ip[5]);
+    let d = m(XC3S5, ip[5]) - m(XC5S3, ip[3]);
 
-    let ad = (XC4S4 * (a - c)) >> 16;
-    let bd = (XC4S4 * (b - d)) >> 16;
+    let ad = m(XC4S4, a - c);
+    let bd = m(XC4S4, b - d);
     let cd = a + c;
     let dd = b + d;
-    let e = (XC4S4 * (ip[0] + ip[4])) >> 16;
-    let f = (XC4S4 * (ip[0] - ip[4])) >> 16;
-    let g = ((XC2S6 * ip[2]) >> 16) + ((XC6S2 * ip[6]) >> 16);
-    let h = ((XC6S2 * ip[2]) >> 16) - ((XC2S6 * ip[6]) >> 16);
+    let e = m(XC4S4, ip[0] + ip[4]);
+    let f = m(XC4S4, ip[0] - ip[4]);
+    let g = m(XC2S6, ip[2]) + m(XC6S2, ip[6]);
+    let h = m(XC6S2, ip[2]) - m(XC2S6, ip[6]);
     let ed = e - g;
     let gd = e + g;
     let add = f + ad;
@@ -305,6 +324,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A maximally-large conformant dequantized coefficient does not
+    /// overflow. The largest coded coefficient is Table 18 CATEGORY6's
+    /// 2114, and the largest §15 factor is 376, so a single dequantized
+    /// coefficient can reach ≈ 795 k. Filling a whole block with that
+    /// value and transforming it must not panic — the multiply is done
+    /// in `i64`. (A pre-fix `i32` multiply panicked with "attempt to
+    /// multiply with overflow" here.)
+    #[test]
+    fn max_conformant_coefficient_does_not_overflow() {
+        let max_dequant: i32 = 2114 * 376;
+        let mut block = [max_dequant; 64];
+        idct_block(&mut block); // must not panic
+                                // And a single max DC coefficient (the worst single-term case).
+        let mut dc_block = [0i32; 64];
+        dc_block[0] = max_dequant;
+        idct_block(&mut dc_block);
     }
 
     /// Mirror of the previous test: a purely vertical AC coefficient
