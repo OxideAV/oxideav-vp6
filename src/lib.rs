@@ -899,7 +899,8 @@ pub use huffman::{
 pub use idct::idct_block;
 pub use inter::{
     chroma_frac, fetch_prediction_block, fetch_prediction_block_clamped, inter_block_to_pixels,
-    luma_frac, reconstruct_inter_block, whole_sample_aligned, MvShift,
+    luma_frac, reconstruct_inter_block, reconstruct_inter_macroblock, whole_sample_aligned,
+    MvShift, ReconstructedMacroblock, RefPlane,
 };
 pub use interp::{
     bicubic_block, bicubic_point, bilinear_block, bilinear_point, var_16_point, BICUBIC_FILTER_SET,

@@ -374,6 +374,139 @@ pub fn inter_block_to_pixels(pred: &[u8; 64], residual: &[i32; 64]) -> [u8; 64] 
     pixels
 }
 
+/// One reference plane for inter motion compensation: a flat,
+/// **unbordered** `width × height` reconstruction (the previous-frame or
+/// golden-frame luma or chroma plane). §11.5's UMV border is applied on
+/// the read side by [`fetch_prediction_block_clamped`], so the plane
+/// itself carries no padding.
+#[derive(Debug, Clone, Copy)]
+pub struct RefPlane<'a> {
+    /// The flat plane samples, `sample(r, c) = data[r * width + c]`.
+    pub data: &'a [u8],
+    /// Plane width in samples.
+    pub width: usize,
+    /// Plane height in samples.
+    pub height: usize,
+}
+
+/// The six reconstructed 8×8 pixel blocks of one motion-compensated
+/// macroblock: four luma (raster TL, TR, BL, BR) plus U and V.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconstructedMacroblock {
+    /// The four luma blocks, raster order (0=TL, 1=TR, 2=BL, 3=BR).
+    pub luma: [[u8; 64]; 4],
+    /// The U chroma block.
+    pub u: [u8; 64],
+    /// The V chroma block.
+    pub v: [u8; 64],
+}
+
+/// Reconstruct one **integer-motion-vector** inter macroblock by
+/// motion-compensating each of its six blocks against the reference
+/// planes and recombining with the per-block IDCT residual
+/// (§17.2 / §17.3).
+///
+/// This is the integer-MV (whole-pixel-aligned, §17.2 zero and §17.3
+/// full-pixel) MB-level glue between MV resolution and §2 raster
+/// assembly: it drives the per-block prediction fetch + §17 recombine
+/// across the four luma blocks and the two chroma blocks of one
+/// macroblock, handling the §11.4 luma-vs-chroma motion-vector shift and
+/// the 4:2:0 plane geometry. Sub-pixel motion (§17.4) routes through the
+/// [`crate::interp`] bilinear/bicubic filters and is **not** handled
+/// here — a fractional MV component is treated by its whole-sample part
+/// only, so callers needing sub-pixel accuracy filter the fetched
+/// prediction themselves. FourMV macroblocks (per-block luma vectors)
+/// are likewise a separate per-block path.
+///
+/// * `mb_row` / `mb_col` — the macroblock's grid position. The luma
+///   plane co-located corner is `(mb_row * 16, mb_col * 16)`; each
+///   chroma plane's is `(mb_row * 8, mb_col * 8)` (§2 4:2:0).
+/// * `mv` — the MB motion vector in ¼-pel luma units. The luma blocks
+///   use `mv >> 2` whole-sample offsets ([`MvShift::Luma`]); the chroma
+///   blocks reinterpret the same vector at ⅛-sample precision
+///   (`mv >> 3`, [`MvShift::Chroma`]) per §11.4.
+/// * `luma_residual` — the four luma blocks' post-IDCT residuals, raster
+///   order; `u_residual` / `v_residual` — the chroma residuals.
+/// * `ref_y` / `ref_u` / `ref_v` — the reference reconstruction planes.
+///
+/// Each block's prediction is fetched with
+/// [`fetch_prediction_block_clamped`] (the §11.5 read-side edge clamp)
+/// and recombined via [`reconstruct_inter_block`].
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_inter_macroblock(
+    mb_row: usize,
+    mb_col: usize,
+    mv_x: i32,
+    mv_y: i32,
+    luma_residual: &[[i32; 64]; 4],
+    u_residual: &[i32; 64],
+    v_residual: &[i32; 64],
+    ref_y: RefPlane<'_>,
+    ref_u: RefPlane<'_>,
+    ref_v: RefPlane<'_>,
+) -> ReconstructedMacroblock {
+    // §11.4 whole-sample offsets per plane.
+    let luma_dx = whole_sample_aligned(mv_x, MvShift::Luma);
+    let luma_dy = whole_sample_aligned(mv_y, MvShift::Luma);
+    let chroma_dx = whole_sample_aligned(mv_x, MvShift::Chroma);
+    let chroma_dy = whole_sample_aligned(mv_y, MvShift::Chroma);
+
+    // The four luma block co-located corners within the luma plane.
+    const LUMA_OFFSETS: [(i32, i32); 4] = [(0, 0), (0, 8), (8, 0), (8, 8)];
+    let luma_top = (mb_row * 16) as i32;
+    let luma_left = (mb_col * 16) as i32;
+
+    let mut luma = [[0u8; 64]; 4];
+    for (k, &(dr, dc)) in LUMA_OFFSETS.iter().enumerate() {
+        let mut pred = [0u8; 64];
+        fetch_prediction_block_clamped(
+            ref_y.data,
+            ref_y.width,
+            ref_y.height,
+            luma_top + dr,
+            luma_left + dc,
+            luma_dx,
+            luma_dy,
+            &mut pred,
+        );
+        reconstruct_inter_block(&pred, &luma_residual[k], &mut luma[k]);
+    }
+
+    // One chroma block per plane at the MB's chroma corner.
+    let chroma_top = (mb_row * 8) as i32;
+    let chroma_left = (mb_col * 8) as i32;
+
+    let mut u = [0u8; 64];
+    let mut pred_u = [0u8; 64];
+    fetch_prediction_block_clamped(
+        ref_u.data,
+        ref_u.width,
+        ref_u.height,
+        chroma_top,
+        chroma_left,
+        chroma_dx,
+        chroma_dy,
+        &mut pred_u,
+    );
+    reconstruct_inter_block(&pred_u, u_residual, &mut u);
+
+    let mut v = [0u8; 64];
+    let mut pred_v = [0u8; 64];
+    fetch_prediction_block_clamped(
+        ref_v.data,
+        ref_v.width,
+        ref_v.height,
+        chroma_top,
+        chroma_left,
+        chroma_dx,
+        chroma_dy,
+        &mut pred_v,
+    );
+    reconstruct_inter_block(&pred_v, v_residual, &mut v);
+
+    ReconstructedMacroblock { luma, u, v }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,5 +1171,184 @@ mod tests {
         let img = vec![0u8; 10];
         let mut pred = [0u8; 64];
         fetch_prediction_block_clamped(&img, 16, 16, 0, 0, 0, 0, &mut pred);
+    }
+
+    // -------- reconstruct_inter_macroblock --------
+
+    /// A zero-MV macroblock against a uniform reference plus a zero
+    /// residual reproduces the reference exactly: every reconstructed
+    /// block is the co-located reference content (here a flat value).
+    #[test]
+    fn inter_mb_zero_mv_zero_residual_copies_reference() {
+        // A 16x16 luma plane filled with 200, 8x8 chroma planes with 50.
+        let ref_y = vec![200u8; 16 * 16];
+        let ref_u = vec![50u8; 8 * 8];
+        let ref_v = vec![60u8; 8 * 8];
+        let zero = [0i32; 64];
+        let mb = reconstruct_inter_macroblock(
+            0,
+            0,
+            0,
+            0,
+            &[zero; 4],
+            &zero,
+            &zero,
+            RefPlane {
+                data: &ref_y,
+                width: 16,
+                height: 16,
+            },
+            RefPlane {
+                data: &ref_u,
+                width: 8,
+                height: 8,
+            },
+            RefPlane {
+                data: &ref_v,
+                width: 8,
+                height: 8,
+            },
+        );
+        for block in mb.luma {
+            assert!(block.iter().all(|&p| p == 200));
+        }
+        assert!(mb.u.iter().all(|&p| p == 50));
+        assert!(mb.v.iter().all(|&p| p == 60));
+    }
+
+    /// A constant residual offsets the copied prediction by that amount,
+    /// clipped to 0..=255 (§17.2 recombine).
+    #[test]
+    fn inter_mb_residual_offsets_prediction() {
+        let ref_y = vec![100u8; 16 * 16];
+        let ref_u = vec![100u8; 8 * 8];
+        let ref_v = vec![100u8; 8 * 8];
+        let plus10 = [10i32; 64];
+        let zero = [0i32; 64];
+        let mb = reconstruct_inter_macroblock(
+            0,
+            0,
+            0,
+            0,
+            &[plus10; 4],
+            &zero,
+            &zero,
+            RefPlane {
+                data: &ref_y,
+                width: 16,
+                height: 16,
+            },
+            RefPlane {
+                data: &ref_u,
+                width: 8,
+                height: 8,
+            },
+            RefPlane {
+                data: &ref_v,
+                width: 8,
+                height: 8,
+            },
+        );
+        for block in mb.luma {
+            assert!(block.iter().all(|&p| p == 110), "100 + 10 residual");
+        }
+        // Chroma had a zero residual → unchanged.
+        assert!(mb.u.iter().all(|&p| p == 100));
+    }
+
+    /// A full-pixel (¼-pel multiple of 4) horizontal MV shifts the luma
+    /// prediction source by whole samples. Build a reference whose
+    /// columns ramp 0,1,2,… so a known dx produces a known shifted read.
+    #[test]
+    fn inter_mb_full_pixel_mv_shifts_source() {
+        // 32x16 luma plane: sample(r,c) = c (column ramp, 0..=31).
+        let width = 32usize;
+        let height = 16usize;
+        let mut ref_y = vec![0u8; width * height];
+        for r in 0..height {
+            for c in 0..width {
+                ref_y[r * width + c] = c as u8;
+            }
+        }
+        let ref_c = vec![0u8; 16 * 8];
+        let zero = [0i32; 64];
+        // MV x = 4 quarter-pels = +1 whole sample (luma >> 2). MB at
+        // (row 0, col 0) so luma corner is (0, 0); the TL block reads
+        // columns 1..=8 → values 1..=8 across each row.
+        let mb = reconstruct_inter_macroblock(
+            0,
+            0,
+            4,
+            0,
+            &[zero; 4],
+            &zero,
+            &zero,
+            RefPlane {
+                data: &ref_y,
+                width,
+                height,
+            },
+            RefPlane {
+                data: &ref_c,
+                width: 16,
+                height: 8,
+            },
+            RefPlane {
+                data: &ref_c,
+                width: 16,
+                height: 8,
+            },
+        );
+        // TL luma block row 0: source columns 1..=8 → 1,2,..,8.
+        for c in 0..8 {
+            assert_eq!(mb.luma[0][c], (c as u8) + 1, "shifted column read");
+        }
+    }
+
+    /// The §11.5 read-side clamp: an MV that points off the left edge
+    /// duplicates the edge column rather than reading out of bounds.
+    #[test]
+    fn inter_mb_negative_mv_clamps_to_edge() {
+        let width = 16usize;
+        let height = 16usize;
+        let mut ref_y = vec![0u8; width * height];
+        for r in 0..height {
+            for c in 0..width {
+                ref_y[r * width + c] = c as u8;
+            }
+        }
+        let ref_c = vec![0u8; 8 * 8];
+        let zero = [0i32; 64];
+        // MV x = -40 quarter-pels = -10 whole samples; the TL block at
+        // corner (0,0) reads columns -10..=-3, all clamped to column 0
+        // (value 0).
+        let mb = reconstruct_inter_macroblock(
+            0,
+            0,
+            -40,
+            0,
+            &[zero; 4],
+            &zero,
+            &zero,
+            RefPlane {
+                data: &ref_y,
+                width,
+                height,
+            },
+            RefPlane {
+                data: &ref_c,
+                width: 8,
+                height: 8,
+            },
+            RefPlane {
+                data: &ref_c,
+                width: 8,
+                height: 8,
+            },
+        );
+        assert!(
+            mb.luma[0].iter().all(|&p| p == 0),
+            "off-left-edge read clamps to column 0"
+        );
     }
 }
