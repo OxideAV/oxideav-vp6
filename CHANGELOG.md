@@ -6,6 +6,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 331, 2026-06-18)
+
+- `mode_decode` — `decode_macroblock_modes`, the §10 frame-level
+  macroblock mode-decode pass and first stage of the per-MB decode
+  driver. Walks the `mb_cols × mb_rows` macroblock grid in spec raster
+  order (§13), threading `last_mode` (feeds the root
+  `B(probModeSame[type][lastmode])` "same as last" decision and the
+  `ModeDecisionTree[type][lastmode]` row selection, advancing to each
+  MB's just-decoded mode) and resolving each MB's §10 Table 5
+  `ModeAvailability` via a caller-supplied closure (the spec couples
+  the Nearest/Near reference-frame filter to the mode being decoded,
+  so availability resolution — typically backed by
+  `near_mv::resolve_near_mvs_from_grid` over the MV grid built so far —
+  is delegated to the caller). The first-MB `last_mode` seed is a
+  parameter so no unstated constant is baked in. Returns one
+  `CodingMode` per MB in raster order; empty grids read no BoolCoder
+  bits. Sourced exclusively from `docs/video/vp6/vp6_format.pdf`
+  §10/§13 and the staged errata #35.
+
 ### Added (clean-room round 36, 2026-06-16)
 
 - `bool_coder` — `BoolEncoder`, the binary arithmetic **encoder** that

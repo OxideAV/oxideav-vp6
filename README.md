@@ -50,8 +50,11 @@ a no-op. It is a primitive library, not a wired codec.
   reconstruction (`mv_diff`), the §10 `CODE_INTER_FOURMV` block-mode
   signaling (`fourmv`) and chroma-MV derivation, the §10
   Nearest/Near neighbour walker (`near_mv`), the §10 `VP6_DecodeMode`
-  macroblock-mode traversal (`mode_decode`), and the §9 output-scaling
-  surface (`scaling`).
+  macroblock-mode traversal plus the §10/§13 frame-level
+  raster-order macroblock mode-decode pass
+  (`mode_decode::decode_macroblock_modes` — threads `last_mode` and
+  per-MB `ModeAvailability` across the MB grid; the first stage of the
+  per-MB driver), and the §9 output-scaling surface (`scaling`).
 - **Frame assembly** (`frame_assembly`) — block-to-plane raster
   placement of reconstructed 8×8 blocks into a YUV 4:2:0 image.
 
@@ -64,11 +67,15 @@ a no-op. It is a primitive library, not a wired codec.
   holds for every probability),
   what remains is the per-MB driver that walks the macroblock grid
   (mode decode → MV decode → coefficient decode → reconstruct →
-  assemble) and the `Decoder` registration. Every primitive that driver
-  sequences already exists; the remaining work is wiring them into a
-  partition-walking loop and threading the per-frame geometry
-  (`VFragments` / `HFragments`) from the header tail into the grid
-  bounds.
+  assemble) and the `Decoder` registration. The **mode-decode stage**
+  of that driver now exists as
+  `mode_decode::decode_macroblock_modes` (raster-order MB walk,
+  `last_mode` threading, per-MB `ModeAvailability` resolution); the
+  remaining work is sequencing the MV-decode / coefficient-decode /
+  reconstruct stages behind it into the same partition-walking loop and
+  threading the per-frame geometry (`VFragments` / `HFragments`) from
+  the header tail into the grid bounds. Every primitive that driver
+  sequences already exists.
 - **High-bit-depth / scaling resampling math** and **sample-exact
   validation against a conformant `.vp6` bitstream** — the latter
   needs an encoder-produced fixture.
