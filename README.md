@@ -13,9 +13,11 @@ Specification" (document version 1.02, August 2006), staged at
 source has been consulted at any stage.
 
 Almost every decode primitive is implemented and unit-tested, but the
-crate does **not yet expose a full frame decoder** and does **not
-register a `Decoder` with `oxideav-core`** — `register()` is currently
-a no-op. It is a primitive library, not a wired codec.
+crate now exposes a **full intra-frame (I-frame) decoder**
+(`decode_intra_frame`) that drives an entire keyframe end-to-end to
+output pixels, but does **not yet** drive the inter (P-frame) loop or
+**register a `Decoder` with `oxideav-core`** — `register()` is currently
+a no-op.
 
 ### Implemented stages
 
@@ -67,32 +69,57 @@ a no-op. It is a primitive library, not a wired codec.
 - **Frame assembly** (`frame_assembly`) — block-to-plane raster
   placement of reconstructed 8×8 blocks into a YUV 4:2:0 image.
 
+### Full intra-frame decode loop
+
+- **`intra_frame::decode_intra_frame`** drives a complete keyframe
+  end-to-end to output pixels: it walks the macroblock grid in raster
+  order and, for each MB's six blocks (four luma raster TL/TR/BL/BR,
+  then U, then V — §13 page 58), runs the full §13 coefficient decode →
+  §14 DC prediction → §15 dequant → §16 IDCT → §17.1 reconstruct → §2
+  raster-assembly chain, threading the §14/§13.2 left/above block-grid
+  neighbours through explicit per-plane coded-DC grids (the
+  MB-interleaved decode order makes the plane-raster
+  `DcZeroContextTracker` unusable for this). Reads a single BoolCoder
+  partition (`MultiStream == 0`). `IntraProbs::keyframe()` seeds the
+  per-frame DC/AC/zero-run banks at the §13 baselines. Driving this loop
+  surfaced and fixed a latent §16 IDCT `i32` overflow: a conformant
+  dequantized coefficient times the Q16 cosine constant exceeds
+  `i32::MAX`, so the multiply now widens to `i64` before the `>> 16`
+  descale.
+
+### Inter (P-frame) path — partially wired
+
+- **`fourmv::reconstruct_fourmv_macroblock`** resolves a
+  `CODE_INTER_FOURMV` macroblock's full motion state: the four Table 10
+  per-block coding modes, each block's resolved MV (NoMv → `(0,0)`;
+  PlusMv → §11.1 delta + §11 differential reference; Nearest/Near → the
+  MB-level §10 neighbour walk), and the derived chroma MV.
+- **`inter::reconstruct_inter_macroblock`** is the §17.2/§17.3
+  integer-MV MB-level glue: per-block §11.5-clamped prediction fetch +
+  §17 recombine across one MB's six blocks, with the §11.4 luma/chroma
+  MV-shift split. The §17.4 sub-pixel path routes through the existing
+  `interp` filters.
+
 ### Blocked
 
-- **Full P-frame / I-frame decode loop.** With the §9 BoolCoder header
-  tail now parsing (the §7.3 `Split` shift was corrected by errata #35 —
-  the spec prints `>> 7`, but the operative shift is `>> 8`, under which
-  probability 128 is the half-interval point and `1 ≤ Split ≤ Range − 1`
-  holds for every probability),
-  what remains is the per-MB driver that walks the macroblock grid
-  (mode decode → MV decode → coefficient decode → reconstruct →
-  assemble) and the `Decoder` registration. The **mode-decode stage**
-  of that driver now exists as
-  `mode_decode::decode_macroblock_modes` (raster-order MB walk,
-  `last_mode` threading, per-MB `ModeAvailability` resolution) and the
-  **per-MB MV-resolution stage** as
-  `mv_decode::reconstruct_macroblock_mv` (full single-vector path for
-  the nine non-FourMV modes, reading partition-1 delta bits only for the
-  `New` modes). The remaining work is fusing these into one partition-1
-  per-MB walk (mode then, in bitstream order, its MV — both live in the
-  §6 first data partition), wiring the `CODE_INTER_FOURMV` per-block MV
-  path (its four-block decode exists in `fourmv`; what is missing is the
-  spec-blessed MB-representative vector a FourMV MB contributes to a
-  *later* MB's neighbour list — a DOCS-GAP, see below), sequencing the
-  coefficient-decode / reconstruct stages behind it, and threading the
-  per-frame geometry (`VFragments` / `HFragments`) from the header tail
-  into the grid bounds. Every primitive that driver sequences already
-  exists.
+- **Fused inter (P-frame) per-MB driver + `Decoder` registration.** The
+  per-MB inter stages all exist independently —
+  `mode_decode::decode_macroblock_modes` (mode walk),
+  `mv_decode::reconstruct_macroblock_mv` (single-vector resolution),
+  `fourmv::reconstruct_fourmv_macroblock` (four-MV resolution),
+  `inter::reconstruct_inter_macroblock` (integer-MV reconstruction). The
+  remaining work is fusing them into one partition-1 per-MB walk (mode
+  then, in bitstream order, its MV, then the residual), plus golden-frame
+  bookkeeping, the §17.4 sub-pixel/loop-filter dispatch, and the
+  `Decoder` registration.
+- **DOCS-GAP — FourMV MB neighbour representative.** §10 defines the
+  Nearest/Near walk over "decoded macroblock neighbors" (one MV per
+  neighbour MB), but never states which of a `CODE_INTER_FOURMV` MB's
+  four per-block vectors (or what combination) represents it in a
+  *later* MB's `NearMacroBlocks` list, nor which it contributes as the
+  §11 differential reference for an immediately-right/below `New` MB.
+  `reconstruct_fourmv_macroblock` exposes all four vectors and defers
+  the choice rather than guess.
 - **High-bit-depth / scaling resampling math** and **sample-exact
   validation against a conformant `.vp6` bitstream** — the latter
   needs an encoder-produced fixture.

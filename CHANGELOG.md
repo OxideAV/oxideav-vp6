@@ -6,6 +6,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 339, 2026-06-19)
+
+- `intra_frame` — `decode_intra_frame` + `IntraProbs`: the full
+  intra-frame (I-frame) per-macroblock decode loop. Walks the MB grid in
+  raster order and, for each MB's six blocks (four luma raster
+  TL/TR/BL/BR, then U, then V — §13 page 58), runs the §13 coefficient
+  decode → §14 DC prediction → §15 dequant → §16 IDCT → §17.1
+  reconstruct → §2 raster-assembly chain, threading the §14/§13.2
+  left/above block-grid neighbours through explicit per-plane coded-DC
+  grids. Single BoolCoder partition (`MultiStream == 0`).
+- `fourmv` — `reconstruct_fourmv_macroblock` + `FourMvMacroblock`:
+  resolves a `CODE_INTER_FOURMV` macroblock's four per-block coding
+  modes (Table 10) and motion vectors (NoMv → `(0,0)`; PlusMv → §11.1
+  delta + §11 differential reference; Nearest/Near → MB-level §10 walk),
+  plus the derived chroma MV. Defers the FourMV MB-representative-MV
+  choice (a documented §10 DOCS-GAP).
+- `inter` — `reconstruct_inter_macroblock` + `RefPlane` +
+  `ReconstructedMacroblock`: §17.2/§17.3 integer-MV macroblock
+  reconstruction, driving the per-block §11.5-clamped prediction fetch +
+  §17 recombine across one MB's six blocks with the §11.4 luma/chroma
+  MV-shift split.
+
+### Fixed (round 339)
+
+- `idct` — the §16 inverse-DCT multiply now widens to `i64` before the
+  `>> 16` descale. A conformant §15-dequantized coefficient (≈ 2114 ×
+  376) times the Q16 cosine constant 64277 overflowed the previous
+  `i32` product; value-identical for non-overflowing inputs.
+
 ### Added (clean-room round 336, 2026-06-18)
 
 - `mv_decode` — `reconstruct_macroblock_mv`, the §10/§11 per-MB
