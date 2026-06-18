@@ -76,6 +76,10 @@
 //! third-party VP6 implementation has been consulted at any stage.
 
 use crate::bool_coder::BoolCoder;
+use crate::dc_pred::ReferenceBucket;
+use crate::modes::{CodingMode, MvSource};
+use crate::mv_diff::{reconstruct_diff_mv, select_diff_reference_mv};
+use crate::near_mv::{resolve_near_mvs, MotionVector, NeighbourMv};
 use crate::Error;
 
 /// Number of motion-vector axes (`x = 0`, `y = 1`).
@@ -389,6 +393,145 @@ pub fn decode_mv_pair(
     let dx = decode_mv_component(bc, &probs[MV_AXIS_X])?;
     let dy = decode_mv_component(bc, &probs[MV_AXIS_Y])?;
     Ok((dx, dy))
+}
+
+/// One macroblock's resolved motion state after the §10/§11 per-MB
+/// decode: the final reconstructed motion vector plus the
+/// [`ReferenceBucket`] the MB predicts from.
+///
+/// This is what the per-MB driver records into the motion-vector grid
+/// so that subsequent macroblocks' §10 Nearest/Near walks and §11
+/// differential-reference selection can see this MB as a decoded
+/// neighbour (`reference` feeds the same-reference filter; `mv` feeds
+/// the non-`(0,0)` predicate). It converts directly into a
+/// [`NeighbourMv`] via [`MacroblockMv::as_neighbour`].
+///
+/// Intra macroblocks (`CODE_INTRA`) carry no inter prediction, so their
+/// `mv` is `(0, 0)` and `reference` is [`ReferenceBucket::Intra`]; the
+/// §10 walker's same-reference filter then naturally excludes them from
+/// any inter MB's neighbour resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacroblockMv {
+    /// The final reconstructed motion vector in ¼-pel units.
+    pub mv: MotionVector,
+    /// The prediction-frame bucket this MB was coded against.
+    pub reference: ReferenceBucket,
+}
+
+impl MacroblockMv {
+    /// The intra outcome: `(0, 0)` MV against
+    /// [`ReferenceBucket::Intra`].
+    pub const INTRA: Self = Self {
+        mv: MotionVector::ZERO,
+        reference: ReferenceBucket::Intra,
+    };
+
+    /// Construct a [`MacroblockMv`] from its parts.
+    #[inline]
+    pub const fn new(mv: MotionVector, reference: ReferenceBucket) -> Self {
+        Self { mv, reference }
+    }
+
+    /// View this resolved MB as a [`NeighbourMv`] for the §10
+    /// Nearest/Near walker and the §11 differential-reference walker.
+    #[inline]
+    pub const fn as_neighbour(self) -> NeighbourMv {
+        NeighbourMv::new(self.mv, self.reference)
+    }
+}
+
+/// Resolve one macroblock's final motion vector and reference bucket
+/// for a single-vector §10 coding mode (everything except
+/// `CODE_INTER_FOURMV`), reading a §11.1 delta from the BoolCoder only
+/// when the mode is a *new*-MV mode.
+///
+/// Dispatches on the mode's [`MvSource`] classification
+/// ([`CodingMode::mv_source`]):
+///
+/// * [`MvSource::Intra`] — returns [`MacroblockMv::INTRA`]; **no bits
+///   read**.
+/// * [`MvSource::Zero`] (`CODE_INTER_NO_MV` / `CODE_USING_GOLDEN`) —
+///   the fixed `(0, 0)` MV against the mode's reference bucket; **no
+///   bits read**.
+/// * [`MvSource::New`] (`CODE_INTER_PLUS_MV` / `CODE_GOLDEN_MV`) — reads
+///   a §11.1 `(dx, dy)` delta with [`decode_mv_pair`], selects the §11
+///   differential reference MV (the nearest same-reference above/left
+///   neighbour, else `(0, 0)`) via
+///   [`select_diff_reference_mv`](crate::mv_diff::select_diff_reference_mv),
+///   and adds the two
+///   ([`reconstruct_diff_mv`](crate::mv_diff::reconstruct_diff_mv)).
+/// * [`MvSource::Nearest`] (`CODE_INTER_NEAREST_MV` /
+///   `CODE_GOLD_NEAREST_MV`) — reuses the §10 Nearest neighbour's MV;
+///   **no bits read**.
+/// * [`MvSource::Near`] (`CODE_INTER_NEAR_MV` / `CODE_GOLD_NEAR_MV`) —
+///   reuses the §10 Near neighbour's MV; **no bits read**.
+///
+/// The reference bucket is the mode's [`CodingMode::reference_bucket`].
+/// The §10 Nearest/Near walk and the §11 differential-reference walk
+/// both filter neighbours on this same bucket, so they receive it
+/// directly.
+///
+/// `neighbour_at` is the per-MB grid accessor — `(row, col)` →
+/// `Some(NeighbourMv)` for an already-decoded in-frame neighbour, else
+/// `None` — shared with [`crate::near_mv::resolve_near_mvs`] and
+/// [`crate::mv_diff::select_diff_reference_mv`]. The caller threads it
+/// over the MV grid built so far (typically a flat row-major
+/// `Vec<Option<NeighbourMv>>`).
+///
+/// # FourMV
+///
+/// `CODE_INTER_FOURMV` is **not** handled here: it carries four
+/// per-Y-block vectors whose per-block decode lives in
+/// [`crate::fourmv`], and the spec does not name which of the four
+/// luma vectors represents the MB in a *subsequent* MB's neighbour
+/// list (a DOCS-GAP). Passing a `FourMv` mode returns
+/// [`Error::NotImplemented`] so the caller routes it through the
+/// dedicated four-MV path rather than silently mis-resolving it.
+///
+/// # Errors
+///
+/// * [`Error::Truncated`] if the BoolCoder runs out of bytes while
+///   reading a `New`-mode delta.
+/// * [`Error::NotImplemented`] if `mode` is `CODE_INTER_FOURMV`.
+pub fn reconstruct_macroblock_mv<F>(
+    bc: &mut BoolCoder<'_>,
+    mode: CodingMode,
+    row: i32,
+    col: i32,
+    mv_probs: &[MvProbs; NUM_MV_AXES],
+    mut neighbour_at: F,
+) -> Result<MacroblockMv, Error>
+where
+    F: FnMut(i32, i32) -> Option<NeighbourMv>,
+{
+    let reference = mode.reference_bucket();
+    let mv = match mode.mv_source() {
+        MvSource::Intra => return Ok(MacroblockMv::INTRA),
+        MvSource::Zero => MotionVector::ZERO,
+        MvSource::New => {
+            // Read the §11.1 delta first (bitstream order), then resolve
+            // the §11 differential reference and add. The delta
+            // components are in [-127, 127] (the §11.1 magnitude cap),
+            // so they fit i16 and the sum fits i16 (proven in mv_diff).
+            let (dx, dy) = decode_mv_pair(bc, mv_probs)?;
+            let delta = MotionVector::new(dx as i16, dy as i16);
+            let reference_mv = select_diff_reference_mv(row, col, reference, &mut neighbour_at);
+            reconstruct_diff_mv(reference_mv, delta)
+        }
+        MvSource::Nearest => {
+            // Reuse the §10 Nearest neighbour's MV; undefined Nearest
+            // (no qualifying neighbour) falls back to (0, 0), the same
+            // "absolute" zero the §11 intro names for the new-MV case.
+            resolve_near_mvs(row, col, reference, &mut neighbour_at)
+                .nearest_mv
+                .unwrap_or(MotionVector::ZERO)
+        }
+        MvSource::Near => resolve_near_mvs(row, col, reference, &mut neighbour_at)
+            .near_mv
+            .unwrap_or(MotionVector::ZERO),
+        MvSource::FourMv => return Err(Error::NotImplemented),
+    };
+    Ok(MacroblockMv::new(mv, reference))
 }
 
 #[cfg(test)]
@@ -794,5 +937,264 @@ mod tests {
         // sensitive to the exact byte sequence — but it must be
         // in the valid signed-decoder range.
         assert!((-255..=255).contains(&signed));
+    }
+
+    // -------- reconstruct_macroblock_mv (per-MB §10/§11 resolution) --------
+
+    use crate::dc_pred::ReferenceBucket;
+    use crate::modes::CodingMode;
+    use crate::near_mv::NeighbourMv;
+
+    fn default_mv_probs() -> [MvProbs; NUM_MV_AXES] {
+        [MvProbs::defaults(MV_AXIS_X), MvProbs::defaults(MV_AXIS_Y)]
+    }
+
+    fn no_neighbours(_r: i32, _c: i32) -> Option<NeighbourMv> {
+        None
+    }
+
+    /// Intra mode resolves to the intra outcome and reads **no** bits.
+    #[test]
+    fn macroblock_mv_intra_reads_no_bits() {
+        let probs = default_mv_probs();
+        let stream = ones_stream(16);
+        let mut bc = BoolCoder::new(&stream).unwrap();
+        let (p0, r0, v0) = (bc.pos(), bc.range(), bc.value());
+        let out =
+            reconstruct_macroblock_mv(&mut bc, CodingMode::Intra, 3, 3, &probs, no_neighbours)
+                .unwrap();
+        assert_eq!(out, MacroblockMv::INTRA);
+        assert_eq!(out.reference, ReferenceBucket::Intra);
+        assert_eq!(out.mv, MotionVector::ZERO);
+        // No BoolCoder progress.
+        assert_eq!((bc.pos(), bc.range(), bc.value()), (p0, r0, v0));
+    }
+
+    /// `CODE_INTER_NO_MV` → (0,0) against InterLast, no bits read.
+    #[test]
+    fn macroblock_mv_zero_inter_last() {
+        let probs = default_mv_probs();
+        let stream = ones_stream(16);
+        let mut bc = BoolCoder::new(&stream).unwrap();
+        let (p0, r0, v0) = (bc.pos(), bc.range(), bc.value());
+        let out =
+            reconstruct_macroblock_mv(&mut bc, CodingMode::InterNoMv, 2, 2, &probs, no_neighbours)
+                .unwrap();
+        assert_eq!(out.mv, MotionVector::ZERO);
+        assert_eq!(out.reference, ReferenceBucket::InterLast);
+        assert_eq!((bc.pos(), bc.range(), bc.value()), (p0, r0, v0));
+    }
+
+    /// `CODE_USING_GOLDEN` → (0,0) against InterGolden, no bits read.
+    #[test]
+    fn macroblock_mv_zero_using_golden() {
+        let probs = default_mv_probs();
+        let stream = zero_stream(16);
+        let mut bc = BoolCoder::new(&stream).unwrap();
+        let out = reconstruct_macroblock_mv(
+            &mut bc,
+            CodingMode::UsingGolden,
+            2,
+            2,
+            &probs,
+            no_neighbours,
+        )
+        .unwrap();
+        assert_eq!(out.mv, MotionVector::ZERO);
+        assert_eq!(out.reference, ReferenceBucket::InterGolden);
+    }
+
+    /// `CODE_INTER_NEAREST_MV` reuses the §10 Nearest neighbour's MV
+    /// verbatim, reads no bits, and records InterLast.
+    #[test]
+    fn macroblock_mv_nearest_reuses_neighbour() {
+        let probs = default_mv_probs();
+        let stream = ones_stream(16);
+        let mut bc = BoolCoder::new(&stream).unwrap();
+        let (p0, r0, v0) = (bc.pos(), bc.range(), bc.value());
+        // Above neighbour (4,5) carries a non-zero InterLast MV.
+        let out =
+            reconstruct_macroblock_mv(&mut bc, CodingMode::InterNearestMv, 5, 5, &probs, |r, c| {
+                if (r, c) == (4, 5) {
+                    Some(NeighbourMv::new(
+                        MotionVector::new(12, -8),
+                        ReferenceBucket::InterLast,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(out.mv, MotionVector::new(12, -8));
+        assert_eq!(out.reference, ReferenceBucket::InterLast);
+        assert_eq!((bc.pos(), bc.range(), bc.value()), (p0, r0, v0));
+    }
+
+    /// `CODE_INTER_NEAREST_MV` with no qualifying neighbour falls back
+    /// to (0,0) (undefined Nearest → absolute zero).
+    #[test]
+    fn macroblock_mv_nearest_undefined_falls_back_to_zero() {
+        let probs = default_mv_probs();
+        let stream = ones_stream(16);
+        let mut bc = BoolCoder::new(&stream).unwrap();
+        let out = reconstruct_macroblock_mv(
+            &mut bc,
+            CodingMode::InterNearestMv,
+            0,
+            0,
+            &probs,
+            no_neighbours,
+        )
+        .unwrap();
+        assert_eq!(out.mv, MotionVector::ZERO);
+        assert_eq!(out.reference, ReferenceBucket::InterLast);
+    }
+
+    /// `CODE_GOLD_NEAR_MV` reuses the §10 Near (second) neighbour's MV
+    /// filtered on the Golden reference bucket.
+    #[test]
+    fn macroblock_mv_gold_near_uses_second_golden_neighbour() {
+        let probs = default_mv_probs();
+        let stream = zero_stream(16);
+        let mut bc = BoolCoder::new(&stream).unwrap();
+        // Two Golden neighbours: above (4,5) becomes Nearest, left
+        // (5,4) becomes Near; GOLD_NEAR must pick the left one.
+        let out = reconstruct_macroblock_mv(
+            &mut bc,
+            CodingMode::GoldNearMv,
+            5,
+            5,
+            &probs,
+            |r, c| match (r, c) {
+                (4, 5) => Some(NeighbourMv::new(
+                    MotionVector::new(3, 3),
+                    ReferenceBucket::InterGolden,
+                )),
+                (5, 4) => Some(NeighbourMv::new(
+                    MotionVector::new(-7, 9),
+                    ReferenceBucket::InterGolden,
+                )),
+                _ => None,
+            },
+        )
+        .unwrap();
+        assert_eq!(out.mv, MotionVector::new(-7, 9));
+        assert_eq!(out.reference, ReferenceBucket::InterGolden);
+    }
+
+    /// `CODE_INTER_PLUS_MV` reads a §11.1 delta and adds it to the §11
+    /// differential reference. With no neighbour the reference is
+    /// (0,0), so the result is exactly the decoded delta. The same
+    /// delta decoded standalone with `decode_mv_pair` must match, and
+    /// the BoolCoder must advance identically.
+    #[test]
+    fn macroblock_mv_plus_mv_absolute_equals_decoded_delta() {
+        let probs = default_mv_probs();
+        let stream = vec![0x9C, 0x42, 0xE7, 0x10, 0x55, 0xAA, 0x3B, 0xF1, 0x00, 0x00];
+
+        // Standalone delta decode for the reference value.
+        let mut bc_ref = BoolCoder::new(&stream).unwrap();
+        let (dx, dy) = decode_mv_pair(&mut bc_ref, &probs).unwrap();
+
+        // Via the per-MB resolver with no neighbours → absolute coding.
+        let mut bc = BoolCoder::new(&stream).unwrap();
+        let out = reconstruct_macroblock_mv(
+            &mut bc,
+            CodingMode::InterPlusMv,
+            0,
+            0,
+            &probs,
+            no_neighbours,
+        )
+        .unwrap();
+        assert_eq!(out.mv, MotionVector::new(dx as i16, dy as i16));
+        assert_eq!(out.reference, ReferenceBucket::InterLast);
+        // Same bits consumed.
+        assert_eq!(bc.pos(), bc_ref.pos());
+        assert_eq!(bc.value(), bc_ref.value());
+        assert_eq!(bc.range(), bc_ref.range());
+    }
+
+    /// `CODE_GOLDEN_MV` adds the decoded delta to a qualifying
+    /// above-neighbour differential reference (same Golden bucket).
+    #[test]
+    fn macroblock_mv_golden_mv_adds_to_diff_reference() {
+        let probs = default_mv_probs();
+        let stream = vec![0x9C, 0x42, 0xE7, 0x10, 0x55, 0xAA, 0x3B, 0xF1, 0x00, 0x00];
+
+        // Reference delta decoded standalone.
+        let mut bc_ref = BoolCoder::new(&stream).unwrap();
+        let (dx, dy) = decode_mv_pair(&mut bc_ref, &probs).unwrap();
+
+        let ref_mv = MotionVector::new(10, -6);
+        let mut bc = BoolCoder::new(&stream).unwrap();
+        let out = reconstruct_macroblock_mv(&mut bc, CodingMode::GoldenMv, 5, 5, &probs, |r, c| {
+            if (r, c) == (4, 5) {
+                Some(NeighbourMv::new(ref_mv, ReferenceBucket::InterGolden))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+        // final = reference + delta, per component.
+        assert_eq!(
+            out.mv,
+            MotionVector::new(ref_mv.x + dx as i16, ref_mv.y + dy as i16)
+        );
+        assert_eq!(out.reference, ReferenceBucket::InterGolden);
+    }
+
+    /// `CODE_INTER_FOURMV` is not handled by the single-vector
+    /// resolver and surfaces `Error::NotImplemented`.
+    #[test]
+    fn macroblock_mv_fourmv_is_not_implemented() {
+        let probs = default_mv_probs();
+        let stream = zero_stream(16);
+        let mut bc = BoolCoder::new(&stream).unwrap();
+        let err = reconstruct_macroblock_mv(
+            &mut bc,
+            CodingMode::InterFourMv,
+            2,
+            2,
+            &probs,
+            no_neighbours,
+        );
+        assert_eq!(err, Err(Error::NotImplemented));
+    }
+
+    /// A `New`-mode delta on a 4-byte stream eventually exhausts the
+    /// buffer → `Error::Truncated` propagates out of the resolver.
+    #[test]
+    fn macroblock_mv_new_truncation_propagates() {
+        let probs = default_mv_probs();
+        // Default IsMvShort probs (162/164) steer the long path on an
+        // all-zero short stream; a 4-byte stream can't satisfy the
+        // long-vector reads.
+        let mut bc = BoolCoder::new(&[0x00, 0x00, 0x00, 0x00]).unwrap();
+        let mut last = Ok(MacroblockMv::INTRA);
+        for _ in 0..64 {
+            last = reconstruct_macroblock_mv(
+                &mut bc,
+                CodingMode::InterPlusMv,
+                0,
+                0,
+                &probs,
+                no_neighbours,
+            );
+            if last.is_err() {
+                break;
+            }
+        }
+        assert_eq!(last, Err(Error::Truncated));
+    }
+
+    /// `as_neighbour` round-trips the resolved MV/reference into a
+    /// `NeighbourMv` for the next MB's grid.
+    #[test]
+    fn macroblock_mv_as_neighbour_round_trips() {
+        let m = MacroblockMv::new(MotionVector::new(5, -3), ReferenceBucket::InterGolden);
+        let n = m.as_neighbour();
+        assert_eq!(n.mv, MotionVector::new(5, -3));
+        assert_eq!(n.reference, ReferenceBucket::InterGolden);
     }
 }

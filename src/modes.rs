@@ -61,7 +61,53 @@
 //! Technologies, document version 1.02, August 2006). No third-party
 //! VP6 implementation has been consulted.
 
+use crate::dc_pred::ReferenceBucket;
 use core::fmt;
+
+/// How a §10 [`CodingMode`] sources its macroblock motion vector
+/// (spec §10 Table 4 / §11 intro).
+///
+/// Each of the ten coding modes pins its prediction MV to exactly one
+/// of five sources. This enum makes that classification explicit so the
+/// per-MB MV-decode pass (`crate::mv_decode::decode_macroblock_mvs`) can
+/// dispatch without re-deriving the mapping from the mode name:
+///
+/// * [`Zero`](MvSource::Zero) — `CODE_INTER_NO_MV` and
+///   `CODE_USING_GOLDEN`. The MV is the fixed `(0, 0)`; no bits are read
+///   and no neighbour is consulted (Table 4 rows 0 / 5).
+/// * [`New`](MvSource::New) — `CODE_INTER_PLUS_MV` and
+///   `CODE_GOLDEN_MV`. A fresh `(dx, dy)` delta pair is §11.1-decoded
+///   and added to the §11-intro differential reference MV (the nearest
+///   same-reference above/left neighbour, else `(0, 0)`).
+/// * [`Nearest`](MvSource::Nearest) — `CODE_INTER_NEAREST_MV` and
+///   `CODE_GOLD_NEAREST_MV`. The MV is reused verbatim from the §10
+///   **Nearest** neighbour (first non-`(0,0)` same-reference neighbour
+///   in [`NEAR_MACROBLOCKS`] order); no bits are read.
+/// * [`Near`](MvSource::Near) — `CODE_INTER_NEAR_MV` and
+///   `CODE_GOLD_NEAR_MV`. The MV is reused verbatim from the §10
+///   **Near** neighbour (second such neighbour); no bits are read.
+/// * [`FourMv`](MvSource::FourMv) — `CODE_INTER_FOURMV`. The MB carries
+///   four per-Y-block vectors, each independently §10-coded, with the
+///   two chroma MVs derived as their rounding-away-from-zero average
+///   (see `crate::fourmv`).
+/// * [`Intra`](MvSource::Intra) — `CODE_INTRA`. The MB carries no
+///   prediction and therefore no motion vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MvSource {
+    /// Fixed `(0, 0)` motion vector; no bits read, no neighbour.
+    Zero,
+    /// A freshly §11.1-decoded delta added to the §11 differential
+    /// reference.
+    New,
+    /// The §10 Nearest neighbour's motion vector, reused verbatim.
+    Nearest,
+    /// The §10 Near neighbour's motion vector, reused verbatim.
+    Near,
+    /// Four independently-coded per-Y-block vectors (`CODE_INTER_FOURMV`).
+    FourMv,
+    /// No motion vector (the intra mode carries no prediction).
+    Intra,
+}
 
 /// Number of macroblock coding modes the spec defines (§10 Table 4).
 ///
@@ -211,6 +257,43 @@ impl CodingMode {
     #[inline]
     pub const fn carries_new_mv(self) -> bool {
         matches!(self, Self::InterPlusMv | Self::GoldenMv | Self::InterFourMv)
+    }
+
+    /// The §14 / §10 [`ReferenceBucket`] this mode predicts from.
+    ///
+    /// Per Table 4: `CODE_INTRA` is intra (no inter prediction); the
+    /// four `*_GOLD*` / `CODE_USING_GOLDEN` / `CODE_GOLDEN_MV` modes
+    /// predict from the Golden Frame ([`ReferenceBucket::InterGolden`]);
+    /// every other mode predicts from the previous-frame reconstruction
+    /// ([`ReferenceBucket::InterLast`]). This is the bucket the per-MB
+    /// MV / DC-prediction passes record for the MB so that later
+    /// neighbours filter on it via the same-reference rule.
+    #[inline]
+    pub const fn reference_bucket(self) -> ReferenceBucket {
+        if self.is_intra() {
+            ReferenceBucket::Intra
+        } else if self.uses_golden() {
+            ReferenceBucket::InterGolden
+        } else {
+            ReferenceBucket::InterLast
+        }
+    }
+
+    /// How this mode sources its motion vector (spec §10 Table 4).
+    ///
+    /// Maps each of the ten modes to one of the six [`MvSource`]
+    /// classes the per-MB MV-decode pass dispatches on. See [`MvSource`]
+    /// for the per-class behaviour.
+    #[inline]
+    pub const fn mv_source(self) -> MvSource {
+        match self {
+            Self::InterNoMv | Self::UsingGolden => MvSource::Zero,
+            Self::InterPlusMv | Self::GoldenMv => MvSource::New,
+            Self::InterNearestMv | Self::GoldNearestMv => MvSource::Nearest,
+            Self::InterNearMv | Self::GoldNearMv => MvSource::Near,
+            Self::InterFourMv => MvSource::FourMv,
+            Self::Intra => MvSource::Intra,
+        }
     }
 }
 
@@ -769,6 +852,67 @@ mod tests {
         for mode in CodingMode::ALL.iter() {
             assert_eq!(mode.carries_new_mv(), new_mv.contains(mode), "{}", mode);
         }
+    }
+
+    #[test]
+    fn reference_bucket_matches_table_4() {
+        let golden = [
+            CodingMode::UsingGolden,
+            CodingMode::GoldenMv,
+            CodingMode::GoldNearestMv,
+            CodingMode::GoldNearMv,
+        ];
+        for mode in CodingMode::ALL.iter() {
+            let expected = if *mode == CodingMode::Intra {
+                ReferenceBucket::Intra
+            } else if golden.contains(mode) {
+                ReferenceBucket::InterGolden
+            } else {
+                ReferenceBucket::InterLast
+            };
+            assert_eq!(mode.reference_bucket(), expected, "{}", mode);
+        }
+    }
+
+    #[test]
+    fn mv_source_classifies_every_mode() {
+        // Spec §10 Table 4 mode → MV-source mapping, pinned exhaustively.
+        let cases = [
+            (CodingMode::InterNoMv, MvSource::Zero),
+            (CodingMode::Intra, MvSource::Intra),
+            (CodingMode::InterPlusMv, MvSource::New),
+            (CodingMode::InterNearestMv, MvSource::Nearest),
+            (CodingMode::InterNearMv, MvSource::Near),
+            (CodingMode::UsingGolden, MvSource::Zero),
+            (CodingMode::GoldenMv, MvSource::New),
+            (CodingMode::InterFourMv, MvSource::FourMv),
+            (CodingMode::GoldNearestMv, MvSource::Nearest),
+            (CodingMode::GoldNearMv, MvSource::Near),
+        ];
+        // Every mode is covered exactly once.
+        assert_eq!(cases.len(), CodingMode::ALL.len());
+        for (mode, source) in cases {
+            assert_eq!(mode.mv_source(), source, "{}", mode);
+        }
+    }
+
+    /// `mv_source() == New` iff the mode reads a fresh MB-level delta —
+    /// i.e. the single-vector subset of `carries_new_mv()` (which also
+    /// includes the per-block FourMV case).
+    #[test]
+    fn mv_source_new_agrees_with_carries_new_mv_single_vector() {
+        for mode in CodingMode::ALL.iter() {
+            let is_new = mode.mv_source() == MvSource::New;
+            // New-source modes carry a new MV; FourMV carries new MVs
+            // too but is classified separately as FourMv.
+            if is_new {
+                assert!(mode.carries_new_mv(), "{}", mode);
+                assert_ne!(*mode, CodingMode::InterFourMv);
+            }
+        }
+        // FourMV carries new MVs but is NOT MvSource::New.
+        assert!(CodingMode::InterFourMv.carries_new_mv());
+        assert_eq!(CodingMode::InterFourMv.mv_source(), MvSource::FourMv);
     }
 
     #[test]

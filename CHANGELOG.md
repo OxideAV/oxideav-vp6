@@ -6,6 +6,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 336, 2026-06-18)
+
+- `mv_decode` — `reconstruct_macroblock_mv`, the §10/§11 per-MB
+  motion-vector resolution stage that sequences behind the round-331
+  mode-decode pass. Given one MB's decoded `CodingMode`, its `(row,
+  col)`, the per-axis `[MvProbs; 2]` bank and a neighbour-grid accessor,
+  it dispatches on the mode's `MvSource`: `Intra`/`Zero`
+  (`CODE_INTRA` / `CODE_INTER_NO_MV` / `CODE_USING_GOLDEN`) resolve to
+  `(0,0)` reading **no** BoolCoder bits; `New` (`CODE_INTER_PLUS_MV` /
+  `CODE_GOLDEN_MV`) reads a §11.1 `(dx,dy)` delta with `decode_mv_pair`,
+  selects the §11 differential reference MV
+  (`mv_diff::select_diff_reference_mv`), and adds them
+  (`reconstruct_diff_mv`); `Nearest`/`Near` reuse the §10 neighbour
+  walk (`near_mv::resolve_near_mvs`), falling back to `(0,0)` when the
+  Nearest/Near vector is undefined. Returns a `MacroblockMv`
+  (`MotionVector` + `ReferenceBucket`) with an `as_neighbour` view that
+  feeds the next MB's neighbour grid. `CODE_INTER_FOURMV` returns
+  `Error::NotImplemented` (its MB-representative neighbour vector is a
+  DOCS-GAP). Sourced exclusively from `docs/video/vp6/vp6_format.pdf`
+  §10 (Table 4) / §11 (intro + §11.1) and the staged errata #35.
+- `modes` — `CodingMode::reference_bucket` (Table 4 mode →
+  `ReferenceBucket`: intra / Golden / previous-frame) and
+  `CodingMode::mv_source` + the `MvSource` enum (mode → one of
+  `Zero` / `New` / `Nearest` / `Near` / `FourMv` / `Intra`), the
+  classifiers the per-MB MV resolver dispatches on.
+
 ### Added (clean-room round 331, 2026-06-18)
 
 - `mode_decode` — `decode_macroblock_modes`, the §10 frame-level

@@ -54,7 +54,16 @@ a no-op. It is a primitive library, not a wired codec.
   raster-order macroblock mode-decode pass
   (`mode_decode::decode_macroblock_modes` — threads `last_mode` and
   per-MB `ModeAvailability` across the MB grid; the first stage of the
-  per-MB driver), and the §9 output-scaling surface (`scaling`).
+  per-MB driver), the §10/§11 per-MB **motion-vector resolution**
+  (`mv_decode::reconstruct_macroblock_mv` — dispatches a decoded
+  [`CodingMode`] on its `MvSource` class: `Zero`/`Intra` read no bits,
+  `New` reads a §11.1 delta and adds it to the §11 differential
+  reference, `Nearest`/`Near` reuse the §10 neighbour walk; returns the
+  final `MotionVector` + `ReferenceBucket` as a `MacroblockMv` ready to
+  feed the next MB's neighbour grid via `as_neighbour`), the §10 Table 4
+  mode→reference and mode→MV-source classifiers
+  (`CodingMode::reference_bucket` / `mv_source`), and the §9
+  output-scaling surface (`scaling`).
 - **Frame assembly** (`frame_assembly`) — block-to-plane raster
   placement of reconstructed 8×8 blocks into a YUV 4:2:0 image.
 
@@ -70,12 +79,20 @@ a no-op. It is a primitive library, not a wired codec.
   assemble) and the `Decoder` registration. The **mode-decode stage**
   of that driver now exists as
   `mode_decode::decode_macroblock_modes` (raster-order MB walk,
-  `last_mode` threading, per-MB `ModeAvailability` resolution); the
-  remaining work is sequencing the MV-decode / coefficient-decode /
-  reconstruct stages behind it into the same partition-walking loop and
-  threading the per-frame geometry (`VFragments` / `HFragments`) from
-  the header tail into the grid bounds. Every primitive that driver
-  sequences already exists.
+  `last_mode` threading, per-MB `ModeAvailability` resolution) and the
+  **per-MB MV-resolution stage** as
+  `mv_decode::reconstruct_macroblock_mv` (full single-vector path for
+  the nine non-FourMV modes, reading partition-1 delta bits only for the
+  `New` modes). The remaining work is fusing these into one partition-1
+  per-MB walk (mode then, in bitstream order, its MV — both live in the
+  §6 first data partition), wiring the `CODE_INTER_FOURMV` per-block MV
+  path (its four-block decode exists in `fourmv`; what is missing is the
+  spec-blessed MB-representative vector a FourMV MB contributes to a
+  *later* MB's neighbour list — a DOCS-GAP, see below), sequencing the
+  coefficient-decode / reconstruct stages behind it, and threading the
+  per-frame geometry (`VFragments` / `HFragments`) from the header tail
+  into the grid bounds. Every primitive that driver sequences already
+  exists.
 - **High-bit-depth / scaling resampling math** and **sample-exact
   validation against a conformant `.vp6` bitstream** — the latter
   needs an encoder-produced fixture.
