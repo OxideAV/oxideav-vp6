@@ -221,6 +221,77 @@ pub fn decode_mode_from_probs(
     decode_mode(bc, prob_mode_same, last_mode, &stats)
 }
 
+/// Decode every macroblock's [`CodingMode`] for one P-frame, walking
+/// the MB grid in spec raster order (§13: *"macroblocks are encoded in
+/// raster order within a video image"*).
+///
+/// This is the §10 frame-level mode pass — the first stage of the
+/// per-MB decode driver. It threads the two pieces of state that
+/// `VP6_DecodeMode` carries across the grid:
+///
+/// * **`last_mode`** — the previously-coded MB's mode, which feeds the
+///   root `B(probModeSame[type][lastmode])` "same as last" decision and
+///   the `ModeDecisionTree[type][lastmode]` row selection
+///   (`decode_mode_from_probs`). It advances to each MB's just-decoded
+///   mode after that MB is read. The caller supplies the seed
+///   `initial_last_mode` for the first MB (the spec does not print an
+///   explicit first-MB seed; the natural seed is `CODE_INTER_NO_MV`,
+///   the index-0 mode, but that choice is the caller's so this routine
+///   stays free of an unstated constant).
+/// * **`ModeAvailability`** — the §10 Table 5 ProbabilitySituation row
+///   (`type`), which the spec defines as "the ModeAvailability for the
+///   macroblock we are about to decode": whether the Nearest and Near
+///   MVs exist for this MB. Resolving it requires walking the already-
+///   decoded `NearMacroblocks[12]` neighbours filtered on the *current*
+///   MB's reference frame — a resolution whose reference-ordering the
+///   spec couples to the mode being decoded, so it is delegated to the
+///   caller-supplied `availability_at` closure (typically backed by
+///   [`near_mv::resolve_near_mvs_from_grid`](crate::near_mv::resolve_near_mvs_from_grid)
+///   over the MV grid built so far). The closure receives the MB's
+///   `(row, col)` in macroblock units.
+///
+/// The grid is visited row-major: `(0,0), (0,1), … (0, mb_cols-1),
+/// (1,0), …`. For each MB the mode is decoded with
+/// [`decode_mode_from_probs`] against the per-frame `prob_xmitted`
+/// table (the adapted `probXmitted[3][20]` bank that round 32's
+/// [`mode_prob_update`](crate::mode_prob_update) mutates), and the
+/// decoded mode is appended to the returned `Vec` in raster order and
+/// becomes `last_mode` for the next MB.
+///
+/// The returned `Vec` has exactly `mb_cols * mb_rows` entries. An empty
+/// grid (`mb_cols == 0` or `mb_rows == 0`) returns an empty `Vec`
+/// without reading any BoolCoder bits.
+///
+/// This pass decodes only the **modes**; the per-MB MV decode, the
+/// FourMV block-mode sub-pass, coefficient decode and reconstruction
+/// are sequenced by the surrounding driver. It is factored out because
+/// the availability of MB *N+1* depends on the MVs decoded for MBs
+/// `0..=N`, which the caller materialises into the grid that
+/// `availability_at` reads.
+pub fn decode_macroblock_modes<F>(
+    bc: &mut BoolCoder,
+    prob_xmitted: &[[u8; PROB_XMITTED_ROW_LEN]; NUM_PROBABILITY_SITUATIONS],
+    mb_cols: usize,
+    mb_rows: usize,
+    initial_last_mode: CodingMode,
+    mut availability_at: F,
+) -> Result<Vec<CodingMode>, Error>
+where
+    F: FnMut(usize, usize) -> ModeAvailability,
+{
+    let mut modes = Vec::with_capacity(mb_cols.saturating_mul(mb_rows));
+    let mut last_mode = initial_last_mode;
+    for row in 0..mb_rows {
+        for col in 0..mb_cols {
+            let availability = availability_at(row, col);
+            let mode = decode_mode_from_probs(bc, prob_xmitted, availability, last_mode)?;
+            modes.push(mode);
+            last_mode = mode;
+        }
+    }
+    Ok(modes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +575,165 @@ mod tests {
         // only assert the same-as-last path returns last_mode.
         let _ = same_pos_progress;
         assert!(descend.pos() >= 4);
+    }
+
+    // -------- decode_macroblock_modes (frame-level pass) --------
+
+    #[test]
+    fn grid_pass_empty_grid_reads_no_bits() {
+        // A 0-column or 0-row grid yields an empty Vec and consumes no
+        // BoolCoder bits (pos/range/value untouched from init).
+        for (cols, rows) in [(0usize, 4usize), (4, 0), (0, 0)] {
+            let mut bc = zero_coder();
+            let (p0, r0, v0) = (bc.pos(), bc.range(), bc.value());
+            let modes = decode_macroblock_modes(
+                &mut bc,
+                &VP6_BASELINE_XMITTED_PROBS,
+                cols,
+                rows,
+                CodingMode::InterNoMv,
+                |_, _| ModeAvailability::NearestAndNear,
+            )
+            .unwrap();
+            assert!(modes.is_empty());
+            assert_eq!((bc.pos(), bc.range(), bc.value()), (p0, r0, v0));
+        }
+    }
+
+    #[test]
+    fn grid_pass_returns_one_mode_per_macroblock_in_raster_order() {
+        // On the zero stream every node bit is 0, so each MB decodes the
+        // leftmost reachable leaf. The grid must have exactly
+        // cols*rows entries and the per-MB availability closure must be
+        // queried once per MB in raster order.
+        let (cols, rows) = (3usize, 2usize);
+        let mut visited: Vec<(usize, usize)> = Vec::new();
+        let mut bc = zero_coder();
+        let modes = decode_macroblock_modes(
+            &mut bc,
+            &VP6_BASELINE_XMITTED_PROBS,
+            cols,
+            rows,
+            CodingMode::InterNoMv,
+            |r, c| {
+                visited.push((r, c));
+                ModeAvailability::NearestAndNear
+            },
+        )
+        .unwrap();
+        assert_eq!(modes.len(), cols * rows);
+        assert_eq!(
+            visited,
+            vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2),]
+        );
+        // Every entry is a canonical mode.
+        for m in &modes {
+            assert!(CodingMode::ALL.contains(m));
+        }
+    }
+
+    #[test]
+    fn grid_pass_threads_last_mode_same_as_last() {
+        // Force the root "same as last" bit to 1 for every MB (ones
+        // stream + prob 1 -> bit 1): every MB must repeat the seed mode,
+        // so the whole grid is the seed.
+        //
+        // The grid pass derives prob_mode_same from the table, so to pin
+        // the "same as last" branch deterministically we use a hand
+        // table whose probModeSame is small enough that the ones stream
+        // takes the 1 branch. `VP6_BASELINE_XMITTED_PROBS[*][i*2]` is
+        // the raw count; probModeSame = 255 - 255*x. We instead confirm
+        // threading structurally: the first MB sees `seed`, and on the
+        // zero stream the decoded sequence is reproducible, with each
+        // MB's decode fed the prior MB's decoded mode as last_mode.
+        //
+        // Concretely: run the pass, then replay MB-by-MB with the same
+        // coder fed each prior decoded mode, and require equality.
+        let (cols, rows) = (2usize, 2usize);
+        let seed = CodingMode::GoldenMv;
+
+        let mut bc_pass = zero_coder();
+        let from_pass = decode_macroblock_modes(
+            &mut bc_pass,
+            &VP6_BASELINE_XMITTED_PROBS,
+            cols,
+            rows,
+            seed,
+            |_, _| ModeAvailability::NearestOnly,
+        )
+        .unwrap();
+
+        // Manual replay with explicit last_mode threading.
+        let mut bc_manual = zero_coder();
+        let mut last = seed;
+        let mut manual = Vec::new();
+        for _ in 0..(cols * rows) {
+            let m = decode_mode_from_probs(
+                &mut bc_manual,
+                &VP6_BASELINE_XMITTED_PROBS,
+                ModeAvailability::NearestOnly,
+                last,
+            )
+            .unwrap();
+            manual.push(m);
+            last = m;
+        }
+        assert_eq!(from_pass, manual);
+        // BoolCoder must have advanced identically.
+        assert_eq!(bc_pass.pos(), bc_manual.pos());
+        assert_eq!(bc_pass.value(), bc_manual.value());
+    }
+
+    #[test]
+    fn grid_pass_availability_selects_prob_row() {
+        // The availability returned by the closure must reach
+        // decode_mode_from_probs: a single-MB grid decoded with a fixed
+        // availability must equal the standalone call for that
+        // availability + seed last_mode.
+        for availability in ModeAvailability::ALL {
+            let seed = CodingMode::InterPlusMv;
+            let mut bc_pass = zero_coder();
+            let from_pass = decode_macroblock_modes(
+                &mut bc_pass,
+                &VP6_BASELINE_XMITTED_PROBS,
+                1,
+                1,
+                seed,
+                |_, _| availability,
+            )
+            .unwrap();
+
+            let mut bc_ref = zero_coder();
+            let reference = decode_mode_from_probs(
+                &mut bc_ref,
+                &VP6_BASELINE_XMITTED_PROBS,
+                availability,
+                seed,
+            )
+            .unwrap();
+            assert_eq!(from_pass, vec![reference]);
+            assert_eq!(bc_pass.pos(), bc_ref.pos());
+            assert_eq!(bc_pass.value(), bc_ref.value());
+        }
+    }
+
+    #[test]
+    fn grid_pass_truncation_propagates() {
+        // A 4-byte all-zero stream with a large grid + small-prob row
+        // forces renormalization byte pulls that eventually exhaust the
+        // buffer; the error must propagate out of the pass.
+        let mut bc = BoolCoder::new(&[0x00, 0x00, 0x00, 0x00]).unwrap();
+        let result = decode_macroblock_modes(
+            &mut bc,
+            &VP6_BASELINE_XMITTED_PROBS,
+            64,
+            64,
+            CodingMode::Intra,
+            |_, _| ModeAvailability::Neither,
+        );
+        assert!(
+            result.is_err(),
+            "exhausting the 4-byte stream over a large grid must surface Error::Truncated"
+        );
     }
 }
