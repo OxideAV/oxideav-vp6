@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 343, 2026-06-20)
 
+- `inter_frame` — `decode_inter_frame` + `InterProbs` + `BorderedRef` +
+  `FilterConfig`: the **fused inter (P-frame) per-macroblock decode
+  loop**, the inter-frame analogue of `decode_intra_frame`. Walks the MB
+  grid in §8 single-stream order, decoding per MB the §10 coding mode
+  (against the per-frame `probXmitted` bank + §10 Nearest/Near
+  availability resolved from the MV grid built so far), the §11 motion
+  state (single-vector via `reconstruct_macroblock_mv`, FourMV via
+  `reconstruct_fourmv_macroblock`, or none for intra), the six §13 block
+  coefficients with §14 DC prediction, and §17 reconstruction (intra →
+  §17.1 `+128`; inter → `predict_inter_block_subpel` motion compensation
+  against the previous-frame/golden-frame `BorderedRef` + §17.2/§17.3/
+  §17.4 recombine). Threads the §14 DC neighbour grid (now carrying each
+  block's `ReferenceBucket` for the same-reference filter) and the
+  §10/§11 MV neighbour grid across the walk. P-frames now decode
+  end-to-end to real pixels. FourMV MBs reconstruct their pixels
+  correctly but contribute no neighbour-representative MV (documented
+  §10 DOCS-GAP).
 - `inter` — `predict_inter_block_subpel` + `PredictionFilterPolicy` +
   `FilterFamily`: the full §17.4 fractional-pixel motion-compensation
   block predictor. Decomposes the MV into its §11.4 whole-sample-aligned
