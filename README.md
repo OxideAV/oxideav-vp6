@@ -12,12 +12,18 @@ Specification" (document version 1.02, August 2006), staged at
 `docs/video/vp6/vp6-errata-and-clarifications.md`. No third-party VP6
 source has been consulted at any stage.
 
-Almost every decode primitive is implemented and unit-tested, but the
-crate now exposes a **full intra-frame (I-frame) decoder**
-(`decode_intra_frame`) that drives an entire keyframe end-to-end to
-output pixels, but does **not yet** drive the inter (P-frame) loop or
-**register a `Decoder` with `oxideav-core`** — `register()` is currently
-a no-op.
+Almost every decode primitive is implemented and unit-tested. The crate
+exposes a **full intra-frame (I-frame) decoder** (`decode_intra_frame`)
+**and** a **full inter-frame (P-frame) decoder** (`decode_inter_frame` /
+`decode_inter_frame_with_refs`), both driving an entire frame end-to-end
+to output pixels — the P-frame path fuses the §10 mode walk, §11 motion
+resolution (single-vector + FourMV), §13 coefficient decode, §14 DC
+prediction and §17.2/§17.3/§17.4 reconstruction (including the §11.3
+prediction loop filter and §11.4 sub-pixel filter-family dispatch), with
+§4 golden-frame bookkeeping (`ReferenceFrames`). What remains is the
+top-level per-frame assembly (§9 header → §10/§11.2/§13 probability-update
+sub-streams → frame dispatch) and **registering a `Decoder` with
+`oxideav-core`** — `register()` is currently a no-op.
 
 ### Implemented stages
 
@@ -87,31 +93,47 @@ a no-op.
   `i32::MAX`, so the multiply now widens to `i64` before the `>> 16`
   descale.
 
-### Inter (P-frame) path — partially wired
+### Inter (P-frame) path — decodes end-to-end to pixels
 
-- **`fourmv::reconstruct_fourmv_macroblock`** resolves a
-  `CODE_INTER_FOURMV` macroblock's full motion state: the four Table 10
-  per-block coding modes, each block's resolved MV (NoMv → `(0,0)`;
-  PlusMv → §11.1 delta + §11 differential reference; Nearest/Near → the
-  MB-level §10 neighbour walk), and the derived chroma MV.
-- **`inter::reconstruct_inter_macroblock`** is the §17.2/§17.3
-  integer-MV MB-level glue: per-block §11.5-clamped prediction fetch +
-  §17 recombine across one MB's six blocks, with the §11.4 luma/chroma
-  MV-shift split. The §17.4 sub-pixel path routes through the existing
-  `interp` filters.
+- **`inter_frame::decode_inter_frame`** is the **fused P-frame driver**.
+  It walks the macroblock grid in §8 single-stream bitstream order and,
+  per MB, decodes the §10 coding mode (against the per-frame `probXmitted`
+  bank + §10 Nearest/Near availability from the MV grid built so far), the
+  §11 motion state (single-vector via
+  `mv_decode::reconstruct_macroblock_mv`, FourMV via
+  `fourmv::reconstruct_fourmv_macroblock`, or none for intra), the six §13
+  block coefficients with §14 DC prediction, and §17 reconstruction —
+  intra MBs via §17.1 (`+128`), inter MBs by motion-compensating against
+  the previous/golden `BorderedRef` and recombining (§17.2/§17.3/§17.4).
+  The §14 DC neighbour grid carries each block's reference bucket so the
+  same-reference filter is meaningful in a P-frame mixing intra/last/
+  golden blocks. `decode_inter_frame_with_refs` threads a
+  `ReferenceFrames` directly.
+- **`inter::predict_inter_block_subpel`** is the §17.4 fractional-pixel
+  block predictor: §11.4 whole/fractional MV decomposition, the §11.3
+  prediction loop filter at the straddled `BoundaryX`/`BoundaryY` edges
+  (to a separate working window per §11.3), then §11.4 bilinear/bicubic
+  interpolation. `PredictionFilterPolicy` resolves the §11.4
+  `AutoSelectPMFlag` decision (fixed family, or per-block auto-select from
+  the MV-size and `Var16Point` variance thresholds).
+- **`inter_frame::ReferenceFrames`** is the §4 golden-frame bookkeeping:
+  previous-frame + Golden Frame buffers with the §4 update rules (seed
+  Golden from an I-frame; refresh it on `RefreshGoldenFrame`).
+- **`inter::reconstruct_inter_macroblock`** remains the §17.2/§17.3
+  integer-MV MB-level glue (per-block §11.5-clamped fetch + §17
+  recombine).
 
-### Blocked
+### Blocked / remaining
 
-- **Fused inter (P-frame) per-MB driver + `Decoder` registration.** The
-  per-MB inter stages all exist independently —
-  `mode_decode::decode_macroblock_modes` (mode walk),
-  `mv_decode::reconstruct_macroblock_mv` (single-vector resolution),
-  `fourmv::reconstruct_fourmv_macroblock` (four-MV resolution),
-  `inter::reconstruct_inter_macroblock` (integer-MV reconstruction). The
-  remaining work is fusing them into one partition-1 per-MB walk (mode
-  then, in bitstream order, its MV, then the residual), plus golden-frame
-  bookkeeping, the §17.4 sub-pixel/loop-filter dispatch, and the
-  `Decoder` registration.
+- **Top-level `Decoder` registration** — the per-frame assembly chain
+  (§9 header parse → §10 mode-prob updates → §11.2 MV-prob updates → §13
+  Figure-5 coefficient-prob updates / §12 scan updates → intra/P-frame
+  dispatch) and the registered `Decoder` shell over it. Each stage exists
+  (`frame_header`, `mode_prob_update`, `mv_prob_update`, `prob_update`,
+  `scan_update`, `decode_intra_frame`, `decode_inter_frame`); the
+  remaining work is sequencing them in the exact Figure-1/Figure-5
+  bitstream order, which wants a conformant `.vp6` fixture to validate the
+  parse order against.
 - **DOCS-GAP — FourMV MB neighbour representative.** §10 defines the
   Nearest/Near walk over "decoded macroblock neighbors" (one MV per
   neighbour MB), but never states which of a `CODE_INTER_FOURMV` MB's
