@@ -507,6 +507,297 @@ pub fn reconstruct_inter_macroblock(
     ReconstructedMacroblock { luma, u, v }
 }
 
+// ===================================================================
+// §17.4 sub-pixel prediction with §11.3 loop filtering and §11.4
+// filter-family selection. This is the full fractional-pixel motion-
+// compensation path that the fused inter (P-frame) driver dispatches
+// to, sitting above the integer-only [`reconstruct_inter_macroblock`].
+// ===================================================================
+
+use crate::interp::{
+    bicubic_block, bilinear_block, var_16_point, BICUBIC_FILTER_SET, BILINEAR_CHROMA_FILTERS,
+    BILINEAR_LUMA_FILTERS,
+};
+use crate::loopfilter::{
+    boundary_x, boundary_y, filter_horizontal_boundary, filter_vertical_boundary,
+};
+
+/// Which §11.4 interpolation-filter family the decoder applies for a
+/// fractional-pixel prediction block.
+///
+/// In Simple Profile only [`Bilinear`](FilterFamily::Bilinear) is ever
+/// used (§11.4: "In Simple Profile Bicubic filtering is not allowed").
+/// In Advanced Profile the header's `AutoSelectPMFlag` either fixes the
+/// family for the whole frame (`BiCubicOrBiLinearFiltFlag`) or auto-
+/// selects per block from the §11.4 motion-vector-size and prediction-
+/// block-variance thresholds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterFamily {
+    /// 2-tap bilinear (§11.4.1).
+    Bilinear,
+    /// 4-tap bicubic (§11.4.2), with the alpha-set index (`0..=16`) into
+    /// [`BICUBIC_FILTER_SET`]: a VP6.1 stream uses
+    /// [`BICUBIC_VP61_INDEX`](crate::interp::BICUBIC_VP61_INDEX) (16), a
+    /// VP6.2 stream the header's `PredictionFilterAlpha` (0..=15).
+    Bicubic {
+        /// Index into [`BICUBIC_FILTER_SET`]'s outer dimension.
+        alpha: usize,
+    },
+}
+
+/// The frame-level §11.4 prediction-filter policy, resolved from the §9
+/// header tail's [`PredictionFilter`](crate::frame_header::PredictionFilter)
+/// plus the coding profile and VP6 version.
+///
+/// This captures the *frame* decision; the per-block family is derived
+/// from it (and, for the auto-select case, the block's MV and reference
+/// variance) by [`PredictionFilterPolicy::select`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredictionFilterPolicy {
+    /// A single family is used for every fractional-pixel block this
+    /// frame (`AutoSelectPMFlag == 0`, or Simple Profile which is always
+    /// bilinear).
+    Fixed(FilterFamily),
+    /// `AutoSelectPMFlag == 1`: pick bilinear vs bicubic per block from
+    /// the §11.4 MV-size threshold and prediction-block variance
+    /// threshold.
+    AutoSelect {
+        /// `FilterMvSizeThresh` already converted to ¼-pixel units per
+        /// §11.4 (`(1 << (thresh-1)) << 2`, or the no-restriction value
+        /// when the header field is `0`).
+        mv_size_thresh_qpel: i32,
+        /// `FilterVarThresh` — the prediction-block-variance threshold
+        /// at or above which bicubic is used. A value of `0` means "no
+        /// variance test, always bicubic" (§11.4).
+        var_thresh: i32,
+        /// The bicubic alpha-set index used when bicubic is selected.
+        alpha: usize,
+    },
+}
+
+impl PredictionFilterPolicy {
+    /// Largest MV component magnitude (¼-pixel units) the §11.4 "no
+    /// motion vector length restriction" branch admits:
+    /// `((MAX_MV_EXTENT >> 1) + 1) << 2`. `MAX_MV_EXTENT` is the §11.1
+    /// long-vector cap of 2047 (the 11-bit `dx`/`dy` magnitude limit), so
+    /// this evaluates to `((2047 >> 1) + 1) << 2 == 4096`, comfortably
+    /// above any reachable VP6 MV component.
+    pub const NO_MV_RESTRICTION_QPEL: i32 = ((2047 >> 1) + 1) << 2;
+
+    /// Resolve the per-block [`FilterFamily`] for a block whose
+    /// fractional-pixel MV components are `(mv_x, mv_y)` (¼-pixel units),
+    /// whose §11.4 whole-sample-aligned source region begins at buffer
+    /// index `var_pos` with line length `var_stride` in `ref_buf`.
+    ///
+    /// For [`Fixed`](PredictionFilterPolicy::Fixed) the family is
+    /// returned unconditionally. For
+    /// [`AutoSelect`](PredictionFilterPolicy::AutoSelect) §11.4's two
+    /// tests apply:
+    ///
+    /// 1. If the magnitude of *either* MV component exceeds
+    ///    `mv_size_thresh_qpel`, bilinear is used.
+    /// 2. Otherwise, when a non-zero variance threshold is set, bicubic
+    ///    is used only if the §11.4 [`var_16_point`] prediction-block
+    ///    variance is greater than `var_thresh`; else bilinear. A zero
+    ///    variance threshold means "always bicubic" once the MV-size
+    ///    test passes.
+    pub fn select(
+        self,
+        mv_x: i32,
+        mv_y: i32,
+        ref_buf: &[u8],
+        var_pos: usize,
+        var_stride: usize,
+    ) -> FilterFamily {
+        match self {
+            PredictionFilterPolicy::Fixed(f) => f,
+            PredictionFilterPolicy::AutoSelect {
+                mv_size_thresh_qpel,
+                var_thresh,
+                alpha,
+            } => {
+                // §11.4: "Where the magnitude of either the x or the y
+                // component of a vector is greater than the threshold
+                // value the decoder must use the Bilinear filtering
+                // method."
+                if mv_x.abs() > mv_size_thresh_qpel || mv_y.abs() > mv_size_thresh_qpel {
+                    return FilterFamily::Bilinear;
+                }
+                // §11.4: "A value of zero for this field indicates that
+                // the decoder should not apply a variance threshold test
+                // and should use the bicubic filtering method."
+                if var_thresh == 0 {
+                    return FilterFamily::Bicubic { alpha };
+                }
+                // §11.4: "bicubic filtering is used if the measured
+                // variance of the prediction block is greater than a
+                // threshold". The variance is measured on the whole-
+                // sample-aligned region of the reference buffer.
+                let var = var_16_point(ref_buf, var_pos, var_stride);
+                if var > var_thresh {
+                    FilterFamily::Bicubic { alpha }
+                } else {
+                    FilterFamily::Bilinear
+                }
+            }
+        }
+    }
+}
+
+/// Predict one 8×8 inter block at sub-pixel precision against a
+/// §11.5-UMV-bordered reference buffer, applying §11.3 prediction loop
+/// filtering (when enabled) and §11.4 fractional-pixel interpolation
+/// (spec §11.3 / §11.4 / §17.4).
+///
+/// This is the full fractional-pixel motion-compensation path:
+///
+/// 1. Decompose the MV into its whole-sample-aligned part
+///    (`>> MvShift`) and fractional phase (the low `MvShift` bits),
+///    locating the 8×8 whole-sample source region in the bordered
+///    buffer.
+/// 2. If `loop_filter_qi` is `Some` *and* the MV is non-zero, copy a
+///    working window around the source region and apply the §11.3
+///    deblocking filter at the straddled vertical (`BoundaryX`) and
+///    horizontal (`BoundaryY`) 8×8-grid boundaries (§11.3: "If the
+///    prediction block defined by a motion vector straddles an 8×8
+///    block boundary … a de-blocking … filter is applied"). The filter
+///    writes to a separate buffer, never in place (§11.3).
+/// 3. Interpolate to the fractional phase with the §11.4 family the
+///    `policy` selects ([`bilinear_block`] / [`bicubic_block`]).
+///
+/// * `ref_buf` / `ref_stride` — the bordered reference buffer and its
+///   line length (from [`crate::umv::build_extended_buffer`]).
+/// * `base_pos` — the buffer index of the block's co-located top-left
+///   sample (MV-zero position) inside the bordered buffer.
+/// * `mv_x` / `mv_y` — the block's MV components in `shift`-precision
+///   units (¼-pel luma, ⅛-pel chroma).
+/// * `shift` — [`MvShift::Luma`] or [`MvShift::Chroma`].
+/// * `policy` — the frame's §11.4 filter-family policy.
+/// * `loop_filter_qi` — `Some(quantizer_index)` enables the §11.3
+///   prediction loop filter; `None` disables it (Simple Profile, or
+///   `UseLoopFilter == 0`).
+///
+/// The 64 interpolated prediction samples are written to `pred` in
+/// raster order. The caller recombines them with the IDCT residual via
+/// [`reconstruct_inter_block`].
+#[allow(clippy::too_many_arguments)]
+pub fn predict_inter_block_subpel(
+    ref_buf: &[u8],
+    ref_stride: usize,
+    base_pos: usize,
+    mv_x: i32,
+    mv_y: i32,
+    shift: MvShift,
+    policy: PredictionFilterPolicy,
+    loop_filter_qi: Option<usize>,
+    pred: &mut [u8; 64],
+) {
+    let whole_dx = whole_sample_aligned(mv_x, shift);
+    let whole_dy = whole_sample_aligned(mv_y, shift);
+    let frac_x = (mv_x & shift.frac_mask()) as usize;
+    let frac_y = (mv_y & shift.frac_mask()) as usize;
+
+    // Whole-sample-aligned source top-left in the bordered buffer.
+    let src_pos = (base_pos as i32 + whole_dy * ref_stride as i32 + whole_dx) as usize;
+
+    // The §11.4 filter family for this block. The variance test (when
+    // active) measures the whole-sample-aligned reference region.
+    let family = policy.select(mv_x, mv_y, ref_buf, src_pos, ref_stride);
+
+    // §11.3 prediction loop filter. Only applied for non-zero MVs whose
+    // source region straddles an 8×8 boundary; BoundaryX/BoundaryY come
+    // out 0 for a flush boundary (no filtering needed). When active we
+    // filter a copy of a local window, never the reference in place.
+    //
+    // The window must hold every sample the subsequent §11.4
+    // interpolation reads: bilinear reaches one row/col past the block
+    // (8+1), bicubic reaches one before and two after (8+3). We carry a
+    // generous margin on every side and reframe `src_pos` into it.
+    const MARGIN: i32 = 3;
+    const WIN: usize = 8 + 2 * MARGIN as usize; // 14×14 working window.
+
+    if let Some(qi) = loop_filter_qi {
+        if mv_x != 0 || mv_y != 0 {
+            let bx = boundary_x(whole_dx);
+            let by = boundary_y(whole_dy);
+            if bx != 0 || by != 0 {
+                // Copy the WIN×WIN window centred so the block's top-left
+                // (src_pos) lands at window offset (MARGIN, MARGIN).
+                let mut win = [0u8; WIN * WIN];
+                let win_origin = MARGIN as usize * WIN + MARGIN as usize;
+                for r in 0..WIN as i32 {
+                    let sr = src_pos as i32 + (r - MARGIN) * ref_stride as i32;
+                    for c in 0..WIN as i32 {
+                        let s = (sr + (c - MARGIN)) as usize;
+                        win[(r * WIN as i32 + c) as usize] = ref_buf[s];
+                    }
+                }
+                // Apply the deblocking filter at the straddled
+                // boundaries inside the window's 8×8 block region.
+                if bx != 0 {
+                    filter_vertical_boundary(&mut win, win_origin, WIN, bx as usize, 0, 8, qi);
+                }
+                if by != 0 {
+                    filter_horizontal_boundary(&mut win, win_origin, WIN, by as usize, 0, 8, qi);
+                }
+                interpolate_subpel(&win, WIN, win_origin, frac_x, frac_y, shift, family, pred);
+                return;
+            }
+        }
+    }
+
+    // No loop filtering: interpolate straight from the bordered buffer.
+    interpolate_subpel(
+        ref_buf, ref_stride, src_pos, frac_x, frac_y, shift, family, pred,
+    );
+}
+
+/// Dispatch the §11.4 interpolation for one block at the given fractional
+/// phases and filter family. A phase of `0` in a direction is the
+/// whole-sample identity (handled by the underlying block filters).
+///
+/// `shift` selects the bilinear tap table: luma phases (`0..=3`) index
+/// [`BILINEAR_LUMA_FILTERS`] (¼-pel), chroma phases (`0..=7`) index
+/// [`BILINEAR_CHROMA_FILTERS`] (⅛-pel). The bicubic table is shared and
+/// indexed directly by the ⅛-pel-resolution phase; for a luma block the
+/// caller's `frac` is already a ¼-pel phase which the spec maps onto the
+/// even bicubic rows by scaling.
+#[allow(clippy::too_many_arguments)]
+fn interpolate_subpel(
+    buf: &[u8],
+    stride: usize,
+    pos: usize,
+    frac_x: usize,
+    frac_y: usize,
+    shift: MvShift,
+    family: FilterFamily,
+    dst: &mut [u8; 64],
+) {
+    match family {
+        FilterFamily::Bilinear => {
+            let (xf, yf) = match shift {
+                MvShift::Luma => (BILINEAR_LUMA_FILTERS[frac_x], BILINEAR_LUMA_FILTERS[frac_y]),
+                MvShift::Chroma => (
+                    BILINEAR_CHROMA_FILTERS[frac_x],
+                    BILINEAR_CHROMA_FILTERS[frac_y],
+                ),
+            };
+            bilinear_block(buf, pos, stride, xf, yf, dst);
+        }
+        FilterFamily::Bicubic { alpha } => {
+            let set = &BICUBIC_FILTER_SET[alpha];
+            // The bicubic table is ⅛-pel (8 phases). A chroma phase
+            // (0..=7) indexes it directly; a luma ¼-pel phase (0..=3)
+            // maps to the even rows (¼ → row 2, ½ → row 4, ¾ → row 6).
+            let (ix, iy) = match shift {
+                MvShift::Luma => (frac_x * 2, frac_y * 2),
+                MvShift::Chroma => (frac_x, frac_y),
+            };
+            bicubic_block(buf, pos, stride, set[ix], set[iy], dst);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1350,5 +1641,193 @@ mod tests {
             mb.luma[0].iter().all(|&p| p == 0),
             "off-left-edge read clamps to column 0"
         );
+    }
+
+    // ---- §11.4 filter-family selection -----------------------------
+
+    /// A `Fixed` policy returns its family unconditionally regardless of
+    /// MV size or variance.
+    #[test]
+    fn fixed_policy_is_unconditional() {
+        let buf = [0u8; 64];
+        let p = PredictionFilterPolicy::Fixed(FilterFamily::Bicubic { alpha: 16 });
+        assert_eq!(
+            p.select(9999, 9999, &buf, 0, 8),
+            FilterFamily::Bicubic { alpha: 16 }
+        );
+        let q = PredictionFilterPolicy::Fixed(FilterFamily::Bilinear);
+        assert_eq!(q.select(0, 0, &buf, 0, 8), FilterFamily::Bilinear);
+    }
+
+    /// Auto-select forces bilinear when either MV component magnitude
+    /// exceeds the size threshold (§11.4 "must use the Bilinear
+    /// filtering method").
+    #[test]
+    fn auto_select_large_mv_is_bilinear() {
+        let buf = [200u8; 256]; // high-variance not relevant once MV gates.
+        let p = PredictionFilterPolicy::AutoSelect {
+            mv_size_thresh_qpel: 8, // 2 whole pixels.
+            var_thresh: 0,          // would otherwise force bicubic.
+            alpha: 16,
+        };
+        // x component 9 (¼-pel) > 8 → bilinear.
+        assert_eq!(p.select(9, 0, &buf, 0, 16), FilterFamily::Bilinear);
+        // both within threshold → not gated by size (var_thresh 0 →
+        // always bicubic).
+        assert_eq!(
+            p.select(8, -8, &buf, 0, 16),
+            FilterFamily::Bicubic { alpha: 16 }
+        );
+    }
+
+    /// Auto-select with a zero variance threshold always picks bicubic
+    /// once the MV-size test passes (§11.4 "Value 0 … always be used").
+    #[test]
+    fn auto_select_zero_var_thresh_is_bicubic() {
+        let buf = [128u8; 64];
+        let p = PredictionFilterPolicy::AutoSelect {
+            mv_size_thresh_qpel: 100,
+            var_thresh: 0,
+            alpha: 5,
+        };
+        assert_eq!(
+            p.select(1, 1, &buf, 0, 8),
+            FilterFamily::Bicubic { alpha: 5 }
+        );
+    }
+
+    /// Auto-select with a non-zero variance threshold uses the §11.4
+    /// `var_16_point` measurement: a flat (zero-variance) region falls
+    /// below any positive threshold → bilinear; a high-variance region
+    /// exceeds it → bicubic.
+    #[test]
+    fn auto_select_variance_gate() {
+        // Flat region: variance is 0.
+        let flat = [100u8; 256];
+        let p = PredictionFilterPolicy::AutoSelect {
+            mv_size_thresh_qpel: 100,
+            var_thresh: 10,
+            alpha: 16,
+        };
+        assert_eq!(p.select(1, 1, &flat, 0, 16), FilterFamily::Bilinear);
+
+        // High-variance region: the §11.4 var_16_point samples cols
+        // {0,2,4,6} of rows {0,2,4,6}, so vary the value across rows to
+        // give the measurement spread to find.
+        let mut hi = [0u8; 256];
+        for r in 0..16 {
+            for c in 0..16 {
+                hi[r * 16 + c] = if r % 4 == 0 { 0 } else { 255 };
+            }
+        }
+        let measured = crate::interp::var_16_point(&hi, 0, 16);
+        assert!(measured > 10);
+        assert_eq!(
+            p.select(1, 1, &hi, 0, 16),
+            FilterFamily::Bicubic { alpha: 16 }
+        );
+    }
+
+    // ---- predict_inter_block_subpel --------------------------------
+
+    /// A whole-pixel (phase-0) MV with no loop filtering reduces to a
+    /// straight copy of the whole-sample-aligned region — identical to
+    /// the bilinear/bicubic identity row.
+    #[test]
+    fn subpel_whole_pixel_is_copy() {
+        let (buf, stride, origin) = {
+            let w = 16usize;
+            let h = 16usize;
+            let mut img = vec![0u8; w * h];
+            for (i, v) in img.iter_mut().enumerate() {
+                *v = (i % 251) as u8;
+            }
+            crate::umv::build_extended_buffer(&img, w, h)
+        };
+        // Co-located corner at original (4,4): origin + 4*stride + 4.
+        let base = origin + 4 * stride + 4;
+        let mut pred = [0u8; 64];
+        // MV (8, 4) ¼-pel = whole (2, 1), phase 0 in both.
+        predict_inter_block_subpel(
+            &buf,
+            stride,
+            base,
+            8,
+            4,
+            MvShift::Luma,
+            PredictionFilterPolicy::Fixed(FilterFamily::Bilinear),
+            None,
+            &mut pred,
+        );
+        let src = base + stride + 2;
+        for r in 0..8 {
+            for c in 0..8 {
+                assert_eq!(pred[r * 8 + c], buf[src + r * stride + c]);
+            }
+        }
+    }
+
+    /// A ½-pel luma MV with the bilinear `{64,64}` average over a smooth
+    /// ramp produces the rounded midpoint of adjacent samples.
+    #[test]
+    fn subpel_half_pel_bilinear_average() {
+        let w = 16usize;
+        let h = 16usize;
+        let mut img = vec![0u8; w * h];
+        for r in 0..h {
+            for c in 0..w {
+                img[r * w + c] = (c * 4) as u8; // horizontal ramp, step 4.
+            }
+        }
+        let (buf, stride, origin) = crate::umv::build_extended_buffer(&img, w, h);
+        let base = origin + 2 * stride + 2;
+        let mut pred = [0u8; 64];
+        // MV x = 2 (¼-pel) → phase 2 = ½ ; whole part 0. y = 0.
+        predict_inter_block_subpel(
+            &buf,
+            stride,
+            base,
+            2,
+            0,
+            MvShift::Luma,
+            PredictionFilterPolicy::Fixed(FilterFamily::Bilinear),
+            None,
+            &mut pred,
+        );
+        // Sample at original col 2 is 8, col 3 is 12; ½ average = 10.
+        // (64*8 + 64*12 + 64) >> 7 = (512+768+64)>>7 = 1344>>7 = 10.
+        assert_eq!(pred[0], 10);
+    }
+
+    /// The loop-filter path is gated: a zero MV never triggers §11.3
+    /// filtering even when a quantizer index is supplied, so the output
+    /// equals the unfiltered co-located copy.
+    #[test]
+    fn subpel_zero_mv_skips_loop_filter() {
+        let w = 16usize;
+        let h = 16usize;
+        let mut img = vec![0u8; w * h];
+        for (i, v) in img.iter_mut().enumerate() {
+            *v = (i % 251) as u8;
+        }
+        let (buf, stride, origin) = crate::umv::build_extended_buffer(&img, w, h);
+        let base = origin + 3 * stride + 3;
+        let mut pred = [0u8; 64];
+        predict_inter_block_subpel(
+            &buf,
+            stride,
+            base,
+            0,
+            0,
+            MvShift::Luma,
+            PredictionFilterPolicy::Fixed(FilterFamily::Bilinear),
+            Some(20),
+            &mut pred,
+        );
+        for r in 0..8 {
+            for c in 0..8 {
+                assert_eq!(pred[r * 8 + c], buf[base + r * stride + c]);
+            }
+        }
     }
 }

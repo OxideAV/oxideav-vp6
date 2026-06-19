@@ -6,6 +6,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 343, 2026-06-20)
+
+- `inter` — `predict_inter_block_subpel` + `PredictionFilterPolicy` +
+  `FilterFamily`: the full §17.4 fractional-pixel motion-compensation
+  block predictor. Decomposes the MV into its §11.4 whole-sample-aligned
+  part and fractional phase, applies the §11.3 prediction loop filter at
+  the straddled `BoundaryX`/`BoundaryY` 8×8-grid edges (when enabled and
+  the MV is non-zero, writing to a separate working window per §11.3),
+  and interpolates to the fractional phase with the §11.4 bilinear or
+  bicubic filter family. `PredictionFilterPolicy` resolves the §11.4
+  `AutoSelectPMFlag` decision — `Fixed` (one family per frame) or
+  `AutoSelect` (per-block from the §11.4 MV-size threshold and
+  `Var16Point` prediction-block variance threshold).
+
 ### Added (clean-room round 339, 2026-06-19)
 
 - `intra_frame` — `decode_intra_frame` + `IntraProbs`: the full
