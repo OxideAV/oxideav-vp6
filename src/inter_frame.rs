@@ -123,6 +123,83 @@ impl BorderedRef {
     }
 }
 
+/// The §4 reference-frame state a VP6 stream maintains across frames:
+/// the previous-frame reconstruction and the Golden Frame (spec §4).
+///
+/// Per §4:
+///
+/// > The alternative prediction, or Golden Frame, is a frame buffer that
+/// > by default holds the last decoded I-frame but it may be updated at
+/// > any time. A flag in the frame header indicates to the decoder
+/// > whether or not to update the Golden Frame buffer.
+///
+/// and
+///
+/// > This reference frame may either be the reconstruction of the
+/// > immediately previous frame in the sequence or a stored previous
+/// > frame known as the Golden Frame.
+///
+/// [`ReferenceFrames`] tracks both buffers and applies the §4 update
+/// rules: every decoded frame becomes the new previous-frame
+/// reconstruction; the Golden Frame is replaced when the frame is an
+/// I-frame (which seeds it) or when the InterHeader's `RefreshGoldenFrame`
+/// flag is set. A P-frame decode reads both buffers (the mode's
+/// [`ReferenceBucket`] selects which); this holder threads them.
+///
+/// The stored buffers are plain [`Frame`]s; the §11.5 UMV border is
+/// rebuilt per decode by [`ReferenceFrames::bordered`] (the spec's "copy
+/// in its entirety including any UMV border" only matters because the
+/// border is part of the buffer — rebuilding it from the unbordered
+/// reconstruction is bit-identical, since the border is pure edge
+/// replication of the same samples).
+#[derive(Debug, Clone)]
+pub struct ReferenceFrames {
+    /// The immediately-previous decoded frame reconstruction.
+    pub previous: Frame,
+    /// The Golden Frame reconstruction.
+    pub golden: Frame,
+}
+
+impl ReferenceFrames {
+    /// Seed both buffers from a freshly-decoded I-frame. Per §4 the
+    /// Golden Frame "by default holds the last decoded I-frame", and the
+    /// previous-frame buffer is likewise this reconstruction.
+    pub fn from_keyframe(keyframe: Frame) -> Self {
+        Self {
+            previous: keyframe.clone(),
+            golden: keyframe,
+        }
+    }
+
+    /// Build the §11.5-bordered form of both reference buffers for one
+    /// P-frame decode: `(previous, golden)`.
+    pub fn bordered(&self) -> (BorderedRef, BorderedRef) {
+        (
+            BorderedRef::new(&self.previous),
+            BorderedRef::new(&self.golden),
+        )
+    }
+
+    /// Apply the §4 post-decode reference update for a just-decoded
+    /// frame `decoded`.
+    ///
+    /// * `is_keyframe` — the frame was an I-frame, so it both becomes the
+    ///   previous-frame reconstruction **and** replaces the Golden Frame
+    ///   (§4: the Golden Frame defaults to "the last decoded I-frame").
+    /// * `refresh_golden` — the InterHeader's `RefreshGoldenFrame` flag
+    ///   for a P-frame; when set, the decoded P-frame replaces the Golden
+    ///   Frame too (§4: "it may be updated at any time").
+    ///
+    /// In all cases the decoded frame becomes the new previous-frame
+    /// reconstruction.
+    pub fn update_after_decode(&mut self, decoded: Frame, is_keyframe: bool, refresh_golden: bool) {
+        if is_keyframe || refresh_golden {
+            self.golden = decoded.clone();
+        }
+        self.previous = decoded;
+    }
+}
+
 /// The per-frame mode/MV probability banks a P-frame decode needs, the
 /// inter-frame analogue of [`IntraProbs`].
 ///
@@ -494,6 +571,40 @@ pub fn decode_inter_frame(
     }
 
     Ok(frame)
+}
+
+/// Decode a P-frame against a [`ReferenceFrames`] state holder, building
+/// the §11.5 borders internally.
+///
+/// Convenience wrapper over [`decode_inter_frame`] that takes the
+/// [`ReferenceFrames`] (previous + golden) directly and constructs the
+/// bordered buffers, so the caller threads only the reference *state*
+/// across frames and doesn't manage [`BorderedRef`] lifetimes. The
+/// caller still applies the §4 reference update afterward via
+/// [`ReferenceFrames::update_after_decode`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_inter_frame_with_refs(
+    bc: &mut crate::bool_coder::BoolCoder<'_>,
+    h_fragments: usize,
+    v_fragments: usize,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    scan_to_raster: &[u8; BLOCK_SIZE],
+    filter: &FilterConfig,
+    refs: &ReferenceFrames,
+) -> Result<Frame, Error> {
+    let (prev, golden) = refs.bordered();
+    decode_inter_frame(
+        bc,
+        h_fragments,
+        v_fragments,
+        dct_q_mask,
+        probs,
+        scan_to_raster,
+        filter,
+        &prev,
+        &golden,
+    )
 }
 
 /// Identify a chroma plane for the reconstruction helper.
@@ -921,5 +1032,82 @@ mod tests {
         // The origin sample and a deep-border sample both read 77.
         assert_eq!(r.y[r.y_origin], 77);
         assert_eq!(r.y[0], 77);
+    }
+
+    // ---- §4 reference-frame bookkeeping ----------------------------
+
+    /// `from_keyframe` seeds both the previous-frame and Golden buffers
+    /// with the I-frame reconstruction (§4 default).
+    #[test]
+    fn keyframe_seeds_both_buffers() {
+        let key = flat_ref(2, 2, 42);
+        let refs = ReferenceFrames::from_keyframe(key);
+        assert!(refs.previous.y.samples().iter().all(|&s| s == 42));
+        assert!(refs.golden.y.samples().iter().all(|&s| s == 42));
+    }
+
+    /// A P-frame with `RefreshGoldenFrame == 0` updates only the
+    /// previous-frame buffer; the Golden Frame is unchanged (§4).
+    #[test]
+    fn pframe_no_refresh_keeps_golden() {
+        let mut refs = ReferenceFrames::from_keyframe(flat_ref(2, 2, 10));
+        let decoded = flat_ref(2, 2, 99);
+        refs.update_after_decode(decoded, false, false);
+        assert!(refs.previous.y.samples().iter().all(|&s| s == 99));
+        assert!(
+            refs.golden.y.samples().iter().all(|&s| s == 10),
+            "golden unchanged without refresh"
+        );
+    }
+
+    /// A P-frame with `RefreshGoldenFrame == 1` replaces both buffers
+    /// (§4: "it may be updated at any time").
+    #[test]
+    fn pframe_refresh_replaces_golden() {
+        let mut refs = ReferenceFrames::from_keyframe(flat_ref(2, 2, 10));
+        let decoded = flat_ref(2, 2, 200);
+        refs.update_after_decode(decoded, false, true);
+        assert!(refs.previous.y.samples().iter().all(|&s| s == 200));
+        assert!(refs.golden.y.samples().iter().all(|&s| s == 200));
+    }
+
+    /// A subsequent I-frame re-seeds the Golden Frame even without the
+    /// refresh flag (§4: Golden defaults to the last decoded I-frame).
+    #[test]
+    fn keyframe_reseeds_golden() {
+        let mut refs = ReferenceFrames::from_keyframe(flat_ref(2, 2, 10));
+        // A P-frame moves previous forward but not golden.
+        refs.update_after_decode(flat_ref(2, 2, 50), false, false);
+        // A new I-frame re-seeds golden.
+        refs.update_after_decode(flat_ref(2, 2, 77), true, false);
+        assert!(refs.previous.y.samples().iter().all(|&s| s == 77));
+        assert!(refs.golden.y.samples().iter().all(|&s| s == 77));
+    }
+
+    /// The `_with_refs` wrapper decodes against a `ReferenceFrames` and
+    /// produces the same dimensions as the explicit-border form.
+    #[test]
+    fn decode_with_refs_wrapper() {
+        let bytes = [0u8; 256];
+        let mut bc = BoolCoder::new(&bytes).unwrap();
+        let probs = keyframe_inter_probs();
+        let refs = ReferenceFrames::from_keyframe(flat_ref(2, 2, 128));
+        let filter = FilterConfig {
+            policy: PredictionFilterPolicy::Fixed(crate::inter::FilterFamily::Bilinear),
+            loop_filter_qi: None,
+        };
+        let frame = decode_inter_frame_with_refs(
+            &mut bc,
+            2,
+            2,
+            0,
+            &probs,
+            &DEFAULT_SCAN_ORDER,
+            &filter,
+            &refs,
+        )
+        .expect("decode");
+        assert_eq!(frame.y.width(), 16);
+        assert_eq!(frame.y.height(), 16);
     }
 }

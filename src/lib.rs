@@ -904,7 +904,10 @@ pub use inter::{
     whole_sample_aligned, FilterFamily, MvShift, PredictionFilterPolicy, ReconstructedMacroblock,
     RefPlane,
 };
-pub use inter_frame::{decode_inter_frame, BorderedRef, FilterConfig, InterProbs};
+pub use inter_frame::{
+    decode_inter_frame, decode_inter_frame_with_refs, BorderedRef, FilterConfig, InterProbs,
+    ReferenceFrames,
+};
 pub use interp::{
     bicubic_block, bicubic_point, bilinear_block, bilinear_point, var_16_point, BICUBIC_FILTER_SET,
     BICUBIC_VP61_INDEX, BILINEAR_CHROMA_FILTERS, BILINEAR_LUMA_FILTERS,

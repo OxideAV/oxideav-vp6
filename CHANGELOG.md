@@ -8,6 +8,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 343, 2026-06-20)
 
+- `inter_frame` — `ReferenceFrames` + `decode_inter_frame_with_refs`:
+  the §4 golden-frame bookkeeping. `ReferenceFrames` tracks the
+  previous-frame and Golden Frame reconstructions and applies the §4
+  update rules (every decoded frame becomes the new previous-frame
+  reconstruction; the Golden Frame is replaced on an I-frame — which
+  seeds it — or when the InterHeader's `RefreshGoldenFrame` flag is
+  set). `decode_inter_frame_with_refs` decodes a P-frame against a
+  `ReferenceFrames`, building the §11.5 borders internally so the caller
+  threads only the reference state across frames.
 - `inter_frame` — `decode_inter_frame` + `InterProbs` + `BorderedRef` +
   `FilterConfig`: the **fused inter (P-frame) per-macroblock decode
   loop**, the inter-frame analogue of `decode_intra_frame`. Walks the MB
