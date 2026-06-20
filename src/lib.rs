@@ -867,6 +867,7 @@ pub mod reconstruct;
 pub mod scaling;
 pub mod scan;
 pub mod scan_update;
+pub mod token_encode;
 pub mod tokens;
 pub mod umv;
 pub mod zrl;
@@ -964,6 +965,10 @@ pub use scan_update::{
     build_custom_scan_order, custom_scan_order_to_raster, decode_coeff_band_updates,
     decode_scan_order_update, BandAssignment, COEFF_BAND_UPDATE_FLAG_PROBS,
     CUSTOM_SCAN_BAND_RANGES, DEFAULT_BAND_ASSIGNMENT, NUM_AC_POSITIONS, NUM_SCAN_BANDS,
+};
+pub use token_encode::{
+    encode_ac_token, encode_ac_zero_run, encode_dc, encode_dc_token, encode_token_value,
+    token_for_magnitude,
 };
 pub use tokens::{
     baseline_ac_probs, baseline_dc_probs, dc_probs_to_node_contexts,
