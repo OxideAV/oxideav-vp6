@@ -856,6 +856,7 @@ pub mod intra_encode;
 pub mod intra_frame;
 pub mod loopfilter;
 pub mod mode_decode;
+pub mod mode_encode;
 pub mod mode_prob_update;
 pub mod modes;
 pub mod mv_decode;
@@ -923,6 +924,7 @@ pub use loopfilter::{
     prediction_loop_filter_function, PREDICTION_LOOP_FILTER_LIMIT_VALUES,
 };
 pub use mode_decode::{decode_mode, decode_mode_from_probs, descend_mode_tree};
+pub use mode_encode::{encode_mode, encode_mode_descend, encode_mode_from_probs};
 pub use mode_prob_update::{
     apply_prob_difference, decode_mode_prob_difference, decode_mode_prob_update_value,
     update_mode_probs, update_mode_probs_for_situation, FIGURE9_NODE_PROBS, LONG_DIFFERENCE_BITS,
