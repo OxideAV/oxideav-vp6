@@ -597,4 +597,136 @@ mod tests {
             "finer q ({fine_psnr:.2}) should beat coarser ({coarse_psnr:.2})"
         );
     }
+
+    /// Full keyframe → P-frame GOP: encode an I-frame, decode it through
+    /// the complete §9 header parse + intra-decode path, seed the §4
+    /// `ReferenceFrames` from the reconstruction, encode a P-frame against
+    /// that reconstruction, and decode it through
+    /// `decode_inter_frame_with_refs`. This is the realistic two-frame
+    /// pipeline a stream uses: the P-frame predicts from the *decoded*
+    /// keyframe (not the source), so the encoder must subtract exactly the
+    /// reconstruction the decoder will hold. The second frame round-trips
+    /// above a quantiser-bounded floor against its own source.
+    #[test]
+    fn keyframe_then_pframe_gop_round_trips() {
+        use crate::frame_header::{Vp6FrameHeader, Vp6HeaderTail};
+        use crate::inter_frame::{decode_inter_frame_with_refs, ReferenceFrames};
+        use crate::intra_frame::decode_intra_frame;
+
+        let q = 40u8;
+
+        // --- Frame 0: keyframe. Encode then decode it end-to-end. ---
+        let key_source = pattern(4, 4);
+        let key_bytes = crate::intra_encode::encode_intra_frame(&key_source, q).expect("I-encode");
+        let hdr = Vp6FrameHeader::parse(&key_bytes).expect("header prefix");
+        assert!(hdr.is_keyframe);
+        let mut bc = BoolCoder::new(&key_bytes[hdr.raw_prefix_len..]).expect("bool coder");
+        let _tail =
+            Vp6HeaderTail::parse_with(&mut bc, true, hdr.profile.unwrap(), hdr.version.unwrap())
+                .expect("tail");
+        let key_recon = decode_intra_frame(
+            &mut bc,
+            key_source.h_fragments,
+            key_source.v_fragments,
+            hdr.dct_q_mask,
+            &IntraProbs::keyframe(),
+            &DEFAULT_SCAN_ORDER,
+        )
+        .expect("I-decode");
+
+        // The reconstructed keyframe seeds both reference buffers (§4).
+        let refs = ReferenceFrames::from_keyframe(key_recon.clone());
+
+        // --- Frame 1: P-frame predicted from the *decoded* keyframe. ---
+        let probs = keyframe_inter_probs();
+        let filter = bilinear_filter();
+        let (prev_bordered, _golden) = refs.bordered();
+
+        // A second source that differs from the keyframe reconstruction.
+        let mut p_source = key_recon.clone();
+        // Perturb the source so the residual is non-trivial.
+        for (i, s) in p_source.y.samples_mut().iter_mut().enumerate() {
+            *s = s.wrapping_add(((i % 7) as u8).wrapping_sub(3));
+        }
+
+        let p_bytes =
+            encode_inter_frame(&p_source, &prev_bordered, q, &probs, &filter).expect("P-encode");
+        let mut p_bc = BoolCoder::new(&p_bytes).expect("P bool coder");
+        let p_recon = decode_inter_frame_with_refs(
+            &mut p_bc,
+            p_source.h_fragments,
+            p_source.v_fragments,
+            q,
+            &probs,
+            &DEFAULT_SCAN_ORDER,
+            &filter,
+            &refs,
+        )
+        .expect("P-decode");
+
+        // The P-frame reconstruction tracks its source above a floor.
+        let y = psnr(p_source.y.samples(), p_recon.y.samples());
+        assert!(
+            y >= 30.0,
+            "GOP P-frame luma PSNR {y:.2} dB below floor (q={q})"
+        );
+        assert_eq!(p_recon.y.width(), 32);
+    }
+
+    /// A P-frame whose source equals the decoded keyframe round-trips
+    /// **exactly** in a real GOP: zero residual against the reconstruction
+    /// reproduces it bit-for-bit, independent of quantiser.
+    #[test]
+    fn gop_unchanged_pframe_is_exact() {
+        use crate::frame_header::{Vp6FrameHeader, Vp6HeaderTail};
+        use crate::inter_frame::{decode_inter_frame_with_refs, ReferenceFrames};
+        use crate::intra_frame::decode_intra_frame;
+
+        let q = 16u8;
+        let key_source = pattern(4, 4);
+        let key_bytes = crate::intra_encode::encode_intra_frame(&key_source, q).expect("I-encode");
+        let hdr = Vp6FrameHeader::parse(&key_bytes).expect("header prefix");
+        let mut bc = BoolCoder::new(&key_bytes[hdr.raw_prefix_len..]).expect("bool coder");
+        let _ =
+            Vp6HeaderTail::parse_with(&mut bc, true, hdr.profile.unwrap(), hdr.version.unwrap())
+                .expect("tail");
+        let key_recon = decode_intra_frame(
+            &mut bc,
+            key_source.h_fragments,
+            key_source.v_fragments,
+            hdr.dct_q_mask,
+            &IntraProbs::keyframe(),
+            &DEFAULT_SCAN_ORDER,
+        )
+        .expect("I-decode");
+
+        let refs = ReferenceFrames::from_keyframe(key_recon.clone());
+        let probs = keyframe_inter_probs();
+        let filter = bilinear_filter();
+        let (prev_bordered, _g) = refs.bordered();
+
+        // Source == decoded keyframe → every residual is zero.
+        let p_bytes =
+            encode_inter_frame(&key_recon, &prev_bordered, q, &probs, &filter).expect("P-encode");
+        let mut p_bc = BoolCoder::new(&p_bytes).expect("P bool coder");
+        let p_recon = decode_inter_frame_with_refs(
+            &mut p_bc,
+            key_recon.h_fragments,
+            key_recon.v_fragments,
+            q,
+            &probs,
+            &DEFAULT_SCAN_ORDER,
+            &filter,
+            &refs,
+        )
+        .expect("P-decode");
+
+        assert_eq!(
+            p_recon.y.samples(),
+            key_recon.y.samples(),
+            "unchanged P-frame must reproduce the keyframe reconstruction exactly"
+        );
+        assert_eq!(p_recon.u.samples(), key_recon.u.samples());
+        assert_eq!(p_recon.v.samples(), key_recon.v.samples());
+    }
 }

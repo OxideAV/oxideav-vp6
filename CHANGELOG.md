@@ -6,6 +6,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 350, 2026-06-20)
+
+- `mode_encode` — the bit-for-bit inverse of `mode_decode` (§10 Figure 10
+  `VP6_DecodeMode`): `encode_mode` / `encode_mode_descend` /
+  `encode_mode_from_probs` emit the root "same as last" bit and the
+  node-path bits that drive the decoder's nine-node descent to a mode's
+  leaf. The same-as-last fast path takes the minimal one-bit encoding when
+  a mode repeats `last_mode`. Round-trip tests pin every
+  `(mode, availability, last_mode)` triple against the decoder.
+- `inter_encode::encode_inter_frame` — the top-level P-frame encoder, the
+  inter-frame dual of `encode_intra_frame`. Emits the simplest valid
+  P-frame (every macroblock `CODE_INTER_NO_MV`: zero MV, predicted from
+  the previous-frame reconstruction) as the BoolCoder data partition
+  `decode_inter_frame` consumes. Per block: residual = source − zero-MV
+  prediction (the same `predict_inter_block_subpel` call the decoder uses)
+  → §16-dual forward DCT → §15-inverse quantise → §14 DC delta → §13 token
+  emit; §10 mode emit via `mode_encode`. The §10 Nearest/Near walk skips
+  zero MVs, so availability is `Neither` for every MB. End-to-end tests
+  feed the partition to `decode_inter_frame`: unchanged frames round-trip
+  exactly, changed frames clear a PSNR floor, finer quantisers improve
+  PSNR, and a full keyframe → P-frame GOP (encode/decode I → seed §4
+  refs → encode/decode P against the decoded keyframe) round-trips with an
+  unchanged P-frame reproducing the keyframe reconstruction bit-for-bit.
+- `inter_frame::BorderedRef::{y,u,v}_plane` — accessors exposing the
+  §11.5-bordered reference planes `(samples, stride, origin)` so the
+  encoder forms the zero-MV prediction without duplicating the border
+  construction.
+
 ### Added (clean-room round 347, 2026-06-20)
 
 - `forward_dct::fdct_block` — the §16-dual forward DCT for the encoder.

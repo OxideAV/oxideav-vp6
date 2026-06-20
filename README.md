@@ -22,19 +22,35 @@ prediction and §17.2/§17.3/§17.4 reconstruction (including the §11.3
 prediction loop filter and §11.4 sub-pixel filter-family dispatch), with
 §4 golden-frame bookkeeping (`ReferenceFrames`).
 
-The crate now **also encodes a VP6 keyframe**: `encode_intra_frame`
-takes a 4:2:0 source `Frame` and produces a single-partition I-frame
-bitstream that `decode_intra_frame` reconstructs back to pixels at a
-quantiser-bounded PSNR floor (a 32×32 patterned frame at q=48
-round-trips at ~44 dB luma / ~45 dB chroma; flat frames are exact).
-The encode path is the stage-for-stage inverse of the decode pipeline:
-−128 level shift → §16-dual forward DCT → §15-inverse quantise → §14 DC
-delta → §13 token emit → §9 header emit.
+The crate now **also encodes both a VP6 keyframe and a P-frame**.
+`encode_intra_frame` takes a 4:2:0 source `Frame` and produces a
+single-partition I-frame bitstream that `decode_intra_frame`
+reconstructs back to pixels at a quantiser-bounded PSNR floor (a 32×32
+patterned frame at q=48 round-trips at ~44 dB luma / ~45 dB chroma; flat
+frames are exact). `encode_inter_frame` produces the BoolCoder data
+partition for the simplest valid P-frame — every macroblock
+`CODE_INTER_NO_MV` (zero MV, predicted from the previous-frame
+reconstruction) — that `decode_inter_frame` reconstructs: an unchanged
+frame round-trips **exactly** via the zero-MV inter copy, a changed
+frame above a quantiser-bounded floor. Both encode paths are the
+stage-for-stage inverse of the decode pipeline: (I) −128 level shift, or
+(P) residual = source − zero-MV prediction → §16-dual forward DCT →
+§15-inverse quantise → §14 DC delta → §13 token emit (+ §10 mode emit
+for P-frames via `mode_encode`).
+
+A full **keyframe → P-frame GOP** round-trips end-to-end: encode an
+I-frame, decode it, seed the §4 `ReferenceFrames`, encode a P-frame
+against the *decoded* keyframe, and decode it via
+`decode_inter_frame_with_refs` — an unchanged P-frame reproduces the
+keyframe reconstruction bit-for-bit.
 
 What remains is the top-level per-frame assembly (§9 header →
 §10/§11.2/§13 probability-update sub-streams → frame dispatch),
 **registering a `Decoder`/`Encoder` with `oxideav-core`** (`register()`
-is currently a no-op), and the encoder's P-frame / per-frame
+is currently a no-op), the P-frame encoder's §9 InterHeader emit (the
+current `encode_inter_frame` returns the BoolCoder partition the
+decoder's per-MB driver consumes directly), and the encoder's motion
+estimation (the richer non-`CODE_INTER_NO_MV` modes) / per-frame
 probability-update / rate-control surfaces.
 
 ### Implemented stages
@@ -136,6 +152,37 @@ probability-update / rate-control surfaces.
   full signed range, all category magnitudes/signs, both zero-run bands,
   and full coefficient blocks (empty, DC-only, scattered AC, leading zero
   run, last-nonzero-at-63, zero-DC-with-AC).
+
+### Full P-frame encode loop — round-trips to pixels
+
+- **`inter_encode::encode_inter_frame`** is the top-level **P-frame
+  encoder**, the inter-frame dual of `encode_intra_frame`, producing the
+  BoolCoder data partition `decode_inter_frame` consumes. It emits the
+  simplest valid P-frame: every macroblock `CODE_INTER_NO_MV` (§10) —
+  zero motion vector, predicted from the previous-frame reconstruction.
+  Per block it forms the inter residual (`source − zero-MV prediction`,
+  using the *same* `predict_inter_block_subpel` call the decoder uses so
+  predictions are bit-identical), then the same §16-dual forward DCT →
+  §15-inverse quantise → §14 DC delta → §13 token emit core as the intra
+  encoder, threaded through the same per-plane coded-DC grids. The §10
+  mode emit goes through `mode_encode`. Because the §10 Nearest/Near walk
+  skips zero MVs, an all-`CODE_INTER_NO_MV` frame has `ModeAvailability::
+  Neither` for every MB, so the encoder transmits each mode against the
+  same probXmitted row the decoder selects. `BorderedRef::{y,u,v}_plane`
+  expose the §11.5-bordered reference so the encoder forms the prediction
+  without duplicating the border construction. End-to-end tests feed the
+  partition to `decode_inter_frame`: unchanged frames are exact, changed
+  frames clear a quantiser-bounded PSNR floor, and a full keyframe →
+  P-frame GOP (encode/decode I → seed §4 refs → encode/decode P against
+  the decoded keyframe) round-trips.
+- **`mode_encode`** is the bit-for-bit inverse of `mode_decode`: the §10
+  Figure 10 `VP6_DecodeMode` tree, emitting the root "same as last" bit
+  and the node-path bits that drive the decoder's nine-node descent to a
+  mode's leaf. `encode_mode` / `encode_mode_descend` /
+  `encode_mode_from_probs` mirror the three decode entry points; the
+  same-as-last fast path takes the minimal one-bit encoding when a mode
+  repeats `last_mode`. Round-trip tests pin every
+  `(mode, availability, last_mode)` triple against the decoder.
 
 ### Inter (P-frame) path — decodes end-to-end to pixels
 
