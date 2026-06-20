@@ -843,6 +843,7 @@ pub mod bool_coder;
 pub mod dc_pred;
 pub mod dct_decode;
 pub mod dequant;
+pub mod forward_dct;
 pub mod fourmv;
 pub mod frame_assembly;
 pub mod frame_header;
@@ -883,6 +884,7 @@ pub use dct_decode::{
     decode_token_value, AcOutcome,
 };
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
+pub use forward_dct::fdct_block;
 pub use fourmv::{
     average_four_away_from_zero, decode_fourmv_block_mode, decode_fourmv_block_modes,
     derive_fourmv_chroma_mv, reconstruct_fourmv_macroblock, FourMvMacroblock, FOURMV_BLOCK_MODES,
