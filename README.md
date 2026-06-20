@@ -20,10 +20,22 @@ to output pixels — the P-frame path fuses the §10 mode walk, §11 motion
 resolution (single-vector + FourMV), §13 coefficient decode, §14 DC
 prediction and §17.2/§17.3/§17.4 reconstruction (including the §11.3
 prediction loop filter and §11.4 sub-pixel filter-family dispatch), with
-§4 golden-frame bookkeeping (`ReferenceFrames`). What remains is the
-top-level per-frame assembly (§9 header → §10/§11.2/§13 probability-update
-sub-streams → frame dispatch) and **registering a `Decoder` with
-`oxideav-core`** — `register()` is currently a no-op.
+§4 golden-frame bookkeeping (`ReferenceFrames`).
+
+The crate now **also encodes a VP6 keyframe**: `encode_intra_frame`
+takes a 4:2:0 source `Frame` and produces a single-partition I-frame
+bitstream that `decode_intra_frame` reconstructs back to pixels at a
+quantiser-bounded PSNR floor (a 32×32 patterned frame at q=48
+round-trips at ~44 dB luma / ~45 dB chroma; flat frames are exact).
+The encode path is the stage-for-stage inverse of the decode pipeline:
+−128 level shift → §16-dual forward DCT → §15-inverse quantise → §14 DC
+delta → §13 token emit → §9 header emit.
+
+What remains is the top-level per-frame assembly (§9 header →
+§10/§11.2/§13 probability-update sub-streams → frame dispatch),
+**registering a `Decoder`/`Encoder` with `oxideav-core`** (`register()`
+is currently a no-op), and the encoder's P-frame / per-frame
+probability-update / rate-control surfaces.
 
 ### Implemented stages
 
@@ -92,6 +104,38 @@ sub-streams → frame dispatch) and **registering a `Decoder` with
   dequantized coefficient times the Q16 cosine constant exceeds
   `i32::MAX`, so the multiply now widens to `i64` before the `>> 16`
   descale.
+
+### Full intra-frame encode loop — round-trips to pixels
+
+- **`intra_encode::encode_intra_frame`** is the top-level keyframe
+  **encoder**, the stage-for-stage inverse of `decode_intra_frame`.
+  Per block it applies the §17.1 `−128` level shift, the §16-dual
+  forward DCT (`forward_dct::fdct_block`), the §15-inverse quantiser
+  (`round(coeff / factor)` into scan order), the §14 DC-prediction delta
+  (`Δ = coded_dc − predictor`), and the §13 token emit
+  (`token_encode::encode_block_coefficients`) — threaded through the same
+  per-plane coded-DC grids and `DcPredictionContext` the decoder uses, in
+  the identical MB/block walk order and with identical §13.2 Table-26 DC
+  context selection. It emits the simplest valid I-frame shape: Simple
+  profile, `MultiStream == 0` (single BoolCoder partition), VP6.0,
+  default zig-zag scan, keyframe-baseline probabilities. The §9 raw-bit
+  prefix goes through `oxideav_core::bits::BitWriter`; the header tail +
+  coefficient tokens through the §7.3 `BoolEncoder`.
+- **`forward_dct::fdct_block`** is the §16-dual forward transform: a
+  separable orthonormal 8-point DCT-II per axis, scaled to invert the
+  §16 integer IDCT's observable `1/32` pure-DC gain, evaluated in `f64`
+  and rounded to nearest. `idct(fdct(x))` recovers the input to ≤3 LSB
+  per sample (the un-quantised transform-pair floor).
+- **`token_encode`** is the bit-for-bit inverse of the `dct_decode`
+  token trees: the §13.2.1 DC tree walk, the §13.3.1 AC tree walk (incl.
+  the `EncodedCoeffs>1 && Prec==WasZero` implicit-1 shortcut), the
+  magnitude/sign emit, the §13.3.3.1 zero-run emit, and the per-block
+  `encode_block_coefficients` mirroring the decoder's `EncodedCoeffs`
+  loop (Prec evolution, inclusive zero-run choreography, EOB-vs-natural-
+  full-block termination). Round-trip tests pin every DC value across the
+  full signed range, all category magnitudes/signs, both zero-run bands,
+  and full coefficient blocks (empty, DC-only, scattered AC, leading zero
+  run, last-nonzero-at-63, zero-DC-with-AC).
 
 ### Inter (P-frame) path — decodes end-to-end to pixels
 

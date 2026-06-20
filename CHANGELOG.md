@@ -6,6 +6,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 347, 2026-06-20)
+
+- `forward_dct::fdct_block` — the §16-dual forward DCT for the encoder.
+  A separable orthonormal 8-point DCT-II per axis, scaled to invert the
+  §16 integer IDCT's observable `1/32` pure-DC gain, in `f64` rounded to
+  nearest. `idct(fdct(x))` recovers the input to ≤3 LSB per sample.
+- `token_encode` — the bit-for-bit inverse of the `dct_decode` token
+  trees: DC tree walk, AC tree walk (incl. the `EncodedCoeffs>1 &&
+  Prec==WasZero` implicit-1 shortcut), magnitude/sign emit, §13.3.3.1
+  zero-run emit, and the per-block `encode_block_coefficients` mirroring
+  the decoder's `EncodedCoeffs` loop (Prec evolution, inclusive zero-run
+  choreography, EOB-vs-natural-full-block termination). Round-trips every
+  DC value, all category magnitudes/signs, both zero-run bands, and full
+  coefficient blocks.
+- `intra_encode::encode_intra_frame` — the top-level I-frame encoder, the
+  stage-for-stage inverse of `decode_intra_frame` (−128 level shift →
+  §16-dual forward DCT → §15-inverse quantise → §14 DC delta → §13 token
+  emit → §9 header emit). Emits the simplest valid I-frame shape (Simple
+  profile, single partition, VP6.0, default scan, keyframe-baseline
+  probs). Round-trip tests drive `encode_intra_frame → Vp6FrameHeader::
+  parse → Vp6HeaderTail::parse_with → decode_intra_frame` and measure
+  PSNR: flat frames exact, a 32×32 patterned frame at q=48 hits ~44 dB
+  luma / ~45 dB chroma, quantiser-monotonicity holds.
+
 ### Added (clean-room round 343, 2026-06-20)
 
 - `inter_frame` — `ReferenceFrames` + `decode_inter_frame_with_refs`:
