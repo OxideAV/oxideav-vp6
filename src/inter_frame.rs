@@ -121,6 +121,28 @@ impl BorderedRef {
             v_origin,
         }
     }
+
+    /// The bordered luma plane: `(samples, stride, origin)`. `origin` is
+    /// the flat-buffer index of the in-image top-left sample; `stride` is
+    /// the bordered row length. Lets an encoder form the **same** zero-MV
+    /// prediction the decoder does without duplicating the §11.5 border
+    /// construction.
+    #[inline]
+    pub fn y_plane(&self) -> (&[u8], usize, usize) {
+        (&self.y, self.y_stride, self.y_origin)
+    }
+
+    /// The bordered U-chroma plane: `(samples, stride, origin)`.
+    #[inline]
+    pub fn u_plane(&self) -> (&[u8], usize, usize) {
+        (&self.u, self.u_stride, self.u_origin)
+    }
+
+    /// The bordered V-chroma plane: `(samples, stride, origin)`.
+    #[inline]
+    pub fn v_plane(&self) -> (&[u8], usize, usize) {
+        (&self.v, self.v_stride, self.v_origin)
+    }
 }
 
 /// The §4 reference-frame state a VP6 stream maintains across frames:

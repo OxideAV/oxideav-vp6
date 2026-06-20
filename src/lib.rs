@@ -850,6 +850,7 @@ pub mod frame_header;
 pub mod huffman;
 pub mod idct;
 pub mod inter;
+pub mod inter_encode;
 pub mod inter_frame;
 pub mod interp;
 pub mod intra_encode;
@@ -909,6 +910,7 @@ pub use inter::{
     whole_sample_aligned, FilterFamily, MvShift, PredictionFilterPolicy, ReconstructedMacroblock,
     RefPlane,
 };
+pub use inter_encode::encode_inter_frame;
 pub use inter_frame::{
     decode_inter_frame, decode_inter_frame_with_refs, BorderedRef, FilterConfig, InterProbs,
     ReferenceFrames,
