@@ -6,6 +6,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 356, 2026-06-21)
+
+- `PredictionFilter::resolve` — the §11.4 bridge from the *signalled*
+  Advanced-profile filter selector (the decoded header `PredictionFilter`)
+  to the *operative* `PredictionFilterPolicy` the per-block fractional-pixel
+  predictor consumes. Applies the three header→runtime conversions:
+  (1) MV-size threshold to ¼-pixel units — `(1 << (thresh-1)) << 2`, or the
+  "no restriction" branch `((MAX_MV_EXTENT >> 1) + 1) << 2` when the field
+  is zero; (2) `FilterVarThresh = PredictionFilterVarThresh << 5` (the §11.4
+  formula as printed names `MvSizeThresh`, but the surrounding prose, the
+  zero/non-zero gate field, and the `FilterVarThresh` result name are all
+  the *variance* threshold — using `MvSizeThresh` would force a zero
+  MV-size field to make `FilterVarThresh == 0` regardless of the variance
+  field, contradicting the prose; the internally-consistent reading shifts
+  `PredictionFilterVarThresh`); (3) bicubic alpha index — the VP6.2
+  `PredictionFilterAlpha` when present, else the VP6.1 default index 16.
+  `Fixed` / `NotSignalled` selectors resolve to the corresponding fixed
+  family (Simple profile / omitted selector → bilinear per §11.4).
+- `interp::var_16_point_clamped` — the §11.5 out-of-range edge form of the
+  §11.4 16-point variance metric. Each sampled position is edge-clamped
+  into the reference buffer's valid range, replicating the §11.5
+  edge-extension sample instead of indexing out of bounds when an
+  unrestricted (or out-of-spec long) motion vector places the
+  whole-sample-aligned variance window past a buffer edge. Bit-identical to
+  `var_16_point` for any window fully inside the buffer.
+  `PredictionFilterPolicy::select` now takes a signed (`i64`) variance
+  position and reads through the clamped form, so the Advanced-profile
+  filter selection never panics on an edge/long-MV block.
+
 ### Added (clean-room round 350, 2026-06-20)
 
 - `mode_encode` — the bit-for-bit inverse of `mode_decode` (§10 Figure 10

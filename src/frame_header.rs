@@ -304,6 +304,103 @@ pub enum PredictionFilter {
     NotSignalled,
 }
 
+impl PredictionFilter {
+    /// Resolve this decoded header selector into the operative §11.4
+    /// [`PredictionFilterPolicy`](crate::inter::PredictionFilterPolicy)
+    /// the per-block fractional-pixel predictor consumes.
+    ///
+    /// This is the bridge from the *signalled* fields (variance / MV-size
+    /// thresholds, the fixed-filter flag) to the *operative* thresholds
+    /// §11.4 actually compares against, applying the three header→runtime
+    /// conversions the spec specifies:
+    ///
+    /// 1. **MV-size threshold → ¼-pixel units.** "Largest MV component, in
+    ///    whole pixel units, for use of bi-cubic filter is
+    ///    `(1 << (PredictionFilterMvSizeThresh – 1))`"; §11.4 converts that
+    ///    to ¼-pixel units (`<< 2`). A *zero* `mv_size_thresh` selects the
+    ///    "No motion vector length restriction" branch, whose threshold is
+    ///    `((MAX_MV_EXTENT >> 1) + 1) << 2`
+    ///    ([`PredictionFilterPolicy::NO_MV_RESTRICTION_QPEL`]).
+    ///
+    /// 2. **`FilterVarThresh` formula.** §11.4: "bicubic filtering is used
+    ///    if the measured variance of the prediction block is greater than
+    ///    a threshold number computed as follows: `FilterVarThresh =
+    ///    (PredictionFilterVarThresh << 5)`". The printed formula names
+    ///    `PredictionFilterMvSizeThresh`, but the entire surrounding prose
+    ///    — the field whose zero/non-zero value gates the test, and the
+    ///    `FilterVarThresh` name of the result — is `Var`-thresh, not
+    ///    `MvSize`-thresh. Using `MvSizeThresh` here would make a zero
+    ///    `MvSizeThresh` force `FilterVarThresh == 0` (i.e. "always
+    ///    bicubic") regardless of the `VarThresh` field, directly
+    ///    contradicting "In cases where this [VarThresh] field is
+    ///    non-zero, bicubic filtering is used if …". The internally
+    ///    consistent reading shifts `PredictionFilterVarThresh`.
+    ///
+    /// 3. **Out-of-range edge rule.** The `b(5)` `var_thresh` field spans
+    ///    `0..=31`, so `var_thresh << 5` spans `0..=992` and never
+    ///    overflows `i32`. The `var_thresh == 0` case is special-cased by
+    ///    [`select`](crate::inter::PredictionFilterPolicy::select) to "no
+    ///    variance test, always bicubic" before the shift is ever
+    ///    compared, so a resolved `var_thresh` of `0` is unambiguous.
+    ///
+    /// The bicubic alpha index is the VP6.2 `PredictionFilterAlpha`
+    /// (`0..=15`) when present, else the VP6.1 default
+    /// [`BICUBIC_VP61_INDEX`](crate::interp::BICUBIC_VP61_INDEX) (16). A
+    /// [`NotSignalled`](PredictionFilter::NotSignalled) selector (Simple
+    /// profile, or a frame that omitted the fields) resolves to a fixed
+    /// bilinear policy: §11.4 mandates bilinear for Simple profile and for
+    /// any frame that did not transmit the selector.
+    pub fn resolve(
+        self,
+        prediction_filter_alpha: Option<u8>,
+    ) -> crate::inter::PredictionFilterPolicy {
+        use crate::inter::{FilterFamily, PredictionFilterPolicy};
+
+        // VP6.2 carries an explicit alpha; VP6.1 streams use the 17th
+        // (`BICUBIC_VP61_INDEX`) coefficient set (§11.4.2).
+        let alpha = prediction_filter_alpha
+            .map(usize::from)
+            .unwrap_or(crate::interp::BICUBIC_VP61_INDEX);
+
+        match self {
+            PredictionFilter::Fixed { bicubic } => {
+                if bicubic {
+                    PredictionFilterPolicy::Fixed(FilterFamily::Bicubic { alpha })
+                } else {
+                    PredictionFilterPolicy::Fixed(FilterFamily::Bilinear)
+                }
+            }
+            PredictionFilter::NotSignalled => {
+                // §11.4: Simple profile (and any frame that omitted the
+                // selector) is bilinear with no dynamic switching.
+                PredictionFilterPolicy::Fixed(FilterFamily::Bilinear)
+            }
+            PredictionFilter::AutoSelect {
+                var_thresh,
+                mv_size_thresh,
+            } => {
+                // §11.4 MV-size threshold → ¼-pixel units.
+                let mv_size_thresh_qpel = if mv_size_thresh > 0 {
+                    // (1 << (thresh - 1)) << 2, all in i32; thresh ≤ 7 from
+                    // the 3-bit field so (1 << 6) << 2 == 256, no overflow.
+                    (1i32 << (mv_size_thresh - 1)) << 2
+                } else {
+                    PredictionFilterPolicy::NO_MV_RESTRICTION_QPEL
+                };
+                // §11.4 FilterVarThresh = PredictionFilterVarThresh << 5
+                // (see the disambiguation note above). The 5-bit field
+                // keeps the product in 0..=992.
+                let var_thresh = (var_thresh as i32) << 5;
+                PredictionFilterPolicy::AutoSelect {
+                    mv_size_thresh_qpel,
+                    var_thresh,
+                    alpha,
+                }
+            }
+        }
+    }
+}
+
 /// Loop-filter selection from the §9 InterHeader tail (Table 3
 /// `UseLoopFilter` / `LoopFilterSelector`).
 ///
@@ -523,6 +620,124 @@ impl Vp6HeaderTail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inter::{FilterFamily, PredictionFilterPolicy};
+
+    // ---- §11.4 PredictionFilter::resolve ----------------------------
+
+    /// A `Fixed { bicubic: true }` selector resolves to a fixed bicubic
+    /// policy; the alpha is the VP6.2 field when present.
+    #[test]
+    fn resolve_fixed_bicubic_uses_alpha() {
+        let pf = PredictionFilter::Fixed { bicubic: true };
+        assert_eq!(
+            pf.resolve(Some(5)),
+            PredictionFilterPolicy::Fixed(FilterFamily::Bicubic { alpha: 5 })
+        );
+    }
+
+    /// A `Fixed { bicubic: false }` selector resolves to fixed bilinear
+    /// regardless of any alpha field.
+    #[test]
+    fn resolve_fixed_bilinear() {
+        let pf = PredictionFilter::Fixed { bicubic: false };
+        assert_eq!(
+            pf.resolve(Some(5)),
+            PredictionFilterPolicy::Fixed(FilterFamily::Bilinear)
+        );
+        assert_eq!(
+            pf.resolve(None),
+            PredictionFilterPolicy::Fixed(FilterFamily::Bilinear)
+        );
+    }
+
+    /// `NotSignalled` (Simple profile / omitted selector) resolves to
+    /// fixed bilinear per §11.4.
+    #[test]
+    fn resolve_not_signalled_is_bilinear() {
+        assert_eq!(
+            PredictionFilter::NotSignalled.resolve(None),
+            PredictionFilterPolicy::Fixed(FilterFamily::Bilinear)
+        );
+    }
+
+    /// Absent VP6.2 alpha falls back to the VP6.1 default index 16.
+    #[test]
+    fn resolve_absent_alpha_is_vp61_default() {
+        let pf = PredictionFilter::Fixed { bicubic: true };
+        assert_eq!(
+            pf.resolve(None),
+            PredictionFilterPolicy::Fixed(FilterFamily::Bicubic {
+                alpha: crate::interp::BICUBIC_VP61_INDEX
+            })
+        );
+    }
+
+    /// AutoSelect with a non-zero MV-size threshold converts to ¼-pixel
+    /// units `(1 << (thresh-1)) << 2` and shifts the variance threshold by
+    /// 5 (§11.4 `FilterVarThresh = VarThresh << 5`).
+    #[test]
+    fn resolve_auto_select_thresholds() {
+        let pf = PredictionFilter::AutoSelect {
+            var_thresh: 3,
+            mv_size_thresh: 4,
+        };
+        assert_eq!(
+            pf.resolve(Some(7)),
+            PredictionFilterPolicy::AutoSelect {
+                // (1 << (4-1)) << 2 == 8 << 2 == 32.
+                mv_size_thresh_qpel: 32,
+                // 3 << 5 == 96.
+                var_thresh: 96,
+                alpha: 7,
+            }
+        );
+    }
+
+    /// A zero MV-size threshold selects the §11.4 "No motion vector length
+    /// restriction" branch (`((MAX_MV_EXTENT >> 1) + 1) << 2`).
+    #[test]
+    fn resolve_auto_select_zero_mv_size_is_no_restriction() {
+        let pf = PredictionFilter::AutoSelect {
+            var_thresh: 0,
+            mv_size_thresh: 0,
+        };
+        let policy = pf.resolve(None);
+        match policy {
+            PredictionFilterPolicy::AutoSelect {
+                mv_size_thresh_qpel,
+                var_thresh,
+                alpha,
+            } => {
+                assert_eq!(
+                    mv_size_thresh_qpel,
+                    PredictionFilterPolicy::NO_MV_RESTRICTION_QPEL
+                );
+                assert_eq!(var_thresh, 0);
+                assert_eq!(alpha, crate::interp::BICUBIC_VP61_INDEX);
+            }
+            _ => panic!("expected AutoSelect policy"),
+        }
+    }
+
+    /// The §11.4 out-of-range edge rule: the maximum `b(5)` variance field
+    /// (31) shifts to `31 << 5 == 992`, well within `i32` and never
+    /// overflowing; the maximum `b(3)` MV-size field (7) gives
+    /// `(1 << 6) << 2 == 256`.
+    #[test]
+    fn resolve_auto_select_field_extremes_no_overflow() {
+        let pf = PredictionFilter::AutoSelect {
+            var_thresh: 31,
+            mv_size_thresh: 7,
+        };
+        assert_eq!(
+            pf.resolve(Some(15)),
+            PredictionFilterPolicy::AutoSelect {
+                mv_size_thresh_qpel: 256,
+                var_thresh: 992,
+                alpha: 15,
+            }
+        );
+    }
 
     /// Hand-encode a minimal Intra frame, Simple profile, MultiStream=0
     /// (Buff2Offset still present because Simple). DctQMask = 0x2A

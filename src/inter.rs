@@ -515,8 +515,8 @@ pub fn reconstruct_inter_macroblock(
 // ===================================================================
 
 use crate::interp::{
-    bicubic_block, bilinear_block, var_16_point, BICUBIC_FILTER_SET, BILINEAR_CHROMA_FILTERS,
-    BILINEAR_LUMA_FILTERS,
+    bicubic_block, bilinear_block, var_16_point_clamped, BICUBIC_FILTER_SET,
+    BILINEAR_CHROMA_FILTERS, BILINEAR_LUMA_FILTERS,
 };
 use crate::loopfilter::{
     boundary_x, boundary_y, filter_horizontal_boundary, filter_vertical_boundary,
@@ -586,8 +586,16 @@ impl PredictionFilterPolicy {
 
     /// Resolve the per-block [`FilterFamily`] for a block whose
     /// fractional-pixel MV components are `(mv_x, mv_y)` (¼-pixel units),
-    /// whose §11.4 whole-sample-aligned source region begins at buffer
-    /// index `var_pos` with line length `var_stride` in `ref_buf`.
+    /// whose §11.4 whole-sample-aligned source region begins at signed
+    /// buffer index `var_pos` with line length `var_stride` in `ref_buf`.
+    ///
+    /// `var_pos` is signed (`i64`) because §11.5 unrestricted motion
+    /// vectors may place the whole-sample-aligned variance window above or
+    /// to the left of the bordered-buffer origin; the variance read
+    /// [`var_16_point_clamped`] edge-clamps each sampled position into
+    /// `ref_buf`'s valid range, implementing the §11.5 out-of-range rule
+    /// (see that function). For any window fully inside the buffer the
+    /// result is bit-identical to the unclamped [`var_16_point`].
     ///
     /// For [`Fixed`](PredictionFilterPolicy::Fixed) the family is
     /// returned unconditionally. For
@@ -597,16 +605,15 @@ impl PredictionFilterPolicy {
     /// 1. If the magnitude of *either* MV component exceeds
     ///    `mv_size_thresh_qpel`, bilinear is used.
     /// 2. Otherwise, when a non-zero variance threshold is set, bicubic
-    ///    is used only if the §11.4 [`var_16_point`] prediction-block
-    ///    variance is greater than `var_thresh`; else bilinear. A zero
-    ///    variance threshold means "always bicubic" once the MV-size
-    ///    test passes.
+    ///    is used only if the §11.4 prediction-block variance is greater
+    ///    than `var_thresh`; else bilinear. A zero variance threshold
+    ///    means "always bicubic" once the MV-size test passes.
     pub fn select(
         self,
         mv_x: i32,
         mv_y: i32,
         ref_buf: &[u8],
-        var_pos: usize,
+        var_pos: i64,
         var_stride: usize,
     ) -> FilterFamily {
         match self {
@@ -632,8 +639,9 @@ impl PredictionFilterPolicy {
                 // §11.4: "bicubic filtering is used if the measured
                 // variance of the prediction block is greater than a
                 // threshold". The variance is measured on the whole-
-                // sample-aligned region of the reference buffer.
-                let var = var_16_point(ref_buf, var_pos, var_stride);
+                // sample-aligned region of the reference buffer, with the
+                // §11.5 out-of-range edge clamp applied per sample.
+                let var = var_16_point_clamped(ref_buf, var_pos, var_stride);
                 if var > var_thresh {
                     FilterFamily::Bicubic { alpha }
                 } else {
@@ -697,12 +705,16 @@ pub fn predict_inter_block_subpel(
     let frac_x = (mv_x & shift.frac_mask()) as usize;
     let frac_y = (mv_y & shift.frac_mask()) as usize;
 
-    // Whole-sample-aligned source top-left in the bordered buffer.
-    let src_pos = (base_pos as i32 + whole_dy * ref_stride as i32 + whole_dx) as usize;
+    // Whole-sample-aligned source top-left in the bordered buffer. The
+    // signed form is retained for the §11.4 variance read, whose §11.5
+    // out-of-range clamp must see a window that may sit before the buffer
+    // origin (an unrestricted MV pointing above/left of the border).
+    let src_pos_signed = base_pos as i64 + whole_dy as i64 * ref_stride as i64 + whole_dx as i64;
+    let src_pos = src_pos_signed as usize;
 
     // The §11.4 filter family for this block. The variance test (when
     // active) measures the whole-sample-aligned reference region.
-    let family = policy.select(mv_x, mv_y, ref_buf, src_pos, ref_stride);
+    let family = policy.select(mv_x, mv_y, ref_buf, src_pos_signed, ref_stride);
 
     // §11.3 prediction loop filter. Only applied for non-zero MVs whose
     // source region straddles an 8×8 boundary; BoundaryX/BoundaryY come
@@ -1726,6 +1738,39 @@ mod tests {
             p.select(1, 1, &hi, 0, 16),
             FilterFamily::Bicubic { alpha: 16 }
         );
+    }
+
+    /// §11.4 out-of-range edge rule: an auto-select variance test whose
+    /// whole-sample-aligned window sits before the buffer origin (negative
+    /// `var_pos`) must not panic — the §11.5 clamp reads the replicated
+    /// edge sample. With a flat reference the variance is 0, below the
+    /// threshold → bilinear.
+    #[test]
+    fn auto_select_variance_window_off_origin_is_clamped() {
+        let flat = [100u8; 256];
+        let p = PredictionFilterPolicy::AutoSelect {
+            mv_size_thresh_qpel: 100,
+            var_thresh: 10,
+            alpha: 16,
+        };
+        // var_pos far before the buffer start: every variance read clamps
+        // to index 0 (flat ⇒ variance 0 ⇒ bilinear), no out-of-bounds.
+        assert_eq!(p.select(1, 1, &flat, -10_000, 16), FilterFamily::Bilinear);
+    }
+
+    /// §11.4 out-of-range edge rule on the high side: a variance window
+    /// past the buffer end clamps each sampled index to the last sample
+    /// rather than indexing out of bounds. A flat buffer still measures 0.
+    #[test]
+    fn auto_select_variance_window_past_end_is_clamped() {
+        let flat = [100u8; 256];
+        let p = PredictionFilterPolicy::AutoSelect {
+            mv_size_thresh_qpel: 100,
+            var_thresh: 10,
+            alpha: 16,
+        };
+        let past_end = flat.len() as i64 + 5_000;
+        assert_eq!(p.select(1, 1, &flat, past_end, 16), FilterFamily::Bilinear);
     }
 
     // ---- predict_inter_block_subpel --------------------------------

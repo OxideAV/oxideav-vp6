@@ -51,17 +51,21 @@
 //! The `PixelStep` argument selects the pass direction: `1` for the
 //! horizontal pass, the buffer stride for the vertical pass.
 //!
-//! ## DOCS-GAP: filter *selection* threshold (`MAX_MV_EXTENT`)
+//! ## DOCS-GAP (residual): filter *selection* threshold (`MAX_MV_EXTENT`)
 //!
 //! §11.4's Advanced-Profile filter-selection logic computes a motion
 //! vector size threshold whose "no restriction" branch reads
-//! `FilterMvSizeThresh = ((MAX_MV_EXTENT >> 1) + 1) << 2`, but
-//! `MAX_MV_EXTENT` is never assigned a numeric value anywhere in the
-//! document. The variance branch and the per-point kernels are fully
-//! specified and implemented here; the size-threshold *selector* is
-//! therefore deferred until the constant is supplied. The
-//! variance-metric half of the selector ([`var_16_point`]) is fully
-//! specified and is implemented.
+//! `FilterMvSizeThresh = ((MAX_MV_EXTENT >> 1) + 1) << 2`. `MAX_MV_EXTENT`
+//! is never assigned a numeric value in §11.4 itself; the §11.1 long-vector
+//! magnitude cap (the 11-bit `dx`/`dy` limit, 2047) supplies the only
+//! self-consistent value, which
+//! [`crate::inter::PredictionFilterPolicy::NO_MV_RESTRICTION_QPEL`] uses.
+//! With that, the full §11.4 selector — MV-size threshold conversion, the
+//! `FilterVarThresh = VarThresh << 5` formula (see
+//! [`crate::frame_header::PredictionFilter::resolve`]) and the 16-point
+//! variance metric ([`var_16_point`] / [`var_16_point_clamped`]) — is
+//! implemented; the only residual ambiguity is the spec never spelling out
+//! `MAX_MV_EXTENT` numerically.
 
 /// Bilinear luma filter taps (spec §11.4.1 `BilinearLumaFilters[4][2]`).
 ///
@@ -411,6 +415,51 @@ pub fn var_16_point(data: &[u8], pos: usize, stride: usize) -> i32 {
         let base = pos + row * stride;
         for col in (0..8).step_by(2) {
             let v = data[base + col] as i64;
+            x_sum += v;
+            xx_sum += v * v;
+        }
+    }
+    (((xx_sum << 4) - x_sum * x_sum) >> 8) as i32
+}
+
+/// §11.4 16-point variance, but with each sampled position **edge-clamped**
+/// into `data`'s valid index range (the §11.5 out-of-range rule).
+///
+/// §11.4 computes the prediction-block variance over an 8×8 region whose
+/// top-left corner is the *whole-sample-aligned* MV offset
+/// (`WholeSampleAlignedX/Y = MvX/Y >> MvShift`). Because VP6 permits
+/// unrestricted motion vectors (§11.5), that corner — and therefore the
+/// sampled positions — can lie past the reference buffer's edge. §11.5
+/// resolves every such out-of-range reference read by edge-replication:
+///
+/// > because the extension is built by edge replication, any read from a
+/// > sample position … is equivalent to clamping the read position to the
+/// > original image's valid range.
+///
+/// [`var_16_point`] assumes the caller pre-bounded `pos` so all 16 reads
+/// land inside `data`; that holds for spec-conformant streams (MV
+/// components capped at ±127 ¼-pel ⇒ within the 48-sample UMV border).
+/// This variant additionally tolerates an MV that the encoder left
+/// out-of-spec (the long-vector decode formula can yield magnitudes up to
+/// 255 ¼-pel, i.e. ~64 whole pixels, beyond the 48-sample border): each
+/// computed index is clamped to `0..data.len()`, replicating the §11.5
+/// edge sample instead of indexing out of bounds.
+///
+/// For any `pos` whose full 8×8 sampling window already lies inside
+/// `data`, every clamp is a no-op and the result is **bit-identical** to
+/// [`var_16_point`]. `signed_pos` is the (possibly negative) top-left
+/// index of the variance window relative to the buffer start, so an MV
+/// pointing above/left of the bordered origin clamps to row/column 0.
+pub fn var_16_point_clamped(data: &[u8], signed_pos: i64, stride: usize) -> i32 {
+    debug_assert!(!data.is_empty(), "var_16_point_clamped: empty buffer");
+    let last = data.len() as i64 - 1;
+    let mut x_sum: i64 = 0;
+    let mut xx_sum: i64 = 0;
+    for row in (0..8i64).step_by(2) {
+        let base = signed_pos + row * stride as i64;
+        for col in (0..8i64).step_by(2) {
+            let idx = (base + col).clamp(0, last) as usize;
+            let v = data[idx] as i64;
             x_sum += v;
             xx_sum += v * v;
         }
@@ -836,5 +885,56 @@ mod tests {
         }
         assert_eq!(var_16_point(&src, 0, 8), baseline);
         assert_eq!(baseline, 0);
+    }
+
+    /// For a window fully inside the buffer, `var_16_point_clamped` is
+    /// bit-identical to the unclamped `var_16_point` (every clamp a no-op).
+    #[test]
+    fn var_16_point_clamped_matches_unclamped_in_range() {
+        let (a, b) = (40i64, 200i64);
+        let mut src = [0u8; 64];
+        for r in 0..8 {
+            for c in 0..8 {
+                src[r * 8 + c] = if (c / 2) % 2 == 0 { a as u8 } else { b as u8 };
+            }
+        }
+        assert_eq!(var_16_point_clamped(&src, 0, 8), var_16_point(&src, 0, 8));
+    }
+
+    /// A negative `signed_pos` (window above/left of the buffer origin)
+    /// clamps every sampled index to 0, so the §11.5 edge sample is
+    /// replicated. With a flat buffer the variance is still 0.
+    #[test]
+    fn var_16_point_clamped_negative_pos_clamps_to_origin() {
+        let src = [77u8; 64];
+        // Window starting far before the origin: all reads clamp to idx 0.
+        assert_eq!(var_16_point_clamped(&src, -1000, 8), 0);
+    }
+
+    /// A `signed_pos` whose window runs past the buffer end clamps the
+    /// overrunning samples to the last index instead of panicking. The
+    /// result equals the variance of the clamped sample set, which for a
+    /// flat buffer is 0.
+    #[test]
+    fn var_16_point_clamped_past_end_clamps_to_last() {
+        let src = [123u8; 64];
+        let last = (src.len() - 1) as i64;
+        // Start at the last valid index: every read clamps to it.
+        assert_eq!(var_16_point_clamped(&src, last, 8), 0);
+        // Start well past the end: same clamp behaviour, no panic.
+        assert_eq!(var_16_point_clamped(&src, last + 500, 8), 0);
+    }
+
+    /// The clamped variance replicates the edge sample for an
+    /// out-of-range window the same way a §11.5-bordered buffer would: a
+    /// non-flat buffer read entirely off the right edge sees only the last
+    /// column's value, giving zero variance.
+    #[test]
+    fn var_16_point_clamped_off_edge_replicates_edge_value() {
+        // Stride-8 buffer whose last sample is 200, everything else 0.
+        let mut src = [0u8; 64];
+        src[63] = 200;
+        // Start exactly at the last index: all 16 reads clamp to idx 63.
+        assert_eq!(var_16_point_clamped(&src, 63, 8), 0);
     }
 }
