@@ -254,6 +254,42 @@ pub struct FilterConfig {
     pub loop_filter_qi: Option<usize>,
 }
 
+impl FilterConfig {
+    /// Build the operative §11.3/§11.4 frame filter configuration from a
+    /// decoded frame-header tail plus the frame's quantiser index.
+    ///
+    /// This is the bridge from the *signalled* header fields to the
+    /// per-frame policy the per-block predictor consumes:
+    ///
+    /// * The §11.4 prediction-filter family policy comes from
+    ///   [`crate::frame_header::PredictionFilter::resolve`] (MV-size and
+    ///   variance thresholds, the bicubic alpha). On a Simple-profile or
+    ///   non-VP6.2 frame whose selector was absent it resolves to fixed
+    ///   bilinear, matching §11.4's "Simple Profile … Bilinear filtering
+    ///   is used in all cases".
+    /// * The §11.3 prediction loop filter is enabled (carrying the
+    ///   frame's quantiser index) only when the tail's
+    ///   [`LoopFilter`](crate::frame_header::LoopFilter) reports
+    ///   `Enabled`; a `Disabled` / `NotSignalled` selector (Simple
+    ///   profile, an IntraHeader, or `UseLoopFilter == 0`) leaves
+    ///   `loop_filter_qi` `None`.
+    ///
+    /// `dct_q_mask` is the frame's `DctQMask` (Table 1), the index the
+    /// §11.3 deblocking limit is selected with.
+    pub fn from_header(tail: &crate::frame_header::Vp6HeaderTail, dct_q_mask: u8) -> Self {
+        let policy = tail.prediction_filter.resolve(tail.prediction_filter_alpha);
+        let loop_filter_qi = match tail.loop_filter {
+            crate::frame_header::LoopFilter::Enabled { .. } => Some(dct_q_mask as usize),
+            crate::frame_header::LoopFilter::Disabled
+            | crate::frame_header::LoopFilter::NotSignalled => None,
+        };
+        FilterConfig {
+            policy,
+            loop_filter_qi,
+        }
+    }
+}
+
 /// One block-grid cell of the §14 DC-prediction neighbour grid: the
 /// reconstructed coded DC plus the block's reference bucket.
 #[derive(Debug, Clone, Copy)]
@@ -825,7 +861,88 @@ fn reconstruct_chroma_block(
 mod tests {
     use super::*;
     use crate::bool_coder::BoolCoder;
+    use crate::frame_header::{LoopFilter, PredictionFilter, Vp6HeaderTail};
+    use crate::inter::FilterFamily;
     use crate::scan::DEFAULT_SCAN_ORDER;
+
+    /// A minimal Inter-frame `Vp6HeaderTail` with the given filter
+    /// selectors; all geometry fields `None` (carried on the IntraHeader).
+    fn inter_tail(
+        loop_filter: LoopFilter,
+        prediction_filter: PredictionFilter,
+        prediction_filter_alpha: Option<u8>,
+    ) -> Vp6HeaderTail {
+        Vp6HeaderTail {
+            v_fragments: None,
+            h_fragments: None,
+            output_v_fragments: None,
+            output_h_fragments: None,
+            scaling_mode: None,
+            refresh_golden_frame: Some(false),
+            loop_filter,
+            prediction_filter,
+            prediction_filter_alpha,
+            use_huffman: false,
+        }
+    }
+
+    /// `FilterConfig::from_header` resolves a fixed-bicubic Advanced-profile
+    /// selector and an enabled loop filter into the operative policy +
+    /// loop-filter quantiser index.
+    #[test]
+    fn filter_config_from_header_fixed_bicubic_loop_on() {
+        let tail = inter_tail(
+            LoopFilter::Enabled { selector: 0 },
+            PredictionFilter::Fixed { bicubic: true },
+            Some(9),
+        );
+        let cfg = FilterConfig::from_header(&tail, 42);
+        assert_eq!(
+            cfg.policy,
+            PredictionFilterPolicy::Fixed(FilterFamily::Bicubic { alpha: 9 })
+        );
+        assert_eq!(cfg.loop_filter_qi, Some(42));
+    }
+
+    /// A `NotSignalled` selector (Simple profile / omitted) plus a
+    /// `Disabled` loop filter resolves to fixed bilinear with no loop
+    /// filtering — §11.4's Simple-profile-is-bilinear default.
+    #[test]
+    fn filter_config_from_header_not_signalled_is_bilinear_no_loop() {
+        let tail = inter_tail(LoopFilter::Disabled, PredictionFilter::NotSignalled, None);
+        let cfg = FilterConfig::from_header(&tail, 7);
+        assert_eq!(
+            cfg.policy,
+            PredictionFilterPolicy::Fixed(FilterFamily::Bilinear)
+        );
+        assert_eq!(cfg.loop_filter_qi, None);
+    }
+
+    /// An auto-select selector resolves the §11.4 thresholds and, with the
+    /// loop filter `NotSignalled`, leaves `loop_filter_qi` `None`.
+    #[test]
+    fn filter_config_from_header_auto_select_thresholds() {
+        let tail = inter_tail(
+            LoopFilter::NotSignalled,
+            PredictionFilter::AutoSelect {
+                var_thresh: 2,
+                mv_size_thresh: 3,
+            },
+            Some(4),
+        );
+        let cfg = FilterConfig::from_header(&tail, 12);
+        assert_eq!(
+            cfg.policy,
+            PredictionFilterPolicy::AutoSelect {
+                // (1 << (3-1)) << 2 == 4 << 2 == 16.
+                mv_size_thresh_qpel: 16,
+                // 2 << 5 == 64.
+                var_thresh: 64,
+                alpha: 4,
+            }
+        );
+        assert_eq!(cfg.loop_filter_qi, None);
+    }
 
     fn keyframe_inter_probs() -> InterProbs {
         InterProbs {

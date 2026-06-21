@@ -204,9 +204,22 @@ probability-update / rate-control surfaces.
   block predictor: §11.4 whole/fractional MV decomposition, the §11.3
   prediction loop filter at the straddled `BoundaryX`/`BoundaryY` edges
   (to a separate working window per §11.3), then §11.4 bilinear/bicubic
-  interpolation. `PredictionFilterPolicy` resolves the §11.4
+  interpolation. `PredictionFilterPolicy` is the *operative* §11.4
   `AutoSelectPMFlag` decision (fixed family, or per-block auto-select from
-  the MV-size and `Var16Point` variance thresholds).
+  the MV-size and `Var16Point` variance thresholds), built from the
+  signalled header fields by **`frame_header::PredictionFilter::resolve`**:
+  it converts the MV-size threshold to ¼-pixel units (`(1 << (thresh-1))
+  << 2`, or the no-restriction branch) and applies `FilterVarThresh =
+  PredictionFilterVarThresh << 5`. The §11.4 variance read uses
+  **`interp::var_16_point_clamped`**, which edge-clamps each sampled
+  position so an unrestricted (or out-of-spec long) MV whose
+  whole-sample-aligned window runs past a buffer edge replicates the §11.5
+  edge sample instead of indexing out of bounds (bit-identical to the
+  unclamped form for any in-range window).
+  **`inter_frame::FilterConfig::from_header`** then assembles the full
+  per-frame §11.3/§11.4 configuration from a decoded `Vp6HeaderTail` + the
+  frame's `DctQMask` (resolved family policy + the §11.3 loop-filter
+  quantiser index when `UseLoopFilter == 1`).
 - **`inter_frame::ReferenceFrames`** is the §4 golden-frame bookkeeping:
   previous-frame + Golden Frame buffers with the §4 update rules (seed
   Golden from an I-frame; refresh it on `RefreshGoldenFrame`).

@@ -898,7 +898,10 @@ pub use frame_assembly::{
     mb_cols_for, mb_rows_for, AssemblyError, Frame, Plane, BLOCK_DIM, MB_LUMA_BLOCKS,
     MB_LUMA_BLOCK_OFFSETS, MB_LUMA_DIM,
 };
-pub use frame_header::{CodingProfile, FrameType, Vp3Version, Vp6FrameHeader};
+pub use frame_header::{
+    CodingProfile, FrameType, LoopFilter, PredictionFilter, Vp3Version, Vp6FrameHeader,
+    Vp6HeaderTail,
+};
 pub use huffman::{
     codeword_for, create_huffman_tree, decode_symbol, tree_depth, HuffNode, HuffmanError,
     INTERNAL_SYMBOL, NO_CHILD,

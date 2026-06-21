@@ -34,6 +34,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `PredictionFilterPolicy::select` now takes a signed (`i64`) variance
   position and reads through the clamped form, so the Advanced-profile
   filter selection never panics on an edge/long-MV block.
+- `inter_frame::FilterConfig::from_header` — the per-frame bridge from a
+  decoded `Vp6HeaderTail` (+ the frame's `DctQMask`) to the operative
+  §11.3/§11.4 `FilterConfig`: it resolves the §11.4 family policy via
+  `PredictionFilter::resolve` and enables the §11.3 prediction loop filter
+  (carrying the quantiser index) only when the tail's `LoopFilter` reports
+  `Enabled`. Lets the GOP decode path build its filter configuration from
+  the real header instead of a hardcoded family. `Vp6HeaderTail`,
+  `LoopFilter` and `PredictionFilter` are now re-exported from the crate
+  root so the builder is reachable.
 
 ### Added (clean-room round 350, 2026-06-20)
 
