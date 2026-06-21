@@ -729,4 +729,74 @@ mod tests {
         assert_eq!(p_recon.u.samples(), key_recon.u.samples());
         assert_eq!(p_recon.v.samples(), key_recon.v.samples());
     }
+
+    /// A keyframe→P-frame GOP whose decode `FilterConfig` is built from the
+    /// **decoded keyframe header** via `FilterConfig::from_header` (rather
+    /// than a hardcoded family) round-trips an unchanged P-frame exactly.
+    /// The encoder emits a Simple-profile keyframe, so the tail's
+    /// prediction filter is `NotSignalled` ⇒ §11.4 bilinear with no loop
+    /// filter — the header-derived config matches the hand-built one and
+    /// the GOP reconstructs bit-for-bit.
+    #[test]
+    fn gop_filter_config_from_header_round_trips() {
+        use crate::frame_header::{Vp6FrameHeader, Vp6HeaderTail};
+        use crate::inter_frame::{decode_inter_frame_with_refs, ReferenceFrames};
+        use crate::intra_frame::decode_intra_frame;
+
+        let q = 24u8;
+        let key_source = pattern(4, 4);
+        let key_bytes = crate::intra_encode::encode_intra_frame(&key_source, q).expect("I-encode");
+        let hdr = Vp6FrameHeader::parse(&key_bytes).expect("header prefix");
+        let mut bc = BoolCoder::new(&key_bytes[hdr.raw_prefix_len..]).expect("bool coder");
+        let tail =
+            Vp6HeaderTail::parse_with(&mut bc, true, hdr.profile.unwrap(), hdr.version.unwrap())
+                .expect("tail");
+
+        // Build the operative filter config straight from the decoded
+        // header tail — the wiring under test.
+        let filter = FilterConfig::from_header(&tail, hdr.dct_q_mask);
+        // The encoder's keyframe is Simple profile ⇒ no signalled filter.
+        assert_eq!(
+            filter.policy,
+            PredictionFilterPolicy::Fixed(FilterFamily::Bilinear)
+        );
+        assert_eq!(filter.loop_filter_qi, None);
+
+        let key_recon = decode_intra_frame(
+            &mut bc,
+            key_source.h_fragments,
+            key_source.v_fragments,
+            hdr.dct_q_mask,
+            &IntraProbs::keyframe(),
+            &DEFAULT_SCAN_ORDER,
+        )
+        .expect("I-decode");
+
+        let refs = ReferenceFrames::from_keyframe(key_recon.clone());
+        let probs = keyframe_inter_probs();
+        let (prev_bordered, _g) = refs.bordered();
+
+        let p_bytes =
+            encode_inter_frame(&key_recon, &prev_bordered, q, &probs, &filter).expect("P-encode");
+        let mut p_bc = BoolCoder::new(&p_bytes).expect("P bool coder");
+        let p_recon = decode_inter_frame_with_refs(
+            &mut p_bc,
+            key_recon.h_fragments,
+            key_recon.v_fragments,
+            q,
+            &probs,
+            &DEFAULT_SCAN_ORDER,
+            &filter,
+            &refs,
+        )
+        .expect("P-decode");
+
+        assert_eq!(
+            p_recon.y.samples(),
+            key_recon.y.samples(),
+            "header-derived FilterConfig must reconstruct the GOP exactly"
+        );
+        assert_eq!(p_recon.u.samples(), key_recon.u.samples());
+        assert_eq!(p_recon.v.samples(), key_recon.v.samples());
+    }
 }

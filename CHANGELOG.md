@@ -43,6 +43,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the real header instead of a hardcoded family. `Vp6HeaderTail`,
   `LoopFilter` and `PredictionFilter` are now re-exported from the crate
   root so the builder is reachable.
+- `gop_filter_config_from_header_round_trips` — a keyframe→P-frame GOP test
+  whose decode `FilterConfig` is built from the *decoded keyframe header*
+  via `FilterConfig::from_header` (not a hardcoded family). It asserts the
+  Simple-profile keyframe resolves to §11.4 bilinear with no loop filter
+  and that an unchanged P-frame decoded with the header-derived config
+  reconstructs the keyframe bit-for-bit — an end-to-end check of the new
+  resolve→from_header wiring.
 
 ### Added (clean-room round 350, 2026-06-20)
 
