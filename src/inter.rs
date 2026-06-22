@@ -1882,4 +1882,118 @@ mod tests {
             }
         }
     }
+
+    /// §11.3 regression: a negative, non-whole-pixel MV whose §11.3
+    /// round-toward-zero reduction is whole-pixel-aligned must **not**
+    /// trigger loop filtering, even though the §11.4 arithmetic-shift floor
+    /// of the same MV is *not* aligned (and would have produced a non-zero
+    /// `BoundaryX` under the previous, buggy reduction).
+    ///
+    /// For luma, `mv_x == -2` (¼-pel) floors to whole `-1` (`BoundaryX ==
+    /// 1`, the old path) but truncates to `0` (`BoundaryX == 0`, the §11.3
+    /// path). With the fix the loop filter is skipped, so the loop-filter-on
+    /// output is byte-identical to the loop-filter-off interpolation.
+    #[test]
+    fn subpel_negative_mv_truncation_skips_loop_filter() {
+        let w = 24usize;
+        let h = 24usize;
+        // A vertical edge so the §11.3 deblock, if wrongly applied, would
+        // measurably alter samples near the (mis-computed) boundary column.
+        let mut img = vec![0u8; w * h];
+        for r in 0..h {
+            for c in 0..w {
+                img[r * w + c] = if c < w / 2 { 40 } else { 210 };
+            }
+        }
+        let (buf, stride, origin) = crate::umv::build_extended_buffer(&img, w, h);
+        let base = origin + 6 * stride + 6;
+
+        let policy = PredictionFilterPolicy::Fixed(FilterFamily::Bilinear);
+        // mv_x = -2 (¼-pel): floor whole -1, trunc whole 0, phase ½.
+        let mut pred_lf = [0u8; 64];
+        predict_inter_block_subpel(
+            &buf,
+            stride,
+            base,
+            -2,
+            0,
+            MvShift::Luma,
+            policy,
+            Some(20),
+            &mut pred_lf,
+        );
+        let mut pred_no_lf = [0u8; 64];
+        predict_inter_block_subpel(
+            &buf,
+            stride,
+            base,
+            -2,
+            0,
+            MvShift::Luma,
+            policy,
+            None,
+            &mut pred_no_lf,
+        );
+        // §11.3 BoundaryX == 0 ⇒ no filtering ⇒ identical to the
+        // unfiltered interpolation.
+        assert_eq!(
+            pred_lf, pred_no_lf,
+            "negative MV truncating to aligned must skip §11.3 loop filter"
+        );
+    }
+
+    /// Counterpart: a negative MV whose §11.3 truncation is genuinely
+    /// non-aligned still triggers the loop filter (the fix narrows the
+    /// boundary calc, it does not disable it). `mv_x == -6` (¼-pel)
+    /// truncates to whole `-1` ⇒ `BoundaryX == 1`. A *gentle* cross-boundary
+    /// step (small enough that the §11.3 `Bound` soft-clip passes a non-zero
+    /// response rather than zeroing it as it would for a sharp edge) lets
+    /// the deblock measurably alter the prediction, so the loop-filter-on
+    /// output differs from the unfiltered interpolation.
+    #[test]
+    fn subpel_negative_mv_nonaligned_still_filters() {
+        let w = 24usize;
+        let h = 24usize;
+        // whole_dx = floor(-6/4) = -2 ⇒ block spans original cols 4..12;
+        // BoundaryX == 1 ⇒ straddled edge between original cols 4 and 5.
+        // A small 6-level step there stays inside `2*FLimit` (FLimit == 7
+        // at qi == 20) so `Bound` yields a non-zero filter response.
+        let mut img = vec![0u8; w * h];
+        for r in 0..h {
+            for c in 0..w {
+                img[r * w + c] = if c < 5 { 100 } else { 106 };
+            }
+        }
+        let (buf, stride, origin) = crate::umv::build_extended_buffer(&img, w, h);
+        let base = origin + 6 * stride + 6;
+        let policy = PredictionFilterPolicy::Fixed(FilterFamily::Bilinear);
+        let mut pred_lf = [0u8; 64];
+        predict_inter_block_subpel(
+            &buf,
+            stride,
+            base,
+            -6,
+            0,
+            MvShift::Luma,
+            policy,
+            Some(20),
+            &mut pred_lf,
+        );
+        let mut pred_no_lf = [0u8; 64];
+        predict_inter_block_subpel(
+            &buf,
+            stride,
+            base,
+            -6,
+            0,
+            MvShift::Luma,
+            policy,
+            None,
+            &mut pred_no_lf,
+        );
+        assert_ne!(
+            pred_lf, pred_no_lf,
+            "negative MV truncating to a non-aligned whole pixel must filter"
+        );
+    }
 }

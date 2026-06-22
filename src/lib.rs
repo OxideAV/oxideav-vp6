@@ -925,8 +925,8 @@ pub use interp::{
 pub use intra_encode::encode_intra_frame;
 pub use intra_frame::{decode_intra_frame, IntraProbs};
 pub use loopfilter::{
-    bound, boundary_x, boundary_y, filter_horizontal_boundary, filter_vertical_boundary,
-    prediction_loop_filter_function, PREDICTION_LOOP_FILTER_LIMIT_VALUES,
+    bound, boundary_whole_pixel, boundary_x, boundary_y, filter_horizontal_boundary,
+    filter_vertical_boundary, prediction_loop_filter_function, PREDICTION_LOOP_FILTER_LIMIT_VALUES,
 };
 pub use mode_decode::{decode_mode, decode_mode_from_probs, descend_mode_tree};
 pub use mode_encode::{encode_mode, encode_mode_descend, encode_mode_from_probs};
