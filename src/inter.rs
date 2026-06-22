@@ -519,7 +519,8 @@ use crate::interp::{
     BILINEAR_CHROMA_FILTERS, BILINEAR_LUMA_FILTERS,
 };
 use crate::loopfilter::{
-    boundary_x, boundary_y, filter_horizontal_boundary, filter_vertical_boundary,
+    boundary_whole_pixel, boundary_x, boundary_y, filter_horizontal_boundary,
+    filter_vertical_boundary,
 };
 
 /// Which §11.4 interpolation-filter family the decoder applies for a
@@ -730,8 +731,14 @@ pub fn predict_inter_block_subpel(
 
     if let Some(qi) = loop_filter_qi {
         if mv_x != 0 || mv_y != 0 {
-            let bx = boundary_x(whole_dx);
-            let by = boundary_y(whole_dy);
+            // §11.3 derives the boundary offsets from a *round-toward-zero*
+            // whole-pixel reduction of the MV (distinct from §11.4's
+            // arithmetic-shift floor `whole_dx`/`whole_dy` used for the
+            // source position and variance window). For negative MV
+            // components the two differ, and feeding the floor value here
+            // would straddle a boundary the spec leaves unfiltered.
+            let bx = boundary_x(boundary_whole_pixel(mv_x, shift.bits()));
+            let by = boundary_y(boundary_whole_pixel(mv_y, shift.bits()));
             if bx != 0 || by != 0 {
                 // Copy the WIN×WIN window centred so the block's top-left
                 // (src_pos) lands at window offset (MARGIN, MARGIN).

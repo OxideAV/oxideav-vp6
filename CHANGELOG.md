@@ -6,6 +6,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed (clean-room round 359, 2026-06-22)
+
+- §11.3 prediction loop filter: the `BoundaryX` / `BoundaryY` straddled-edge
+  offsets are now derived from the spec's own **round-toward-zero**
+  whole-pixel reduction (`mVx = (mx>0) ? (mx>>shift) : -((-mx)>>shift)`) via
+  the new `loopfilter::boundary_whole_pixel`, instead of reusing §11.4's
+  arithmetic-shift floor (`MvX >> MvShift`). The two agree for non-negative
+  MV components but diverge for negative ones whose magnitude is not a
+  multiple of `2^MvShift` — e.g. a luma MV component of `-1` floors to `-1`
+  (yielding `BoundaryX == 1`) but truncates to `0` (yielding `BoundaryX ==
+  0`, no straddled boundary). The previous code filtered a boundary §11.3
+  leaves unfiltered for such negative MVs, corrupting the prediction signal;
+  the loop-filtered sub-pixel MC path (`predict_inter_block_subpel`) now
+  matches §11.3 exactly across the full signed MV range.
+
 ### Added (clean-room round 356, 2026-06-21)
 
 - `PredictionFilter::resolve` — the §11.4 bridge from the *signalled*

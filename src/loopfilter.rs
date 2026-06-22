@@ -118,6 +118,42 @@ pub fn boundary_y(mvy_whole: i32) -> i32 {
     (8 - (mvy_whole & 7)) & 7
 }
 
+/// The §11.3 whole-pixel-aligned motion-vector component used **only** to
+/// derive [`boundary_x`] / [`boundary_y`].
+///
+/// §11.3 spells out its own whole-pixel reduction, distinct from §11.4's
+/// `MvX >> MvShift`:
+///
+/// > ```text
+/// > if(mx > 0 )
+/// >     mVx = (mx >> MvShift)
+/// > else
+/// >     mVx = -((-mx) >> MvShift)
+/// > ```
+///
+/// This is **round-toward-zero** (truncating) division by `2^MvShift`,
+/// *not* the arithmetic-shift floor that
+/// [`crate::inter::whole_sample_aligned`] applies for the §11.4 source
+/// position and variance window. The two agree for non-negative MV
+/// components but diverge for negative ones whose magnitude is not a
+/// multiple of `2^MvShift`: e.g. for luma (`MvShift == 2`) a component of
+/// `-1` floors to `-1` (§11.4) but truncates to `0` here (§11.3), which in
+/// turn moves `BoundaryX` from `1` to `0` (no straddled vertical
+/// boundary). Feeding the §11.4 floor value into [`boundary_x`] for a
+/// negative MV therefore filters a boundary the spec does not, corrupting
+/// the prediction signal; this function restores the §11.3 truncation.
+///
+/// `mv_component` is the raw MV component in `shift`-precision units;
+/// `shift_bits` is the `MvShift` (`2` for luma, `3` for chroma).
+#[inline]
+pub fn boundary_whole_pixel(mv_component: i32, shift_bits: u32) -> i32 {
+    if mv_component > 0 {
+        mv_component >> shift_bits
+    } else {
+        -((-mv_component) >> shift_bits)
+    }
+}
+
 /// The §11.3 `abs(SignedVal)` helper. Provided as a free function so the
 /// transcription stays literal against the spec pseudocode; the
 /// implementation is `i32::abs`. Wraps at `i32::MIN` per Rust semantics —
@@ -440,6 +476,58 @@ mod tests {
         for mvy in -16..=16 {
             assert_eq!(boundary_y(mvy), (8 - (mvy & 7)) & 7);
         }
+    }
+
+    /// §11.3 `mVx = (mx > 0) ? (mx >> shift) : -((-mx) >> shift)` is a
+    /// round-toward-zero reduction. For non-negative inputs it agrees with
+    /// the plain arithmetic shift; for negatives it truncates toward zero,
+    /// diverging from the §11.4 floor where the magnitude is not a multiple
+    /// of `2^shift`.
+    #[test]
+    fn boundary_whole_pixel_truncates_toward_zero() {
+        // Luma (shift 2): -1 truncates to 0 (§11.4 floor would give -1).
+        assert_eq!(boundary_whole_pixel(-1, 2), 0);
+        assert_eq!(boundary_whole_pixel(-3, 2), 0);
+        assert_eq!(boundary_whole_pixel(-4, 2), -1);
+        assert_eq!(boundary_whole_pixel(-5, 2), -1);
+        // Positive side matches a plain shift.
+        assert_eq!(boundary_whole_pixel(1, 2), 0);
+        assert_eq!(boundary_whole_pixel(4, 2), 1);
+        assert_eq!(boundary_whole_pixel(7, 2), 1);
+        assert_eq!(boundary_whole_pixel(0, 2), 0);
+        // Chroma (shift 3).
+        assert_eq!(boundary_whole_pixel(-7, 3), 0);
+        assert_eq!(boundary_whole_pixel(-8, 3), -1);
+        assert_eq!(boundary_whole_pixel(8, 3), 1);
+    }
+
+    /// The §11.3 truncation matches `i32::abs`-preserving truncating
+    /// division `mv / 2^shift` for the full signed range — the operative
+    /// definition of round-toward-zero.
+    #[test]
+    fn boundary_whole_pixel_equals_truncating_division() {
+        for shift in [2u32, 3] {
+            let div = 1i32 << shift;
+            for mv in -512..=512 {
+                assert_eq!(boundary_whole_pixel(mv, shift), mv / div);
+            }
+        }
+    }
+
+    /// Regression: a negative non-aligned luma MV must yield `BoundaryX ==
+    /// 0` (no straddled vertical boundary) when fed through the §11.3
+    /// round-toward-zero reduction, whereas the §11.4 arithmetic-shift
+    /// floor (`-1 >> 2 == -1`) would wrongly produce `BoundaryX == 1`.
+    #[test]
+    fn boundary_negative_mv_uses_truncation_not_floor() {
+        // §11.4 floor path (the old, buggy call):
+        let floor_whole = -1i32 >> 2; // == -1
+        assert_eq!(boundary_x(floor_whole), 1); // would filter col 1
+
+        // §11.3 truncation path (correct):
+        let trunc_whole = boundary_whole_pixel(-1, 2); // == 0
+        assert_eq!(boundary_x(trunc_whole), 0); // no boundary filtered
+        assert_eq!(boundary_y(trunc_whole), 0);
     }
 
     /// All return values from `boundary_x` / `boundary_y` are in
