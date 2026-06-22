@@ -204,7 +204,13 @@ probability-update / rate-control surfaces.
   block predictor: §11.4 whole/fractional MV decomposition, the §11.3
   prediction loop filter at the straddled `BoundaryX`/`BoundaryY` edges
   (to a separate working window per §11.3), then §11.4 bilinear/bicubic
-  interpolation. `PredictionFilterPolicy` is the *operative* §11.4
+  interpolation. The §11.3 `BoundaryX`/`BoundaryY` offsets are derived from
+  the spec's own **round-toward-zero** whole-pixel MV reduction
+  (`loopfilter::boundary_whole_pixel`, `mVx = (mx>0)?(mx>>shift):-((-mx)>>shift)`),
+  which is distinct from §11.4's arithmetic-shift floor used for the source
+  position and variance window — the two diverge for negative MVs whose
+  magnitude is not a multiple of `2^MvShift`, and using the floor would
+  filter a boundary §11.3 leaves unfiltered. `PredictionFilterPolicy` is the *operative* §11.4
   `AutoSelectPMFlag` decision (fixed family, or per-block auto-select from
   the MV-size and `Var16Point` variance thresholds), built from the
   signalled header fields by **`frame_header::PredictionFilter::resolve`**:
