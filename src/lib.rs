@@ -842,6 +842,7 @@ pub mod block_decode;
 pub mod bool_coder;
 pub mod dc_pred;
 pub mod dct_decode;
+pub mod decode_frame;
 pub mod dequant;
 pub mod forward_dct;
 pub mod fourmv;

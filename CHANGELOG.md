@@ -6,6 +6,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 363, 2026-06-23)
+
+- **Top-level per-frame assembly** (`decode_frame::Vp6Decoder`): a stateful
+  decoder that sequences the §9 header prefix parse (`Vp6FrameHeader::parse`)
+  → BoolCoder construction over the partition → §9 header-tail parse
+  (`Vp6HeaderTail::parse_with`) → keyframe/inter dispatch
+  (`decode_intra_frame` / `decode_inter_frame_with_refs`), threading the §9
+  cross-frame profile/version (Table 3 omits both — inherited from the most
+  recent I-frame) and the §4 `ReferenceFrames` across `decode_packet` calls.
+  Updates the §4 previous-frame + Golden Frame buffers per the
+  `RefreshGoldenFrame` rules after every frame. Targets the no-probability-
+  update / single-partition / BoolCoder-coefficient frame shape the in-tree
+  encoders produce (the §10/§11.2/§13 update sub-streams' exact Figure-5
+  ordering still awaits a conformant `.vp6` fixture; `MultiStream`/`UseHuffman`
+  surface as `NotImplemented`). A keyframe → P-frame GOP now round-trips
+  end-to-end through one `Vp6Decoder` instance.
+- **P-frame packet encoder** (`inter_encode::encode_inter_frame_packet`): the
+  §9 InterHeader emit (Table 1 raw prefix `FrameType=1`/`DctQMask`/
+  `MultiStream=0` + the Table 3 BoolCoder tail `RefreshGoldenFrame`/
+  `UseHuffman`) prepended to the existing data partition, so an encoded
+  P-frame is a self-describing packet `Vp6Decoder::decode_packet` consumes.
+  `encode_inter_frame` is refactored to delegate to a shared
+  `encode_inter_frame_body` taking a header-tail prelude closure (the two
+  tail bits ride the data partition's BoolCoder, which is not byte-splittable).
+- **`InterProbs::keyframe()`** and **`ReferenceFrames::coded_fragments()`**
+  constructors/accessors: the inter dual of `IntraProbs::keyframe()` (the §10
+  baseline `probXmitted` + §11 default MV banks + §13 baseline coefficient
+  banks) and the reference-frame geometry an inter frame inherits. Two
+  duplicated test helpers collapse onto the new constructor.
+
 ### Fixed (clean-room round 359, 2026-06-22)
 
 - §11.3 prediction loop filter: the `BoundaryX` / `BoundaryY` straddled-edge

@@ -296,6 +296,22 @@ pub fn encode_inter_frame(
     probs: &InterProbs,
     filter: &FilterConfig,
 ) -> Result<Vec<u8>, Error> {
+    // Bare data partition: no header-tail prelude on the coder.
+    encode_inter_frame_body(source, prev, dct_q_mask, probs, filter, |_| {})
+}
+
+/// Shared P-frame body: open a [`BoolEncoder`], run `prelude` against it
+/// (used by [`encode_inter_frame_packet`] to emit the §9 InterHeader tail
+/// bits in the same arithmetic stream), then encode every macroblock's
+/// §10 mode + §13 coefficients. Returns the finished partition.
+fn encode_inter_frame_body(
+    source: &Frame,
+    prev: &BorderedRef,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    filter: &FilterConfig,
+    prelude: impl FnOnce(&mut BoolEncoder),
+) -> Result<Vec<u8>, Error> {
     let h_fragments = source.h_fragments;
     let v_fragments = source.v_fragments;
     if h_fragments > u8::MAX as usize || v_fragments > u8::MAX as usize {
@@ -308,6 +324,7 @@ pub fn encode_inter_frame(
     let dequant = DequantContext::new(dct_q_mask);
 
     let mut enc = BoolEncoder::new();
+    prelude(&mut enc);
 
     // Per-plane coded-DC grids + §14 prediction contexts, mirroring the
     // decoder exactly.
@@ -428,6 +445,69 @@ pub fn encode_inter_frame(
     Ok(enc.finish())
 }
 
+/// Encode a complete P-frame **packet** — the §9 InterHeader (raw-bit
+/// prefix + BoolCoder-coded tail) followed by the data partition
+/// [`encode_inter_frame`] produces — so the result decodes end-to-end
+/// through the top-level [`crate::decode_frame::Vp6Decoder`].
+///
+/// This is the inter-frame dual of [`crate::intra_encode::encode_intra_frame`]'s
+/// header emit: where `encode_inter_frame` returns only the BoolCoder
+/// data partition the per-MB driver consumes directly, this wrapper
+/// prepends the §9 InterHeader so the bytes are a self-describing packet.
+///
+/// It emits the **simplest valid P-frame shape**, matching the keyframe
+/// encoder's Simple/VP6.0 profile:
+///
+/// * **Table 1 raw prefix** — `FrameType = 1` (inter), `DctQMask`,
+///   `MultiStream = 0`. No `Buff2Offset` (the inter-frame header parse
+///   stops after Table 1 for the single-partition arrangement).
+/// * **InterHeader tail (Table 3)** — `RefreshGoldenFrame b(1) = 0`,
+///   then `UseHuffman b(1) = 0`. Simple profile carries no loop-filter
+///   fields; VP6.0 (not VP6.2) carries no prediction-filter fields or
+///   `PredictionFilterAlpha`, so the tail is exactly those two flags.
+///
+/// `source` and `prev` are as for [`encode_inter_frame`]: the P-frame
+/// source pixels and the §11.5-bordered previous-frame reconstruction.
+/// `probs` and `filter` must be the keyframe-baseline banks
+/// ([`InterProbs::keyframe`]) and the matching Simple-profile filter
+/// config the decoder seeds.
+///
+/// # Errors
+///
+/// Propagates [`Error::NotImplemented`] from [`encode_inter_frame`] for
+/// an over-large frame geometry.
+pub fn encode_inter_frame_packet(
+    source: &Frame,
+    prev: &BorderedRef,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    filter: &FilterConfig,
+) -> Result<Vec<u8>, Error> {
+    let dct_q_mask = dct_q_mask & 0x3F;
+
+    // --- §9 raw-bit header prefix (Table 1, byte-aligned) ---
+    let mut header = oxideav_core::bits::BitWriter::with_capacity(1);
+    header.write_u32(1, 1); // FrameType = 1 (inter)
+    header.write_u32(dct_q_mask as u32, 6);
+    header.write_u32(0, 1); // MultiStream = 0
+    let raw_prefix = header.finish();
+
+    // --- §9 BoolCoder-coded InterHeader tail (Table 3) + data ---
+    // The header tail must share the *same* BoolCoder stream the decoder
+    // reads (a BoolCoder partition is not byte-splittable), so the two
+    // tail bits are emitted as a prelude on the data partition's coder:
+    // RefreshGoldenFrame b(1) = 0, then (Simple/VP6.0: no loop/pred-filter
+    // fields) UseHuffman b(1) = 0, immediately followed by the per-MB data.
+    let data = encode_inter_frame_body(source, prev, dct_q_mask, probs, filter, |enc| {
+        enc.encode_b1(0); // RefreshGoldenFrame = 0
+        enc.encode_b1(0); // UseHuffman = 0
+    })?;
+
+    let mut out = raw_prefix;
+    out.extend_from_slice(&data);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,15 +515,10 @@ mod tests {
     use crate::inter::{FilterFamily, PredictionFilterPolicy};
     use crate::inter_frame::{decode_inter_frame, InterProbs};
     use crate::intra_frame::IntraProbs;
-    use crate::mv_decode::{MvProbs, MV_AXIS_X, MV_AXIS_Y};
     use crate::scan::DEFAULT_SCAN_ORDER;
 
     fn keyframe_inter_probs() -> InterProbs {
-        InterProbs {
-            mode_probs: crate::modes::VP6_BASELINE_XMITTED_PROBS,
-            mv_probs: [MvProbs::defaults(MV_AXIS_X), MvProbs::defaults(MV_AXIS_Y)],
-            coeffs: IntraProbs::keyframe(),
-        }
+        InterProbs::keyframe()
     }
 
     fn bilinear_filter() -> FilterConfig {

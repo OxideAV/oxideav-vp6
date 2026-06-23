@@ -193,6 +193,13 @@ impl ReferenceFrames {
         }
     }
 
+    /// The coded block-grid geometry `(h_fragments, v_fragments)` of the
+    /// reference frames — the dimensions an inter frame inherits since
+    /// Table 3 carries no geometry of its own.
+    pub fn coded_fragments(&self) -> (usize, usize) {
+        (self.previous.h_fragments, self.previous.v_fragments)
+    }
+
     /// Build the §11.5-bordered form of both reference buffers for one
     /// P-frame decode: `(previous, golden)`.
     pub fn bordered(&self) -> (BorderedRef, BorderedRef) {
@@ -241,6 +248,28 @@ pub struct InterProbs {
     /// The §13 coefficient banks (DC node contexts, AC, zero-run) —
     /// reused verbatim from the intra path, post-§13 update.
     pub coeffs: IntraProbs,
+}
+
+impl InterProbs {
+    /// Build the keyframe-baseline inter probability banks: the §10
+    /// `probXmitted` mode bank at its [`crate::modes::VP6_BASELINE_XMITTED_PROBS`]
+    /// defaults, the §11 two-axis MV bank at [`MvProbs::defaults`], and the
+    /// §13 coefficient banks at the [`IntraProbs::keyframe`] baselines.
+    ///
+    /// This is the inter dual of [`IntraProbs::keyframe`]: the starting
+    /// point a per-frame driver feeds into the §10/§11.2/§13 header
+    /// probability-update sub-streams before dispatching a P-frame whose
+    /// header signalled no updates (every probability stays at baseline).
+    pub fn keyframe() -> Self {
+        Self {
+            mode_probs: crate::modes::VP6_BASELINE_XMITTED_PROBS,
+            mv_probs: [
+                MvProbs::defaults(crate::mv_decode::MV_AXIS_X),
+                MvProbs::defaults(crate::mv_decode::MV_AXIS_Y),
+            ],
+            coeffs: IntraProbs::keyframe(),
+        }
+    }
 }
 
 /// The §11.3 / §11.4 prediction-filter configuration for a frame.
@@ -945,14 +974,7 @@ mod tests {
     }
 
     fn keyframe_inter_probs() -> InterProbs {
-        InterProbs {
-            mode_probs: crate::modes::VP6_BASELINE_XMITTED_PROBS,
-            mv_probs: [
-                MvProbs::defaults(crate::mv_decode::MV_AXIS_X),
-                MvProbs::defaults(crate::mv_decode::MV_AXIS_Y),
-            ],
-            coeffs: IntraProbs::keyframe(),
-        }
+        InterProbs::keyframe()
     }
 
     fn flat_ref(h_fragments: usize, v_fragments: usize, value: u8) -> Frame {
