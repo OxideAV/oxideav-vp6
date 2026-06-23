@@ -8,6 +8,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 363, 2026-06-23)
 
+- **`oxideav-core` `Decoder` registration** (`decoder::Vp6CodecDecoder`,
+  `register`): the framework `Decoder` trait over `decode_frame::Vp6Decoder`
+  — `send_packet` queues a compressed VP6 frame, `receive_frame` decodes it
+  into a 3-plane 4:2:0 `VideoFrame`. `register()` (previously a no-op)
+  installs the codec under id `"vp6"` with the On2 / Flash / Matroska
+  container tags (`VP60` / `VP61` / `VP62` / `vp6f` / `V_VP6`). The crate's
+  `Error` now maps into `oxideav_core::Error` (`Truncated` → invalid,
+  `NotImplemented` → unsupported).
 - **Top-level per-frame assembly** (`decode_frame::Vp6Decoder`): a stateful
   decoder that sequences the §9 header prefix parse (`Vp6FrameHeader::parse`)
   → BoolCoder construction over the partition → §9 header-tail parse

@@ -843,6 +843,7 @@ pub mod bool_coder;
 pub mod dc_pred;
 pub mod dct_decode;
 pub mod decode_frame;
+pub mod decoder;
 pub mod dequant;
 pub mod forward_dct;
 pub mod fourmv;
@@ -1025,10 +1026,14 @@ impl std::error::Error for Error {}
 
 /// Codec registration entry-point.
 ///
-/// The round-1 scaffold doesn't register a `Decoder` or `Encoder` —
-/// the full decoder isn't operational yet. Once the BoolCoder
-/// DOCS-GAP is closed and the remainder of the frame header parses,
-/// the decoder shell will be registered here.
-pub fn register(_ctx: &mut RuntimeContext) {}
+/// Installs the VP6 [`Decoder`](oxideav_core::Decoder) — driven by the
+/// top-level [`decode_frame::Vp6Decoder`] state machine — into the
+/// supplied [`RuntimeContext`] under the canonical id `"vp6"`, with the
+/// On2 / Flash / Matroska container tags VP6 carries. See
+/// [`decoder::register`] for the registration detail and
+/// [`decoder::register_codecs`] for the tag set.
+pub fn register(ctx: &mut RuntimeContext) {
+    decoder::register(ctx);
+}
 
 oxideav_core::register!("vp6", register);

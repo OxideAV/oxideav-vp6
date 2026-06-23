@@ -38,20 +38,33 @@ stage-for-stage inverse of the decode pipeline: (I) −128 level shift, or
 §15-inverse quantise → §14 DC delta → §13 token emit (+ §10 mode emit
 for P-frames via `mode_encode`).
 
-A full **keyframe → P-frame GOP** round-trips end-to-end: encode an
-I-frame, decode it, seed the §4 `ReferenceFrames`, encode a P-frame
-against the *decoded* keyframe, and decode it via
-`decode_inter_frame_with_refs` — an unchanged P-frame reproduces the
-keyframe reconstruction bit-for-bit.
+The crate now exposes a **top-level per-frame assembly** and a
+**registered `oxideav-core` `Decoder`**. `decode_frame::Vp6Decoder` is a
+stateful driver that sequences the §9 header prefix parse → BoolCoder
+construction → §9 header-tail parse → keyframe/inter dispatch, threading
+the §9 cross-frame profile/version (Table 3 omits both — inherited from
+the most recent I-frame) and the §4 `ReferenceFrames` across
+`decode_packet` calls. `decoder::Vp6CodecDecoder` wraps it in the
+framework `Decoder` trait (`send_packet`/`receive_frame` → 3-plane 4:2:0
+`VideoFrame`); `register()` installs it under id `"vp6"` with the On2 /
+Flash / Matroska container tags (`VP60` / `VP61` / `VP62` / `vp6f` /
+`V_VP6`). A full **keyframe → P-frame GOP** round-trips end-to-end
+through a single `Vp6Decoder`: a keyframe packet seeds the §4 refs +
+carries the profile/version, then an unchanged inter frame predicted from
+the decoded keyframe reproduces it bit-for-bit. The P-frame encoder now
+emits a self-describing packet too: `encode_inter_frame_packet` prepends
+the §9 InterHeader (Table 1 prefix + Table 3 BoolCoder tail) to the data
+partition so the round-trip flows through `decode_packet`.
 
-What remains is the top-level per-frame assembly (§9 header →
-§10/§11.2/§13 probability-update sub-streams → frame dispatch),
-**registering a `Decoder`/`Encoder` with `oxideav-core`** (`register()`
-is currently a no-op), the P-frame encoder's §9 InterHeader emit (the
-current `encode_inter_frame` returns the BoolCoder partition the
-decoder's per-MB driver consumes directly), and the encoder's motion
-estimation (the richer non-`CODE_INTER_NO_MV` modes) / per-frame
-probability-update / rate-control surfaces.
+What remains is the in-header **§10/§11.2/§13 probability-update
+sub-streams** (each pass exists — `mode_prob_update`, `mv_prob_update`,
+`prob_update`, `scan_update` — but the exact Figure-5 ordering relative
+to the header tail wants a conformant `.vp6` fixture to validate, so the
+top-level driver currently decodes only the no-update / single-partition
+/ BoolCoder-coefficient shape the in-tree encoders produce), the **`Encoder`
+registration**, and the encoder's motion estimation (the richer
+non-`CODE_INTER_NO_MV` modes) / per-frame probability-update /
+rate-control surfaces.
 
 ### Implemented stages
 
@@ -233,17 +246,37 @@ probability-update / rate-control surfaces.
   integer-MV MB-level glue (per-block §11.5-clamped fetch + §17
   recombine).
 
+### Top-level per-frame assembly + `Decoder` registration
+
+- **`decode_frame::Vp6Decoder`** is the stateful per-frame driver:
+  `decode_packet` parses the §9 header prefix (`Vp6FrameHeader::parse`),
+  builds the BoolCoder over the partition, parses the §9 header tail
+  (`Vp6HeaderTail::parse_with`), and dispatches keyframe →
+  `decode_intra_frame` / inter → `decode_inter_frame_with_refs`. It
+  threads the §9 cross-frame profile/version (Table 3 omits both) and the
+  §4 `ReferenceFrames` between calls, applying the §4/`RefreshGoldenFrame`
+  buffer update after every frame. Targets the no-probability-update /
+  single-partition / BoolCoder-coefficient shape (`MultiStream` /
+  `UseHuffman` / pre-keyframe-inter surface as errors). A keyframe →
+  P-frame GOP round-trips end-to-end through one instance.
+- **`decoder::Vp6CodecDecoder` + `register`** wrap `Vp6Decoder` in the
+  `oxideav_core::Decoder` trait (packet-queue → 3-plane 4:2:0
+  `VideoFrame`) and install it under id `"vp6"` with the On2 / Flash /
+  Matroska container tags. `register()` is no longer a no-op.
+- **`inter_encode::encode_inter_frame_packet`** is the §9 InterHeader
+  emit that turns the data-partition-only `encode_inter_frame` into a
+  self-describing P-frame packet `decode_packet` consumes.
+
 ### Blocked / remaining
 
-- **Top-level `Decoder` registration** — the per-frame assembly chain
-  (§9 header parse → §10 mode-prob updates → §11.2 MV-prob updates → §13
-  Figure-5 coefficient-prob updates / §12 scan updates → intra/P-frame
-  dispatch) and the registered `Decoder` shell over it. Each stage exists
-  (`frame_header`, `mode_prob_update`, `mv_prob_update`, `prob_update`,
-  `scan_update`, `decode_intra_frame`, `decode_inter_frame`); the
-  remaining work is sequencing them in the exact Figure-1/Figure-5
-  bitstream order, which wants a conformant `.vp6` fixture to validate the
-  parse order against.
+- **In-header probability-update sequencing + `Encoder` registration** —
+  the §10 mode-prob / §11.2 MV-prob / §13 Figure-5 coefficient-prob / §12
+  scan-update passes all exist (`mode_prob_update`, `mv_prob_update`,
+  `prob_update`, `scan_update`) but their exact Figure-1/Figure-5
+  ordering relative to the header tail wants a conformant `.vp6` fixture
+  to validate; the top-level driver therefore decodes only the no-update
+  frame shape so far. An `oxideav-core` `Encoder` shell over the
+  `encode_*_frame` paths is likewise unregistered.
 - **DOCS-GAP — FourMV MB neighbour representative.** §10 defines the
   Nearest/Near walk over "decoded macroblock neighbors" (one MV per
   neighbour MB), but never states which of a `CODE_INTER_FOURMV` MB's
