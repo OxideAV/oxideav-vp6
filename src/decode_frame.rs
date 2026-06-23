@@ -357,6 +357,86 @@ mod tests {
         assert_eq!(pf_out.v.samples(), kf_out.v.samples());
     }
 
+    /// A three-frame GOP (I, P, P) decodes through one `Vp6Decoder`: each
+    /// P-frame predicts from the **previous decoded frame**, so the §4
+    /// previous-frame buffer must advance after every `decode_packet`. An
+    /// all-zero-MV chain of unchanged content reproduces the keyframe at
+    /// every step — proving the reference buffer is the just-decoded
+    /// frame, not a stale keyframe copy.
+    #[test]
+    fn three_frame_gop_advances_reference_chain() {
+        let src = pattern_frame(4, 4);
+        let q = 40;
+        let probs = InterProbs::keyframe();
+        let filter = simple_inter_filter();
+
+        let mut dec = Vp6Decoder::new();
+        let kf_out = dec
+            .decode_packet(&encode_intra_frame(&src, q).expect("encode I"))
+            .expect("decode I");
+
+        // P1 predicts from the decoded keyframe.
+        let p1_bytes =
+            encode_inter_frame_packet(&kf_out, &BorderedRef::new(&kf_out), q, &probs, &filter)
+                .expect("encode P1");
+        let p1_out = dec.decode_packet(&p1_bytes).expect("decode P1");
+        assert_eq!(p1_out.y.samples(), kf_out.y.samples());
+
+        // P2 predicts from the decoded P1 (the advanced previous-frame
+        // buffer). Encode against P1's reconstruction, decode against the
+        // decoder's carried state.
+        let p2_bytes =
+            encode_inter_frame_packet(&p1_out, &BorderedRef::new(&p1_out), q, &probs, &filter)
+                .expect("encode P2");
+        let p2_out = dec.decode_packet(&p2_bytes).expect("decode P2");
+        assert_eq!(
+            p2_out.y.samples(),
+            p1_out.y.samples(),
+            "P2 must predict from the decoded P1, not a stale keyframe"
+        );
+        assert_eq!(p2_out.u.samples(), p1_out.u.samples());
+        assert_eq!(p2_out.v.samples(), p1_out.v.samples());
+    }
+
+    /// A content-changed P-frame (different source than the reference)
+    /// decodes through `decode_packet` above a quantiser-bounded PSNR
+    /// floor — the residual path (non-zero coefficients on the zero-MV
+    /// prediction) flows through the top-level driver.
+    #[test]
+    fn changed_pframe_clears_floor_through_decode_packet() {
+        let kf_src = flat_frame(4, 4, 120);
+        let q = 32;
+        let probs = InterProbs::keyframe();
+        let filter = simple_inter_filter();
+
+        let mut dec = Vp6Decoder::new();
+        let kf_out = dec
+            .decode_packet(&encode_intra_frame(&kf_src, q).expect("encode I"))
+            .expect("decode I");
+
+        // Changed P-frame source: a gradient over the flat reference.
+        let mut p_src = kf_out.clone();
+        let yw = p_src.y.width();
+        let yh = p_src.y.height();
+        for r in 0..yh {
+            for c in 0..yw {
+                p_src.y.samples_mut()[r * yw + c] =
+                    (120 + ((r + c) % 24) as i32 - 12).clamp(0, 255) as u8;
+            }
+        }
+
+        let p_bytes =
+            encode_inter_frame_packet(&p_src, &BorderedRef::new(&kf_out), q, &probs, &filter)
+                .expect("encode P");
+        let p_out = dec.decode_packet(&p_bytes).expect("decode P");
+
+        let y = psnr(p_src.y.samples(), p_out.y.samples());
+        assert!(
+            y >= 30.0,
+            "changed P-frame luma PSNR {y:.2} dB below floor — residual path regression"
+        );
+    }
+
     /// An inter frame before any keyframe has no reference / profile —
     /// the driver reports `NotImplemented` rather than guessing.
     #[test]

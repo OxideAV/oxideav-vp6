@@ -43,6 +43,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   baseline `probXmitted` + §11 default MV banks + §13 baseline coefficient
   banks) and the reference-frame geometry an inter frame inherits. Two
   duplicated test helpers collapse onto the new constructor.
+- **Multi-frame GOP coverage** through `Vp6Decoder`: a three-frame (I, P, P)
+  GOP test proves the §4 previous-frame buffer advances after every
+  `decode_packet` (P2 predicts from the decoded P1, not a stale keyframe),
+  and a content-changed P-frame test exercises the residual path (non-zero
+  coefficients on the zero-MV prediction) through the top-level driver above
+  a quantiser-bounded PSNR floor.
 
 ### Fixed (clean-room round 359, 2026-06-22)
 
