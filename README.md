@@ -208,25 +208,32 @@ exists** (`encode_inter_frame_me`).
   `(mode, availability, last_mode)` triple against the decoder.
 - **`inter_encode::encode_inter_frame_me`** is the **motion-estimated
   P-frame encoder** — a strict superset of `encode_inter_frame` that codes
-  each MB as either `CODE_INTER_NO_MV` or `CODE_INTER_PLUS_MV`. Per MB it
-  runs a two-stage luma motion search (`search_luma_mv`): an integer-pel
-  box search over `±ME_SEARCH_RANGE` whole samples around `(0,0)` then a
-  ¼-pel refinement, minimising the 16×16 luma SAD (`luma_mb_sad`) computed
-  against the *same* `predict_inter_block_subpel` prediction the decoder
-  forms. It picks `CODE_INTER_PLUS_MV` only when the best MV beats zero-MV
-  by more than `ME_LAMBDA_SAD` (a Lagrangian λ proxy for the MV bit-cost)
-  and the §11 differential delta is representable; the encoded delta is
-  `best_mv − differential_reference` (the nearest same-reference above/left
-  neighbour via `select_diff_reference_mv_from_grid`, else zero), emitted
-  with `mv_encode::encode_mv_pair`. The encoder threads the **identical**
-  §10/§11 `mv_grid`, `last_mode` and §10 Nearest/Near availability
-  (`resolve_near_mvs`) the decoder builds, so each MB's reconstructed MV,
-  mode-context and residual match the decoder exactly. Luma residual is
-  formed against the chosen MV; chroma against the MB MV at ⅛-pel (§11.4).
-  Round-trip tests against `decode_inter_frame` pin the unchanged→exact
-  reduction, translated-source reconstruction above a floor, ME ≥ zero-MV
-  on translation, the single-MB path, the multi-MB shared-motion
-  differential-reference path, and a full keyframe → ME-P GOP.
+  each MB as one of `CODE_INTER_NO_MV` / `CODE_INTER_NEAREST_MV` /
+  `CODE_INTER_NEAR_MV` (implicit, no MV bits) or `CODE_INTER_PLUS_MV` (an
+  explicit §11.1-coded MV). Per MB it runs a two-stage luma motion search
+  (`search_luma_mv`): an integer-pel box search over `±ME_SEARCH_RANGE`
+  whole samples around `(0,0)` then a ¼-pel refinement, minimising the
+  16×16 luma SAD (`luma_mb_sad`) computed against the *same*
+  `predict_inter_block_subpel` prediction the decoder forms. The mode
+  decision (`decide_mb_mode`) weighs all options by reconstruction SAD plus
+  a bit-cost model: the cheapest implicit option (zero, or a §10
+  Nearest/Near neighbour vector) wins unless the searched
+  `CODE_INTER_PLUS_MV` beats it by more than `ME_LAMBDA_SAD` (a Lagrangian
+  λ proxy for the MV bit-cost) and its §11 differential delta is
+  representable. The explicit delta is `best_mv − differential_reference`
+  (the nearest same-reference above/left neighbour via
+  `select_diff_reference_mv_from_grid`, else zero), emitted with
+  `mv_encode::encode_mv_pair`. The Nearest/Near candidates come from the
+  same `resolve_near_mvs` walk that supplies the §10 availability, and the
+  encoder threads the **identical** §10/§11 `mv_grid` / `last_mode` the
+  decoder builds, so each MB's reconstructed MV, mode-context and residual
+  match the decoder exactly. Luma residual is formed against the chosen MV;
+  chroma against the MB MV at ⅛-pel (§11.4). Round-trip tests against
+  `decode_inter_frame` pin the unchanged→exact reduction, translated-source
+  reconstruction above a floor, ME ≥ zero-MV on translation, the single-MB
+  path, the shared-motion differential-reference path, a uniform-motion
+  frame exercising the implicit Nearest/Near modes, and a full keyframe →
+  ME-P GOP; `decide_mb_mode` unit tests pin the selection logic.
 - **`mv_encode`** is the bit-for-bit inverse of `mv_decode`'s §11.1
   per-component decode: `encode_mv_component` emits the
   `B(IsMvShortProbs)` short/long discriminator (short for `|c| ≤ 7`, long

@@ -19,12 +19,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     the decoder forms — so the cost reflects the exact reconstruction
     pixels. Stage 1 is an integer-pel box over `±ME_SEARCH_RANGE`; stage 2
     refines over the eight ¼-pel neighbours of the best integer MV.
-  - **Mode decision**: `CODE_INTER_PLUS_MV` is chosen only when the best
-    MV beats zero-MV by more than `ME_LAMBDA_SAD` (a Lagrangian λ proxy
-    for the MV bit-cost) *and* the §11 differential delta is representable;
-    otherwise the MB falls back to `CODE_INTER_NO_MV`. The path is a
-    strict superset of `encode_inter_frame`: a motionless frame reduces to
-    all-zero-MV and round-trips exactly.
+  - **Mode decision** (`decide_mb_mode`): weighs the §10 single-vector
+    modes by reconstruction SAD plus a bit-cost model. The implicit-MV
+    modes — `CODE_INTER_NO_MV` (zero), `CODE_INTER_NEAREST_MV` and
+    `CODE_INTER_NEAR_MV` (reuse a §10 neighbour's vector) — read **no** MV
+    bits, so the cheapest available implicit option wins unless an explicit
+    `CODE_INTER_PLUS_MV` beats it by more than `ME_LAMBDA_SAD` (a
+    Lagrangian λ proxy for the MV bit-cost) *and* its §11 differential
+    delta is representable. The Nearest/Near candidate vectors come from
+    the same `resolve_near_mvs` walk that supplies the §10 availability, so
+    the encoder's implicit-mode reconstruction matches the decoder's
+    Nearest/Near resolution exactly. The path is a strict superset of
+    `encode_inter_frame`: a motionless frame reduces to all-zero-MV and
+    round-trips exactly.
   - **Differential MV emit**: the encoded delta is
     `best_mv − differential_reference` (the nearest same-reference
     above/left neighbour via `select_diff_reference_mv_from_grid`, else
@@ -40,17 +47,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     `predict_inter_block_subpel`, guaranteeing bit-identical predictions.
   - `ME_LAMBDA_SAD` (`64`) and `ME_SEARCH_RANGE` (`8` whole samples)
     tune the cost margin and search extent.
-  Six round-trip tests against the decoder pin: the unchanged-frame exact
+  Round-trip tests against the decoder pin: the unchanged-frame exact
   round-trip (ME reduces to zero-MV); a translated-source reconstruction
   above a PSNR floor; ME at-least-matching the zero-MV encoder on a
   translated gradient; the single-MB path; the multi-MB shared-motion
-  **differential-reference** path (a right-neighbour codes its MV relative
-  to the left neighbour's reconstructed MV); and a full keyframe → ME
-  P-frame GOP through `decode_inter_frame_with_refs`. All memory-bounded
-  (small grids; the search is `O(range² · 256)` SAD adds per MB).
-  `encode_inter_frame_packet` is now re-exported from the crate root.
-  Derived solely from the decode pipeline it inverts; no third-party VP6
-  source consulted.
+  **differential-reference** path; a larger uniform-motion frame
+  exercising the **implicit Nearest/Near modes**; and a full keyframe → ME
+  P-frame GOP through `decode_inter_frame_with_refs`. Four `decide_mb_mode`
+  unit tests pin the mode-selection logic (search-wins → PlusMv;
+  within-margin → Nearest; nothing-better → Zero; lowest-SAD implicit →
+  Near). All memory-bounded (small grids; the search is `O(range² · 256)`
+  SAD adds per MB). `encode_inter_frame_packet` is now re-exported from the
+  crate root. Derived solely from the decode pipeline it inverts; no
+  third-party VP6 source consulted.
 - **`inter_encode::encode_inter_frame_me_packet`** — the §9-self-describing
   motion-estimated P-frame packet (the ME dual of
   `encode_inter_frame_packet`): the Table 1 raw prefix + Table 3 BoolCoder

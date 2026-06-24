@@ -609,6 +609,90 @@ fn search_luma_mv(
     (best_mv, best_sad)
 }
 
+/// Inputs to the per-MB mode decision: the search result, the §11
+/// differential reference, the §10 Nearest/Near candidate MVs (when they
+/// exist for this MB), and the 16×16 luma SAD of each candidate.
+struct MbModeInputs {
+    /// The best searched motion vector.
+    best_mv: MotionVector,
+    /// The 16×16 luma SAD of `best_mv`.
+    best_sad: u64,
+    /// The §11 differential reference MV (nearest same-reference above/left
+    /// neighbour, else zero) — `best_mv − reference_mv` is the New-MV delta.
+    reference_mv: MotionVector,
+    /// The §10 Nearest neighbour MV, when one exists.
+    nearest_mv: Option<MotionVector>,
+    /// The §10 Near neighbour MV, when one exists.
+    near_mv: Option<MotionVector>,
+    /// The luma SAD of the zero motion vector.
+    zero_sad: u64,
+    /// The luma SAD of `nearest_mv` (when present).
+    nearest_sad: Option<u64>,
+    /// The luma SAD of `near_mv` (when present).
+    near_sad: Option<u64>,
+}
+
+/// The chosen coding mode for one MB: the §10 mode, the reconstructed MB MV,
+/// and (for `CODE_INTER_PLUS_MV` only) the §11.1 delta to emit.
+struct MbModeDecision {
+    mode: CodingMode,
+    mb_mv: MotionVector,
+    delta: Option<(i32, i32)>,
+}
+
+/// Decide one MB's coding mode, weighing the §10 single-vector modes by
+/// reconstruction SAD plus a bit-cost model.
+///
+/// The implicit-MV modes (`CODE_INTER_NO_MV` / `CODE_INTER_NEAREST_MV` /
+/// `CODE_INTER_NEAR_MV`) read **no** MV bits — they reuse the zero vector or
+/// a neighbour's vector — so the encoder prefers them when their SAD is
+/// within [`ME_LAMBDA_SAD`] of the searched `CODE_INTER_PLUS_MV` SAD (i.e.
+/// the explicit MV doesn't buy enough residual reduction to pay for its
+/// bits). Among the implicit modes the lowest-SAD one wins; a
+/// `CODE_INTER_PLUS_MV` is taken only when it beats every available implicit
+/// option by the margin **and** the delta is representable.
+///
+/// The decoder reconstructs each implicit mode's MV from the same §10
+/// Nearest/Near walk the caller supplied here, so the `mb_mv` recorded into
+/// the neighbour grid matches the decoder's reconstruction exactly.
+fn decide_mb_mode(inp: MbModeInputs) -> MbModeDecision {
+    // Candidate implicit-MV options: (mode, mv, sad). Zero is always
+    // available; Nearest/Near only when the §10 walk found them.
+    let mut best_implicit = (CodingMode::InterNoMv, MotionVector::ZERO, inp.zero_sad);
+    if let (Some(mv), Some(sad)) = (inp.nearest_mv, inp.nearest_sad) {
+        if sad < best_implicit.2 {
+            best_implicit = (CodingMode::InterNearestMv, mv, sad);
+        }
+    }
+    if let (Some(mv), Some(sad)) = (inp.near_mv, inp.near_sad) {
+        if sad < best_implicit.2 {
+            best_implicit = (CodingMode::InterNearMv, mv, sad);
+        }
+    }
+
+    // A New-MV is worth its bits only if it beats the best implicit option by
+    // the bit-cost margin and the delta is representable.
+    let delta_x = inp.best_mv.x as i32 - inp.reference_mv.x as i32;
+    let delta_y = inp.best_mv.y as i32 - inp.reference_mv.y as i32;
+    let delta_representable =
+        delta_x.unsigned_abs() <= MAX_MV_MAGNITUDE && delta_y.unsigned_abs() <= MAX_MV_MAGNITUDE;
+    let new_is_distinct = inp.best_mv != best_implicit.1;
+
+    if new_is_distinct && delta_representable && inp.best_sad + ME_LAMBDA_SAD < best_implicit.2 {
+        MbModeDecision {
+            mode: CodingMode::InterPlusMv,
+            mb_mv: inp.best_mv,
+            delta: Some((delta_x, delta_y)),
+        }
+    } else {
+        MbModeDecision {
+            mode: best_implicit.0,
+            mb_mv: best_implicit.1,
+            delta: None,
+        }
+    }
+}
+
 /// Encode a motion-estimated P-frame into the BoolCoder data partition
 /// [`crate::inter_frame::decode_inter_frame`] consumes.
 ///
@@ -692,17 +776,20 @@ fn encode_inter_frame_me_body(
     let mut last_mode = CodingMode::InterNoMv;
     for mb_row in 0..mb_rows {
         for mb_col in 0..mb_cols {
-            // --- §10 availability from the MV grid built so far (exactly the
-            // decoder's resolution: same-reference InterLast, zero-MV skip).
-            let availability = resolve_near_mvs(
+            // --- §10 Nearest/Near resolution + availability from the MV grid
+            // built so far (exactly the decoder's resolution: same-reference
+            // InterLast, zero-MV skip). This single walk supplies both the
+            // probXmitted availability row and the Nearest/Near candidate MVs
+            // the implicit-MV modes reuse with no MV bits.
+            let near = resolve_near_mvs(
                 mb_row as i32,
                 mb_col as i32,
                 ReferenceBucket::InterLast,
                 |r, c| grid_lookup(&mv_grid, mb_cols, mb_rows, r, c),
-            )
-            .availability;
+            );
+            let availability = near.availability;
 
-            // --- Motion search: pick the cheaper of zero-MV / new-MV. ---
+            // --- Motion search for the best new vector. ---
             let (best_mv, best_sad) = search_luma_mv(
                 source,
                 prev,
@@ -712,22 +799,10 @@ fn encode_inter_frame_me_body(
                 &LUMA_CORNERS,
                 &LUMA_OFFSETS,
             );
-            let zero_sad = luma_mb_sad(
-                source,
-                prev,
-                mb_row,
-                mb_col,
-                MotionVector::ZERO,
-                filter,
-                &LUMA_CORNERS,
-                &LUMA_OFFSETS,
-                u64::MAX,
-            );
 
-            // The differential reference for a New-MV MB is the nearest
-            // same-reference above/left neighbour (else zero). The encoded
-            // delta is `best_mv − reference_mv`; both components must stay in
-            // the MV encoder's representable range.
+            // The differential reference for a New-MV MB (nearest same-
+            // reference above/left neighbour, else zero); the encoded delta is
+            // `best_mv − reference_mv`.
             let reference_mv = select_diff_reference_mv_from_grid(
                 &mv_grid,
                 mb_cols,
@@ -735,29 +810,44 @@ fn encode_inter_frame_me_body(
                 mb_col as i32,
                 ReferenceBucket::InterLast,
             );
-            let delta_x = best_mv.x as i32 - reference_mv.x as i32;
-            let delta_y = best_mv.y as i32 - reference_mv.y as i32;
-            let delta_representable = delta_x.unsigned_abs() <= MAX_MV_MAGNITUDE
-                && delta_y.unsigned_abs() <= MAX_MV_MAGNITUDE;
 
-            // Choose New-MV only when it beats zero-MV by the bit-cost margin
-            // and the delta is representable; otherwise fall back to zero-MV.
-            let use_new =
-                !best_mv.is_zero() && delta_representable && best_sad + ME_LAMBDA_SAD < zero_sad;
-
-            let (mode, mb_mv) = if use_new {
-                (CodingMode::InterPlusMv, best_mv)
-            } else {
-                (CodingMode::InterNoMv, MotionVector::ZERO)
+            let sad_of = |mv: MotionVector| {
+                luma_mb_sad(
+                    source,
+                    prev,
+                    mb_row,
+                    mb_col,
+                    mv,
+                    filter,
+                    &LUMA_CORNERS,
+                    &LUMA_OFFSETS,
+                    u64::MAX,
+                )
             };
+
+            // --- Mode decision: choose among Zero / Nearest / Near (no MV
+            // bits) and PlusMv (delta bits, modelled by ME_LAMBDA_SAD). ---
+            let decision = decide_mb_mode(MbModeInputs {
+                best_mv,
+                best_sad,
+                reference_mv,
+                nearest_mv: near.nearest_mv,
+                near_mv: near.near_mv,
+                zero_sad: sad_of(MotionVector::ZERO),
+                nearest_sad: near.nearest_mv.map(sad_of),
+                near_sad: near.near_mv.map(sad_of),
+            });
+            let mode = decision.mode;
+            let mb_mv = decision.mb_mv;
 
             // --- §10 mode emit ---
             encode_mode_from_probs(&mut enc, mode, &probs.mode_probs, availability, last_mode);
             last_mode = mode;
 
-            // --- §11.1 MV delta emit (New-MV only; Zero reads no bits) ---
-            if mode == CodingMode::InterPlusMv {
-                encode_mv_pair(&mut enc, delta_x, delta_y, &probs.mv_probs);
+            // --- §11.1 MV delta emit (New-MV only; the implicit-MV modes and
+            // Zero read no MV bits). ---
+            if let Some((dx, dy)) = decision.delta {
+                encode_mv_pair(&mut enc, dx, dy, &probs.mv_probs);
             }
 
             // This MB contributes its reconstructed MV to the neighbour grid
@@ -1569,5 +1659,111 @@ mod tests {
         let y = psnr(p_source.y.samples(), p_recon.y.samples());
         assert!(y >= 28.0, "ME GOP P-frame luma PSNR {y:.2} dB below floor");
         assert_eq!(p_recon.y.width(), 32);
+    }
+
+    /// A larger uniformly-translated frame exercises the §10 implicit-MV
+    /// (Nearest/Near) modes: once the first MB in a row codes a New-MV, its
+    /// right/below neighbours share the *same* motion, so `decide_mb_mode`
+    /// reuses the neighbour's vector via `CODE_INTER_NEAREST_MV` /
+    /// `CODE_INTER_NEAR_MV` (no MV bits) rather than re-coding the delta. The
+    /// frame must still round-trip above a floor — the encoder's implicit-MV
+    /// reconstruction matches the decoder's Nearest/Near resolution exactly.
+    #[test]
+    fn me_uniform_motion_uses_implicit_modes_round_trips() {
+        let source = gradient(10, 8);
+        let prev = translate(&source, 6, 4);
+        let out = round_trip_me(&source, &prev, 28);
+        let y = psnr(source.y.samples(), out.y.samples());
+        assert!(
+            y >= 28.0,
+            "uniform-motion implicit-mode luma PSNR {y:.2} dB below floor"
+        );
+        assert_eq!(out.y.width(), 80);
+    }
+
+    // ----- decide_mb_mode unit tests -----
+
+    fn mv(x: i16, y: i16) -> MotionVector {
+        MotionVector::new(x, y)
+    }
+
+    /// With no neighbour MVs and a clearly-better searched vector, the
+    /// decision is `CODE_INTER_PLUS_MV` with the delta against the zero
+    /// differential reference.
+    #[test]
+    fn decide_plus_mv_when_search_wins() {
+        let d = decide_mb_mode(MbModeInputs {
+            best_mv: mv(12, -8),
+            best_sad: 100,
+            reference_mv: MotionVector::ZERO,
+            nearest_mv: None,
+            near_mv: None,
+            zero_sad: 100_000,
+            nearest_sad: None,
+            near_sad: None,
+        });
+        assert_eq!(d.mode, CodingMode::InterPlusMv);
+        assert_eq!(d.mb_mv, mv(12, -8));
+        assert_eq!(d.delta, Some((12, -8)));
+    }
+
+    /// When a Nearest neighbour's vector predicts within the bit-cost margin
+    /// of the searched vector, the decision is the implicit
+    /// `CODE_INTER_NEAREST_MV` (no delta), reusing the neighbour MV.
+    #[test]
+    fn decide_nearest_when_within_margin() {
+        let d = decide_mb_mode(MbModeInputs {
+            best_mv: mv(13, 5),
+            best_sad: 980,
+            reference_mv: MotionVector::ZERO,
+            nearest_mv: Some(mv(12, 4)),
+            near_mv: None,
+            zero_sad: 50_000,
+            // Nearest SAD only ME_LAMBDA_SAD-ish above best: not worth the bits.
+            nearest_sad: Some(980 + ME_LAMBDA_SAD),
+            near_sad: None,
+        });
+        assert_eq!(d.mode, CodingMode::InterNearestMv);
+        assert_eq!(d.mb_mv, mv(12, 4));
+        assert_eq!(d.delta, None);
+    }
+
+    /// Zero-MV wins when nothing beats it: no neighbours, and the search
+    /// found nothing better than the co-located copy.
+    #[test]
+    fn decide_zero_when_nothing_better() {
+        let d = decide_mb_mode(MbModeInputs {
+            best_mv: mv(4, 0),
+            best_sad: 1000,
+            reference_mv: MotionVector::ZERO,
+            nearest_mv: None,
+            near_mv: None,
+            zero_sad: 1000, // tie → no margin → keep zero
+            nearest_sad: None,
+            near_sad: None,
+        });
+        assert_eq!(d.mode, CodingMode::InterNoMv);
+        assert_eq!(d.mb_mv, MotionVector::ZERO);
+        assert_eq!(d.delta, None);
+    }
+
+    /// The cheapest implicit option wins among Zero/Nearest/Near when the
+    /// search isn't worth its bits: a Near neighbour with the lowest SAD is
+    /// chosen over Zero and Nearest.
+    #[test]
+    fn decide_picks_lowest_sad_implicit() {
+        let d = decide_mb_mode(MbModeInputs {
+            best_mv: mv(20, 20),
+            best_sad: 900,
+            reference_mv: MotionVector::ZERO,
+            nearest_mv: Some(mv(2, 2)),
+            near_mv: Some(mv(-3, 1)),
+            zero_sad: 800,
+            nearest_sad: Some(700),
+            near_sad: Some(500), // lowest → Near wins
+        });
+        assert_eq!(d.mode, CodingMode::InterNearMv);
+        assert_eq!(d.mb_mv, mv(-3, 1));
+        assert_eq!(d.delta, None);
     }
 }
