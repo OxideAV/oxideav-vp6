@@ -864,6 +864,7 @@ pub mod mode_prob_update;
 pub mod modes;
 pub mod mv_decode;
 pub mod mv_diff;
+pub mod mv_encode;
 pub mod mv_prob_update;
 pub mod near_mv;
 pub mod prob_update;
@@ -954,6 +955,7 @@ pub use mv_diff::{
     reconstruct_diff_mv, reconstruct_new_mv, reconstruct_new_mv_from_grid,
     select_diff_reference_mv, select_diff_reference_mv_from_grid, DIFF_REFERENCE_OFFSETS,
 };
+pub use mv_encode::{encode_mv_component, encode_mv_pair, MAX_MV_MAGNITUDE};
 pub use mv_prob_update::{
     update_mv_probs, LONG_VECTOR_BIT_ORDER, UPDATE_IS_MV_SHORT_PROBABILITIES,
     UPDATE_LONG_VECTOR_BIT_PROBABILITIES, UPDATE_MV_SIGN_PROBABILITIES,

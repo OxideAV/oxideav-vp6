@@ -6,6 +6,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 366, 2026-06-25)
+
+- **`mv_encode` — the §11.1 motion-vector component encoder**, the
+  bit-for-bit inverse of [`mv_decode::decode_mv_component`]. The
+  foundational primitive the motion-estimated P-frame encoder needs to
+  emit a real (non-zero) MV. Surfaces:
+  - `encode_mv_component(enc, component, probs)` — emits the
+    `B(IsMvShortProbs)` short/long discriminator (short for
+    `|component| <= 7`, long for `8..=255`), the magnitude path, then the
+    `B(MvSignProbs)` sign bit (`0` for non-negative including zero, `1`
+    for negative — a zero still emits a sign per §11.1 and negates to a
+    zero). The short path mirrors the Figure 11 tree; the long path emits
+    bits in the decoder's `[0,1,2,7,6,5,4]` order and respects the
+    implicit-bit-3 rule (bit 3 is transmitted only when the high nibble is
+    non-zero, so magnitudes `8..=15` reconstruct from their low three bits
+    as `(m & 7) | 8 == m`).
+  - `encode_mv_pair(enc, dx, dy, probs)` — the `(dx, dy)` dual of
+    [`mv_decode::decode_mv_pair`] (X then Y).
+  - `MAX_MV_MAGNITUDE` (`0xFF`) — the bit-arithmetic ceiling.
+  Five round-trip tests pin every short component (`-7..=7`),
+  representative long magnitudes (both signs, both axes), the full
+  unsigned `0..=255` range, the zero case, and a mixed-pair sweep — each
+  encoded then decoded back through `decode_mv_component`/`decode_mv_pair`
+  to the exact input. Memory-bounded (each working set is a few bytes).
+  Derived solely from the §11.1 decode functions it inverts plus the §7.3
+  `BoolEncoder`; no third-party VP6 source consulted.
+
 ### Added (clean-room round 363, 2026-06-23)
 
 - **`oxideav-core` `Decoder` registration** (`decoder::Vp6CodecDecoder`,
