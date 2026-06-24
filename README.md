@@ -22,21 +22,28 @@ prediction and §17.2/§17.3/§17.4 reconstruction (including the §11.3
 prediction loop filter and §11.4 sub-pixel filter-family dispatch), with
 §4 golden-frame bookkeeping (`ReferenceFrames`).
 
-The crate now **also encodes both a VP6 keyframe and a P-frame**.
-`encode_intra_frame` takes a 4:2:0 source `Frame` and produces a
-single-partition I-frame bitstream that `decode_intra_frame`
-reconstructs back to pixels at a quantiser-bounded PSNR floor (a 32×32
-patterned frame at q=48 round-trips at ~44 dB luma / ~45 dB chroma; flat
-frames are exact). `encode_inter_frame` produces the BoolCoder data
-partition for the simplest valid P-frame — every macroblock
-`CODE_INTER_NO_MV` (zero MV, predicted from the previous-frame
-reconstruction) — that `decode_inter_frame` reconstructs: an unchanged
-frame round-trips **exactly** via the zero-MV inter copy, a changed
-frame above a quantiser-bounded floor. Both encode paths are the
-stage-for-stage inverse of the decode pipeline: (I) −128 level shift, or
-(P) residual = source − zero-MV prediction → §16-dual forward DCT →
-§15-inverse quantise → §14 DC delta → §13 token emit (+ §10 mode emit
-for P-frames via `mode_encode`).
+The crate now **also encodes both a VP6 keyframe and a P-frame, the
+latter with real motion estimation**. `encode_intra_frame` takes a 4:2:0
+source `Frame` and produces a single-partition I-frame bitstream that
+`decode_intra_frame` reconstructs back to pixels at a quantiser-bounded
+PSNR floor (a 32×32 patterned frame at q=48 round-trips at ~44 dB luma /
+~45 dB chroma; flat frames are exact). For P-frames there are now two
+encoders: `encode_inter_frame` produces the simplest valid all-zero-MV
+shape (every macroblock `CODE_INTER_NO_MV`), and
+**`encode_inter_frame_me`** performs a per-macroblock **motion search**,
+emitting `CODE_INTER_PLUS_MV` (a real §11.1-coded motion vector against
+the §11 differential reference) wherever the search beats zero-MV by the
+bit-cost margin. Both decode back through `decode_inter_frame`: an
+unchanged frame round-trips **exactly** via the zero-MV inter copy, a
+translated frame reconstructs above a quantiser-bounded floor with the ME
+encoder tracking the motion. All encode paths are the stage-for-stage
+inverse of the decode pipeline: (I) −128 level shift, or (P) residual =
+source − (zero-or-searched-MV) prediction → §16-dual forward DCT →
+§15-inverse quantise → §14 DC delta → §13 token emit (+ §10 mode emit via
+`mode_encode` and, for `CODE_INTER_PLUS_MV`, §11.1 MV-delta emit via
+`mv_encode`). Both P-frame encoders also emit self-describing packets
+(`encode_inter_frame_packet` / `encode_inter_frame_me_packet`) that flow
+through the top-level `decode_frame::Vp6Decoder`.
 
 The crate now exposes a **top-level per-frame assembly** and a
 **registered `oxideav-core` `Decoder`**. `decode_frame::Vp6Decoder` is a
@@ -62,9 +69,12 @@ sub-streams** (each pass exists — `mode_prob_update`, `mv_prob_update`,
 to the header tail wants a conformant `.vp6` fixture to validate, so the
 top-level driver currently decodes only the no-update / single-partition
 / BoolCoder-coefficient shape the in-tree encoders produce), the **`Encoder`
-registration**, and the encoder's motion estimation (the richer
-non-`CODE_INTER_NO_MV` modes) / per-frame probability-update /
-rate-control surfaces.
+registration**, and the encoder's richer mode decision (the Nearest/Near
+implicit-MV modes, Golden-frame modes and FourMV), per-frame
+probability-update and rate-control surfaces. The encoder's **motion
+estimation** (single-vector `CODE_INTER_PLUS_MV` with a two-stage
+box-then-¼-pel luma search and §11 differential-MV emission) **now
+exists** (`encode_inter_frame_me`).
 
 ### Implemented stages
 
@@ -196,6 +206,40 @@ rate-control surfaces.
   same-as-last fast path takes the minimal one-bit encoding when a mode
   repeats `last_mode`. Round-trip tests pin every
   `(mode, availability, last_mode)` triple against the decoder.
+- **`inter_encode::encode_inter_frame_me`** is the **motion-estimated
+  P-frame encoder** — a strict superset of `encode_inter_frame` that codes
+  each MB as either `CODE_INTER_NO_MV` or `CODE_INTER_PLUS_MV`. Per MB it
+  runs a two-stage luma motion search (`search_luma_mv`): an integer-pel
+  box search over `±ME_SEARCH_RANGE` whole samples around `(0,0)` then a
+  ¼-pel refinement, minimising the 16×16 luma SAD (`luma_mb_sad`) computed
+  against the *same* `predict_inter_block_subpel` prediction the decoder
+  forms. It picks `CODE_INTER_PLUS_MV` only when the best MV beats zero-MV
+  by more than `ME_LAMBDA_SAD` (a Lagrangian λ proxy for the MV bit-cost)
+  and the §11 differential delta is representable; the encoded delta is
+  `best_mv − differential_reference` (the nearest same-reference above/left
+  neighbour via `select_diff_reference_mv_from_grid`, else zero), emitted
+  with `mv_encode::encode_mv_pair`. The encoder threads the **identical**
+  §10/§11 `mv_grid`, `last_mode` and §10 Nearest/Near availability
+  (`resolve_near_mvs`) the decoder builds, so each MB's reconstructed MV,
+  mode-context and residual match the decoder exactly. Luma residual is
+  formed against the chosen MV; chroma against the MB MV at ⅛-pel (§11.4).
+  Round-trip tests against `decode_inter_frame` pin the unchanged→exact
+  reduction, translated-source reconstruction above a floor, ME ≥ zero-MV
+  on translation, the single-MB path, the multi-MB shared-motion
+  differential-reference path, and a full keyframe → ME-P GOP.
+- **`mv_encode`** is the bit-for-bit inverse of `mv_decode`'s §11.1
+  per-component decode: `encode_mv_component` emits the
+  `B(IsMvShortProbs)` short/long discriminator (short for `|c| ≤ 7`, long
+  for `8..=255`), the Figure 11 short tree or the `[0,1,2,7,6,5,4]`-order
+  long bit-stream (respecting the implicit-bit-3 rule), then the
+  `B(MvSignProbs)` sign. `encode_mv_pair` is the `(dx, dy)` dual of
+  `decode_mv_pair`. Round-trip tests pin every short component, the full
+  `0..=255` magnitude range, and mixed pairs against the decoder.
+- **`inter_encode::encode_inter_frame_packet` /
+  `encode_inter_frame_me_packet`** prepend the §9 InterHeader (Table 1
+  prefix + Table 3 BoolCoder tail) to the zero-MV / motion-estimated data
+  partition so each encoded P-frame is a self-describing packet
+  `decode_frame::Vp6Decoder::decode_packet` consumes end-to-end.
 
 ### Inter (P-frame) path — decodes end-to-end to pixels
 
