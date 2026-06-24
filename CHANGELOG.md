@@ -51,6 +51,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `encode_inter_frame_packet` is now re-exported from the crate root.
   Derived solely from the decode pipeline it inverts; no third-party VP6
   source consulted.
+- **`inter_encode::encode_inter_frame_me_packet`** — the §9-self-describing
+  motion-estimated P-frame packet (the ME dual of
+  `encode_inter_frame_packet`): the Table 1 raw prefix + Table 3 BoolCoder
+  tail (`RefreshGoldenFrame = 0` / `UseHuffman = 0`) prepended to the ME
+  data partition, so a motion-estimated P-frame decodes end-to-end through
+  the top-level `decode_frame::Vp6Decoder`. `encode_inter_frame_me` is
+  refactored to delegate to a shared `encode_inter_frame_me_body` taking a
+  header-tail prelude closure (mirroring the zero-MV `encode_inter_frame`
+  split). A new `decode_frame` test drives a full keyframe → translated
+  ME-P-frame GOP through one `Vp6Decoder` (against its
+  `InterProbs::keyframe()` / header-derived `FilterConfig`, no caller-side
+  filter wiring) above a quantiser-bounded floor.
 
 - **`mv_encode` — the §11.1 motion-vector component encoder**, the
   bit-for-bit inverse of [`mv_decode::decode_mv_component`]. The

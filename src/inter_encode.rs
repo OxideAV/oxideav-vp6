@@ -641,6 +641,21 @@ pub fn encode_inter_frame_me(
     probs: &InterProbs,
     filter: &FilterConfig,
 ) -> Result<Vec<u8>, Error> {
+    encode_inter_frame_me_body(source, prev, dct_q_mask, probs, filter, |_| {})
+}
+
+/// Shared motion-estimated P-frame body: open a [`BoolEncoder`], run
+/// `prelude` against it (used by [`encode_inter_frame_me_packet`] to emit
+/// the §9 InterHeader tail bits in the same arithmetic stream), then run
+/// the per-MB motion search + §10 mode / §11.1 MV / §13 coefficient emit.
+fn encode_inter_frame_me_body(
+    source: &Frame,
+    prev: &BorderedRef,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    filter: &FilterConfig,
+    prelude: impl FnOnce(&mut BoolEncoder),
+) -> Result<Vec<u8>, Error> {
     let h_fragments = source.h_fragments;
     let v_fragments = source.v_fragments;
     if h_fragments > u8::MAX as usize || v_fragments > u8::MAX as usize {
@@ -653,6 +668,7 @@ pub fn encode_inter_frame_me(
     let dequant = DequantContext::new(dct_q_mask);
 
     let mut enc = BoolEncoder::new();
+    prelude(&mut enc);
 
     let mut y_grid = PlaneDcGrid::new(h_fragments, v_fragments);
     let mut u_grid = PlaneDcGrid::new(mb_cols, mb_rows);
@@ -906,6 +922,50 @@ pub fn encode_inter_frame_packet(
     // RefreshGoldenFrame b(1) = 0, then (Simple/VP6.0: no loop/pred-filter
     // fields) UseHuffman b(1) = 0, immediately followed by the per-MB data.
     let data = encode_inter_frame_body(source, prev, dct_q_mask, probs, filter, |enc| {
+        enc.encode_b1(0); // RefreshGoldenFrame = 0
+        enc.encode_b1(0); // UseHuffman = 0
+    })?;
+
+    let mut out = raw_prefix;
+    out.extend_from_slice(&data);
+    Ok(out)
+}
+
+/// Encode a complete **motion-estimated** P-frame packet — the §9
+/// InterHeader (raw-bit prefix + BoolCoder-coded tail) followed by the
+/// motion-estimated data partition [`encode_inter_frame_me`] produces — so
+/// the result decodes end-to-end through the top-level
+/// [`crate::decode_frame::Vp6Decoder`].
+///
+/// Identical header shape to [`encode_inter_frame_packet`] (Simple/VP6.0:
+/// Table 1 `FrameType = 1` / `DctQMask` / `MultiStream = 0`, then the
+/// Table 3 tail `RefreshGoldenFrame = 0` / `UseHuffman = 0` riding the data
+/// partition's BoolCoder), but the body is the motion-estimated encoder, so
+/// the packet carries real `CODE_INTER_PLUS_MV` macroblocks where motion
+/// search found them worthwhile.
+///
+/// # Errors
+///
+/// Propagates [`Error::NotImplemented`] from [`encode_inter_frame_me`] for
+/// an over-large frame geometry.
+pub fn encode_inter_frame_me_packet(
+    source: &Frame,
+    prev: &BorderedRef,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    filter: &FilterConfig,
+) -> Result<Vec<u8>, Error> {
+    let dct_q_mask = dct_q_mask & 0x3F;
+
+    // --- §9 raw-bit header prefix (Table 1, byte-aligned) ---
+    let mut header = oxideav_core::bits::BitWriter::with_capacity(1);
+    header.write_u32(1, 1); // FrameType = 1 (inter)
+    header.write_u32(dct_q_mask as u32, 6);
+    header.write_u32(0, 1); // MultiStream = 0
+    let raw_prefix = header.finish();
+
+    // --- §9 BoolCoder-coded InterHeader tail (Table 3) + ME data ---
+    let data = encode_inter_frame_me_body(source, prev, dct_q_mask, probs, filter, |enc| {
         enc.encode_b1(0); // RefreshGoldenFrame = 0
         enc.encode_b1(0); // UseHuffman = 0
     })?;

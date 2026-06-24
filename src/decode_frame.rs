@@ -233,7 +233,7 @@ mod tests {
     use super::*;
     use crate::frame_assembly::Frame;
     use crate::inter::{FilterFamily, PredictionFilterPolicy};
-    use crate::inter_encode::encode_inter_frame_packet;
+    use crate::inter_encode::{encode_inter_frame_me_packet, encode_inter_frame_packet};
     use crate::inter_frame::{BorderedRef, FilterConfig};
     use crate::intra_encode::encode_intra_frame;
 
@@ -435,6 +435,66 @@ mod tests {
             y >= 30.0,
             "changed P-frame luma PSNR {y:.2} dB below floor — residual path regression"
         );
+    }
+
+    /// A keyframe → **motion-estimated** P-frame GOP decodes end-to-end
+    /// through one `Vp6Decoder` via `encode_inter_frame_me_packet`: the
+    /// keyframe seeds the §4 refs + profile/version, then a translated
+    /// P-frame (whose source moved relative to the decoded keyframe) decodes
+    /// above a quantiser-bounded floor — the motion-estimated MVs and the
+    /// §11 differential-reference emission flow through the top-level driver
+    /// against the decoder's `InterProbs::keyframe()` / header-derived
+    /// `FilterConfig`, with no caller-side filter wiring.
+    #[test]
+    fn keyframe_then_me_pframe_gop_through_decode_packet() {
+        let src = pattern_frame(6, 6);
+        let q = 32;
+
+        let mut dec = Vp6Decoder::new();
+        let kf_out = dec
+            .decode_packet(&encode_intra_frame(&src, q).expect("encode I"))
+            .expect("decode I");
+
+        // The P-frame source is the decoded keyframe shifted right+down by a
+        // few luma pixels with edge replication — so a real MV brings the
+        // prediction back onto the source.
+        let mut p_src = Frame::new(kf_out.h_fragments, kf_out.v_fragments);
+        let shift = 3i32;
+        for (sp, dp) in [
+            (&kf_out.y, &mut p_src.y),
+            (&kf_out.u, &mut p_src.u),
+            (&kf_out.v, &mut p_src.v),
+        ] {
+            let w = sp.width() as i32;
+            let h = sp.height() as i32;
+            // Chroma uses half the luma shift (½-resolution planes).
+            let s = if sp.width() == kf_out.y.width() {
+                shift
+            } else {
+                shift / 2
+            };
+            for r in 0..h {
+                for c in 0..w {
+                    let sr = (r + s).clamp(0, h - 1);
+                    let sc = (c + s).clamp(0, w - 1);
+                    dp.samples_mut()[(r * w + c) as usize] = sp.samples()[(sr * w + sc) as usize];
+                }
+            }
+        }
+
+        let probs = InterProbs::keyframe();
+        let filter = simple_inter_filter();
+        let pf_bytes =
+            encode_inter_frame_me_packet(&p_src, &BorderedRef::new(&kf_out), q, &probs, &filter)
+                .expect("encode ME P");
+        let pf_out = dec.decode_packet(&pf_bytes).expect("decode ME P");
+
+        let y = psnr(p_src.y.samples(), pf_out.y.samples());
+        assert!(
+            y >= 28.0,
+            "ME P-frame luma PSNR {y:.2} dB below floor through decode_packet"
+        );
+        assert_eq!(pf_out.y.width(), 48);
     }
 
     /// An inter frame before any keyframe has no reference / profile —

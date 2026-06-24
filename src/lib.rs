@@ -917,7 +917,8 @@ pub use inter::{
     RefPlane,
 };
 pub use inter_encode::{
-    encode_inter_frame, encode_inter_frame_me, encode_inter_frame_packet, ME_LAMBDA_SAD,
+    encode_inter_frame, encode_inter_frame_me, encode_inter_frame_me_packet,
+    encode_inter_frame_packet, ME_LAMBDA_SAD,
 };
 pub use inter_frame::{
     decode_inter_frame, decode_inter_frame_with_refs, BorderedRef, FilterConfig, InterProbs,
