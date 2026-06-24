@@ -8,6 +8,50 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 366, 2026-06-25)
 
+- **`inter_encode::encode_inter_frame_me` — the motion-estimated P-frame
+  encoder.** The encoder now performs a real per-macroblock motion search
+  and emits `CODE_INTER_PLUS_MV` (a §11.1-coded motion vector) where it
+  pays off, not just the `CODE_INTER_NO_MV` (zero-MV) shape
+  `encode_inter_frame` produces. Per MB:
+  - **Motion search** (`search_luma_mv`): a two-stage box-then-¼-pel
+    search around `(0,0)` minimising the 16×16 luma SAD (`luma_mb_sad`),
+    computed against the *same* `predict_inter_block_subpel` prediction
+    the decoder forms — so the cost reflects the exact reconstruction
+    pixels. Stage 1 is an integer-pel box over `±ME_SEARCH_RANGE`; stage 2
+    refines over the eight ¼-pel neighbours of the best integer MV.
+  - **Mode decision**: `CODE_INTER_PLUS_MV` is chosen only when the best
+    MV beats zero-MV by more than `ME_LAMBDA_SAD` (a Lagrangian λ proxy
+    for the MV bit-cost) *and* the §11 differential delta is representable;
+    otherwise the MB falls back to `CODE_INTER_NO_MV`. The path is a
+    strict superset of `encode_inter_frame`: a motionless frame reduces to
+    all-zero-MV and round-trips exactly.
+  - **Differential MV emit**: the encoded delta is
+    `best_mv − differential_reference` (the nearest same-reference
+    above/left neighbour via `select_diff_reference_mv_from_grid`, else
+    zero), emitted with the round-366 `encode_mv_pair`. The encoder
+    threads the **identical** §10/§11 `mv_grid`, `last_mode` and §10
+    Nearest/Near availability (`resolve_near_mvs`) the decoder builds, so
+    each MB's reconstructed MV, mode-context and residual match the
+    decoder's reconstruction exactly.
+  - The luma residual is formed against the chosen MV's prediction and the
+    chroma residual against the single-vector chroma MV (the MB MV at
+    ⅛-pel, §11.4) — the `predict_mv_luma`/`predict_mv_chroma` helpers
+    (generalised from the old zero-MV-only helpers) call the decoder's
+    `predict_inter_block_subpel`, guaranteeing bit-identical predictions.
+  - `ME_LAMBDA_SAD` (`64`) and `ME_SEARCH_RANGE` (`8` whole samples)
+    tune the cost margin and search extent.
+  Six round-trip tests against the decoder pin: the unchanged-frame exact
+  round-trip (ME reduces to zero-MV); a translated-source reconstruction
+  above a PSNR floor; ME at-least-matching the zero-MV encoder on a
+  translated gradient; the single-MB path; the multi-MB shared-motion
+  **differential-reference** path (a right-neighbour codes its MV relative
+  to the left neighbour's reconstructed MV); and a full keyframe → ME
+  P-frame GOP through `decode_inter_frame_with_refs`. All memory-bounded
+  (small grids; the search is `O(range² · 256)` SAD adds per MB).
+  `encode_inter_frame_packet` is now re-exported from the crate root.
+  Derived solely from the decode pipeline it inverts; no third-party VP6
+  source consulted.
+
 - **`mv_encode` — the §11.1 motion-vector component encoder**, the
   bit-for-bit inverse of [`mv_decode::decode_mv_component`]. The
   foundational primitive the motion-estimated P-frame encoder needs to

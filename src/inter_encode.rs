@@ -60,7 +60,9 @@ use crate::inter::{predict_inter_block_subpel, MvShift};
 use crate::inter_frame::{BorderedRef, FilterConfig, InterProbs};
 use crate::mode_encode::encode_mode_from_probs;
 use crate::modes::{CodingMode, ModeAvailability};
-use crate::near_mv::MotionVector;
+use crate::mv_diff::select_diff_reference_mv_from_grid;
+use crate::mv_encode::{encode_mv_pair, MAX_MV_MAGNITUDE};
+use crate::near_mv::{resolve_near_mvs, MotionVector, NeighbourMv};
 use crate::scan::DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG;
 use crate::token_encode::encode_block_coefficients;
 use crate::tokens::{AcPlane, DcContext};
@@ -209,15 +211,17 @@ fn encode_inter_block(
     coded_dc
 }
 
-/// Compute the zero-MV co-located prediction for a luma block at the
-/// given macroblock + corner against the previous-frame `BorderedRef`,
-/// the exact prediction the decoder forms for a `CODE_INTER_NO_MV` luma
-/// block (zero vector → §11.4 whole-sample identity copy).
-fn predict_zero_mv_luma(
+/// Compute the luma prediction for a block at the given macroblock +
+/// corner against the previous-frame `BorderedRef` with motion vector
+/// `mv` — the exact prediction the decoder forms via
+/// [`predict_inter_block_subpel`] at [`MvShift::Luma`]. A zero `mv` is the
+/// `CODE_INTER_NO_MV` whole-sample identity copy.
+fn predict_mv_luma(
     prev: &BorderedRef,
     mb_row: usize,
     mb_col: usize,
     corner: (i32, i32),
+    mv: MotionVector,
     filter: &FilterConfig,
 ) -> [u8; 64] {
     let (buf, stride, origin) = prev.y_plane();
@@ -229,8 +233,8 @@ fn predict_zero_mv_luma(
         buf,
         stride,
         base,
-        MotionVector::ZERO.x as i32,
-        MotionVector::ZERO.y as i32,
+        mv.x as i32,
+        mv.y as i32,
         MvShift::Luma,
         filter.policy,
         filter.loop_filter_qi,
@@ -239,12 +243,15 @@ fn predict_zero_mv_luma(
     pred
 }
 
-/// Compute the zero-MV co-located prediction for a chroma block.
-fn predict_zero_mv_chroma(
+/// Compute the chroma prediction for a block with motion vector `mv` — the
+/// exact prediction the decoder forms at [`MvShift::Chroma`] (⅛-pel). For
+/// a single-vector MB the chroma MV is the MB MV itself (§11.4).
+fn predict_mv_chroma(
     prev: &BorderedRef,
     mb_row: usize,
     mb_col: usize,
     is_v: bool,
+    mv: MotionVector,
     filter: &FilterConfig,
 ) -> [u8; 64] {
     let (buf, stride, origin) = if is_v { prev.v_plane() } else { prev.u_plane() };
@@ -256,8 +263,8 @@ fn predict_zero_mv_chroma(
         buf,
         stride,
         base,
-        MotionVector::ZERO.x as i32,
-        MotionVector::ZERO.y as i32,
+        mv.x as i32,
+        mv.y as i32,
         MvShift::Chroma,
         filter.policy,
         filter.loop_filter_qi,
@@ -374,8 +381,14 @@ fn encode_inter_frame_body(
                     continue;
                 }
                 let source_pixels = extract_block(source.y.samples(), y_w, br * 8, bc_col * 8);
-                let prediction =
-                    predict_zero_mv_luma(prev, mb_row, mb_col, LUMA_CORNERS[k], filter);
+                let prediction = predict_mv_luma(
+                    prev,
+                    mb_row,
+                    mb_col,
+                    LUMA_CORNERS[k],
+                    MotionVector::ZERO,
+                    filter,
+                );
                 let dc_node_probs = DcContext::from_neighbours(
                     y_grid.left(br, bc_col).is_some_and(|(d, _)| d != 0),
                     y_grid.above(br, bc_col).is_some_and(|(d, _)| d != 0),
@@ -398,7 +411,7 @@ fn encode_inter_frame_body(
 
             // --- U chroma block ---
             let u_source = extract_block(source.u.samples(), u_w, mb_row * 8, mb_col * 8);
-            let u_pred = predict_zero_mv_chroma(prev, mb_row, mb_col, false, filter);
+            let u_pred = predict_mv_chroma(prev, mb_row, mb_col, false, MotionVector::ZERO, filter);
             let u_dc_node_probs = DcContext::from_neighbours(
                 u_grid.left(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
                 u_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
@@ -420,7 +433,7 @@ fn encode_inter_frame_body(
 
             // --- V chroma block ---
             let v_source = extract_block(source.v.samples(), v_w, mb_row * 8, mb_col * 8);
-            let v_pred = predict_zero_mv_chroma(prev, mb_row, mb_col, true, filter);
+            let v_pred = predict_mv_chroma(prev, mb_row, mb_col, true, MotionVector::ZERO, filter);
             let v_dc_node_probs = DcContext::from_neighbours(
                 v_grid.left(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
                 v_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
@@ -443,6 +456,400 @@ fn encode_inter_frame_body(
     }
 
     Ok(enc.finish())
+}
+
+// ===========================================================================
+// Motion-estimated P-frame encoder
+// ===========================================================================
+//
+// The zero-MV body above emits every MB as `CODE_INTER_NO_MV`. This section
+// adds a real per-MB motion search that chooses between `CODE_INTER_NO_MV`
+// (zero vector) and `CODE_INTER_PLUS_MV` (a §11.1-coded vector), emitting the
+// chosen mode + (for a New-MV MB) the §11.1 delta against the §11
+// differential reference, and the residual against the *chosen* prediction.
+//
+// Correctness invariant: the decoder reconstructs each MB by (a) resolving
+// §10 availability from the MV grid built so far, (b) decoding the mode, (c)
+// reconstructing the MV (zero for NoMv; differential-reference + delta for
+// PlusMv), (d) motion-compensating with `predict_inter_block_subpel`, and (e)
+// adding the IDCT residual. The encoder threads the *identical* `mv_grid`,
+// `last_mode` and availability state and forms the residual against the
+// *same* `predict_inter_block_subpel` prediction, so the bytes it emits feed
+// straight back through `decode_inter_frame` to the same reconstruction the
+// encoder predicted from (modulo the quantiser floor).
+
+/// The half-extent (in whole luma samples) of the diamond/box motion search
+/// around the zero/predicted vector. Kept small so the search stays cheap and
+/// the candidate set bounded (the §11.5 border is 48 samples, comfortably
+/// covering this range plus the sub-pixel filter reach).
+const ME_SEARCH_RANGE: i32 = 8;
+
+/// Sum of absolute differences between a source 16×16 luma region and its
+/// motion-compensated prediction for a candidate `mv`, summed over the four
+/// luma blocks. Lower is a better predictor. The prediction is formed with
+/// the *same* [`predict_inter_block_subpel`] the decoder uses, so the SAD is
+/// computed on the exact pixels the decoder will reconstruct from.
+#[allow(clippy::too_many_arguments)]
+fn luma_mb_sad(
+    source: &Frame,
+    prev: &BorderedRef,
+    mb_row: usize,
+    mb_col: usize,
+    mv: MotionVector,
+    filter: &FilterConfig,
+    luma_corners: &[(i32, i32); 4],
+    luma_offsets: &[(usize, usize); 4],
+    best_so_far: u64,
+) -> u64 {
+    let y_w = source.y.width();
+    let h_fragments = source.h_fragments;
+    let v_fragments = source.v_fragments;
+    let mut sad = 0u64;
+    for (k, &(dr, dc)) in luma_offsets.iter().enumerate() {
+        let br = mb_row * 2 + dr;
+        let bc_col = mb_col * 2 + dc;
+        if br >= v_fragments || bc_col >= h_fragments {
+            continue;
+        }
+        let pred = predict_mv_luma(prev, mb_row, mb_col, luma_corners[k], mv, filter);
+        let src = extract_block(source.y.samples(), y_w, br * 8, bc_col * 8);
+        for (&s, &p) in src.iter().zip(pred.iter()) {
+            sad += (s - p as i32).unsigned_abs() as u64;
+        }
+        // Early-out: once this candidate is already worse than the best,
+        // stop accumulating (block-by-block monotone lower bound).
+        if sad >= best_so_far {
+            return sad;
+        }
+    }
+    sad
+}
+
+/// Search for the best whole-then-quarter-pel luma MV for one macroblock
+/// against the previous-frame reference, minimising the 16×16 luma SAD.
+///
+/// Two-stage search: (1) an integer-pel box search over
+/// `±ME_SEARCH_RANGE` whole samples around `(0, 0)`, then (2) a ¼-pel
+/// refinement over the eight quarter-pel neighbours of the best integer MV.
+/// MVs are in ¼-pel units (luma `MvShift == 2`), so an integer step is `4`.
+/// Returns the best MV and its SAD.
+fn search_luma_mv(
+    source: &Frame,
+    prev: &BorderedRef,
+    mb_row: usize,
+    mb_col: usize,
+    filter: &FilterConfig,
+    luma_corners: &[(i32, i32); 4],
+    luma_offsets: &[(usize, usize); 4],
+) -> (MotionVector, u64) {
+    // Clamp candidate components so |component| stays within the MV encoder's
+    // representable range; the §11.5 border also bounds usable MVs.
+    let in_range = |c: i32| c.unsigned_abs() <= MAX_MV_MAGNITUDE;
+
+    let sad_of = |mv: MotionVector, best: u64| {
+        luma_mb_sad(
+            source,
+            prev,
+            mb_row,
+            mb_col,
+            mv,
+            filter,
+            luma_corners,
+            luma_offsets,
+            best,
+        )
+    };
+
+    // --- Stage 1: integer-pel box search around (0, 0). ---
+    let mut best_mv = MotionVector::ZERO;
+    let mut best_sad = sad_of(best_mv, u64::MAX);
+    for wy in -ME_SEARCH_RANGE..=ME_SEARCH_RANGE {
+        for wx in -ME_SEARCH_RANGE..=ME_SEARCH_RANGE {
+            if wx == 0 && wy == 0 {
+                continue;
+            }
+            let (qx, qy) = (wx * 4, wy * 4);
+            if !in_range(qx) || !in_range(qy) {
+                continue;
+            }
+            let mv = MotionVector::new(qx as i16, qy as i16);
+            let sad = sad_of(mv, best_sad);
+            if sad < best_sad {
+                best_sad = sad;
+                best_mv = mv;
+            }
+        }
+    }
+
+    // --- Stage 2: ¼-pel refinement around the best integer MV. ---
+    let base = best_mv;
+    for &(ddx, ddy) in &[
+        (-1, -1),
+        (-1, 0),
+        (-1, 1),
+        (0, -1),
+        (0, 1),
+        (1, -1),
+        (1, 0),
+        (1, 1),
+    ] {
+        let qx = base.x as i32 + ddx;
+        let qy = base.y as i32 + ddy;
+        if !in_range(qx) || !in_range(qy) {
+            continue;
+        }
+        let mv = MotionVector::new(qx as i16, qy as i16);
+        let sad = sad_of(mv, best_sad);
+        if sad < best_sad {
+            best_sad = sad;
+            best_mv = mv;
+        }
+    }
+
+    (best_mv, best_sad)
+}
+
+/// Encode a motion-estimated P-frame into the BoolCoder data partition
+/// [`crate::inter_frame::decode_inter_frame`] consumes.
+///
+/// Each macroblock is coded as either `CODE_INTER_NO_MV` (zero MV) or
+/// `CODE_INTER_PLUS_MV` (a §11.1-coded MV against the §11 differential
+/// reference), whichever yields the lower 16×16 luma SAD by a margin (the
+/// New-MV mode must beat zero-MV by more than [`ME_LAMBDA_SAD`] to justify
+/// the extra MV bits). This is a strict superset of [`encode_inter_frame`]:
+/// a frame with no motion reduces to the all-`CODE_INTER_NO_MV` shape.
+///
+/// * `source` — the 4:2:0 source pixels for this P-frame.
+/// * `prev` — the §11.5-bordered previous-frame reconstruction.
+/// * `dct_q_mask` — the §9 6-bit quantiser index (§15 dequant).
+/// * `probs` — the per-frame mode/MV/coefficient banks; the caller must hand
+///   the **same** banks to the decoder.
+/// * `filter` — the §11.3/§11.4 filter configuration.
+///
+/// The returned `Vec<u8>` is the finished BoolCoder partition: feed it to
+/// [`crate::bool_coder::BoolCoder::new`] then `decode_inter_frame` with the
+/// same `probs`/`filter`/`prev` to recover the frame.
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] if the source's fragment dimensions exceed the
+/// 8-bit header geometry fields.
+pub fn encode_inter_frame_me(
+    source: &Frame,
+    prev: &BorderedRef,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    filter: &FilterConfig,
+) -> Result<Vec<u8>, Error> {
+    let h_fragments = source.h_fragments;
+    let v_fragments = source.v_fragments;
+    if h_fragments > u8::MAX as usize || v_fragments > u8::MAX as usize {
+        return Err(Error::NotImplemented);
+    }
+
+    let dct_q_mask = dct_q_mask & 0x3F;
+    let mb_cols = source.mb_cols();
+    let mb_rows = source.mb_rows();
+    let dequant = DequantContext::new(dct_q_mask);
+
+    let mut enc = BoolEncoder::new();
+
+    let mut y_grid = PlaneDcGrid::new(h_fragments, v_fragments);
+    let mut u_grid = PlaneDcGrid::new(mb_cols, mb_rows);
+    let mut v_grid = PlaneDcGrid::new(mb_cols, mb_rows);
+    let mut y_dc_pred = DcPredictionContext::new();
+    let mut u_dc_pred = DcPredictionContext::new();
+    let mut v_dc_pred = DcPredictionContext::new();
+
+    // §10/§11 MV neighbour grid, threaded exactly as the decoder builds it:
+    // one representative `NeighbourMv` per MB, row-major. Drives both the §10
+    // Nearest/Near availability and the §11 differential reference.
+    let mut mv_grid: Vec<Option<NeighbourMv>> = vec![None; mb_cols.saturating_mul(mb_rows)];
+
+    const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
+    const LUMA_CORNERS: [(i32, i32); 4] = [(0, 0), (0, 8), (8, 0), (8, 8)];
+
+    let y_w = source.y.width();
+    let u_w = source.u.width();
+    let v_w = source.v.width();
+
+    let mut last_mode = CodingMode::InterNoMv;
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            // --- §10 availability from the MV grid built so far (exactly the
+            // decoder's resolution: same-reference InterLast, zero-MV skip).
+            let availability = resolve_near_mvs(
+                mb_row as i32,
+                mb_col as i32,
+                ReferenceBucket::InterLast,
+                |r, c| grid_lookup(&mv_grid, mb_cols, mb_rows, r, c),
+            )
+            .availability;
+
+            // --- Motion search: pick the cheaper of zero-MV / new-MV. ---
+            let (best_mv, best_sad) = search_luma_mv(
+                source,
+                prev,
+                mb_row,
+                mb_col,
+                filter,
+                &LUMA_CORNERS,
+                &LUMA_OFFSETS,
+            );
+            let zero_sad = luma_mb_sad(
+                source,
+                prev,
+                mb_row,
+                mb_col,
+                MotionVector::ZERO,
+                filter,
+                &LUMA_CORNERS,
+                &LUMA_OFFSETS,
+                u64::MAX,
+            );
+
+            // The differential reference for a New-MV MB is the nearest
+            // same-reference above/left neighbour (else zero). The encoded
+            // delta is `best_mv − reference_mv`; both components must stay in
+            // the MV encoder's representable range.
+            let reference_mv = select_diff_reference_mv_from_grid(
+                &mv_grid,
+                mb_cols,
+                mb_row as i32,
+                mb_col as i32,
+                ReferenceBucket::InterLast,
+            );
+            let delta_x = best_mv.x as i32 - reference_mv.x as i32;
+            let delta_y = best_mv.y as i32 - reference_mv.y as i32;
+            let delta_representable = delta_x.unsigned_abs() <= MAX_MV_MAGNITUDE
+                && delta_y.unsigned_abs() <= MAX_MV_MAGNITUDE;
+
+            // Choose New-MV only when it beats zero-MV by the bit-cost margin
+            // and the delta is representable; otherwise fall back to zero-MV.
+            let use_new =
+                !best_mv.is_zero() && delta_representable && best_sad + ME_LAMBDA_SAD < zero_sad;
+
+            let (mode, mb_mv) = if use_new {
+                (CodingMode::InterPlusMv, best_mv)
+            } else {
+                (CodingMode::InterNoMv, MotionVector::ZERO)
+            };
+
+            // --- §10 mode emit ---
+            encode_mode_from_probs(&mut enc, mode, &probs.mode_probs, availability, last_mode);
+            last_mode = mode;
+
+            // --- §11.1 MV delta emit (New-MV only; Zero reads no bits) ---
+            if mode == CodingMode::InterPlusMv {
+                encode_mv_pair(&mut enc, delta_x, delta_y, &probs.mv_probs);
+            }
+
+            // This MB contributes its reconstructed MV to the neighbour grid
+            // (intra/zero-MV MBs still record their bucket; zero-MV MBs are
+            // skipped by the Nearest/Near walk via the zero-MV predicate).
+            mv_grid[mb_row * mb_cols + mb_col] =
+                Some(NeighbourMv::new(mb_mv, ReferenceBucket::InterLast));
+
+            // --- four luma blocks (residual against the chosen MV) ---
+            for (k, &(dr, dc)) in LUMA_OFFSETS.iter().enumerate() {
+                let br = mb_row * 2 + dr;
+                let bc_col = mb_col * 2 + dc;
+                if br >= v_fragments || bc_col >= h_fragments {
+                    continue;
+                }
+                let source_pixels = extract_block(source.y.samples(), y_w, br * 8, bc_col * 8);
+                let prediction =
+                    predict_mv_luma(prev, mb_row, mb_col, LUMA_CORNERS[k], mb_mv, filter);
+                let dc_node_probs = DcContext::from_neighbours(
+                    y_grid.left(br, bc_col).is_some_and(|(d, _)| d != 0),
+                    y_grid.above(br, bc_col).is_some_and(|(d, _)| d != 0),
+                )
+                .select_row(&probs.coeffs.dc_contexts[AcPlane::Y.index()]);
+                let coded_dc = encode_inter_block(
+                    &mut enc,
+                    AcPlane::Y,
+                    &source_pixels,
+                    &prediction,
+                    dequant,
+                    dc_node_probs,
+                    probs,
+                    &mut y_dc_pred,
+                    y_grid.left(br, bc_col),
+                    y_grid.above(br, bc_col),
+                );
+                y_grid.set(br, bc_col, coded_dc, ReferenceBucket::InterLast);
+            }
+
+            // --- U chroma block (chroma MV == MB MV at ⅛-pel, §11.4) ---
+            let u_source = extract_block(source.u.samples(), u_w, mb_row * 8, mb_col * 8);
+            let u_pred = predict_mv_chroma(prev, mb_row, mb_col, false, mb_mv, filter);
+            let u_dc_node_probs = DcContext::from_neighbours(
+                u_grid.left(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
+                u_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
+            )
+            .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
+            let u_coded_dc = encode_inter_block(
+                &mut enc,
+                AcPlane::UV,
+                &u_source,
+                &u_pred,
+                dequant,
+                u_dc_node_probs,
+                probs,
+                &mut u_dc_pred,
+                u_grid.left(mb_row, mb_col),
+                u_grid.above(mb_row, mb_col),
+            );
+            u_grid.set(mb_row, mb_col, u_coded_dc, ReferenceBucket::InterLast);
+
+            // --- V chroma block ---
+            let v_source = extract_block(source.v.samples(), v_w, mb_row * 8, mb_col * 8);
+            let v_pred = predict_mv_chroma(prev, mb_row, mb_col, true, mb_mv, filter);
+            let v_dc_node_probs = DcContext::from_neighbours(
+                v_grid.left(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
+                v_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
+            )
+            .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
+            let v_coded_dc = encode_inter_block(
+                &mut enc,
+                AcPlane::UV,
+                &v_source,
+                &v_pred,
+                dequant,
+                v_dc_node_probs,
+                probs,
+                &mut v_dc_pred,
+                v_grid.left(mb_row, mb_col),
+                v_grid.above(mb_row, mb_col),
+            );
+            v_grid.set(mb_row, mb_col, v_coded_dc, ReferenceBucket::InterLast);
+        }
+    }
+
+    Ok(enc.finish())
+}
+
+/// The SAD margin (a Lagrangian λ proxy) the New-MV mode must beat zero-MV
+/// by to justify the extra §11.1 MV bits. A motion vector that reduces the
+/// 16×16 luma SAD by fewer than this many absolute-difference units is not
+/// worth the bits it costs, so the encoder keeps `CODE_INTER_NO_MV`.
+pub const ME_LAMBDA_SAD: u64 = 64;
+
+/// Grid accessor for the §10/§11 neighbour walks, mirroring the decoder's
+/// `neighbour_lookup`: maps an absolute `(row, col)` MB position to its
+/// representative neighbour MV, or `None` for off-frame / not-yet-coded.
+#[inline]
+fn grid_lookup(
+    mv_grid: &[Option<NeighbourMv>],
+    mb_cols: usize,
+    mb_rows: usize,
+    row: i32,
+    col: i32,
+) -> Option<NeighbourMv> {
+    if row < 0 || col < 0 || row as usize >= mb_rows || col as usize >= mb_cols {
+        return None;
+    }
+    mv_grid[row as usize * mb_cols + col as usize]
 }
 
 /// Encode a complete P-frame **packet** — the §9 InterHeader (raw-bit
@@ -585,6 +992,86 @@ mod tests {
             &golden_bordered,
         )
         .expect("decode")
+    }
+
+    /// Decode the **motion-estimated** encoder's partition back to a frame
+    /// against the same reference + probs + filter.
+    fn round_trip_me(source: &Frame, prev: &Frame, q: u8) -> Frame {
+        let probs = keyframe_inter_probs();
+        let filter = bilinear_filter();
+        let prev_bordered = BorderedRef::new(prev);
+        let golden_bordered = BorderedRef::new(prev);
+
+        let bytes =
+            encode_inter_frame_me(source, &prev_bordered, q, &probs, &filter).expect("ME encode");
+        let mut bc = BoolCoder::new(&bytes).expect("bool coder");
+        decode_inter_frame(
+            &mut bc,
+            source.h_fragments,
+            source.v_fragments,
+            q,
+            &probs,
+            &DEFAULT_SCAN_ORDER,
+            &filter,
+            &prev_bordered,
+            &golden_bordered,
+        )
+        .expect("decode")
+    }
+
+    /// A smooth gradient source — good motion-search material because a
+    /// translated copy of it has a well-defined best MV (unlike the
+    /// high-frequency `pattern`, where sub-pixel filtering blurs the match).
+    fn gradient(hf: usize, vf: usize) -> Frame {
+        let mut f = Frame::new(hf, vf);
+        let yw = f.y.width();
+        let yh = f.y.height();
+        for r in 0..yh {
+            for c in 0..yw {
+                // A smooth bilinear ramp in [16, 235].
+                let v = 16 + (r * 200 / yh.max(1) + c * 200 / yw.max(1)) / 2;
+                f.y.samples_mut()[r * yw + c] = v.min(235) as u8;
+            }
+        }
+        let uw = f.u.width();
+        let uh = f.u.height();
+        for r in 0..uh {
+            for c in 0..uw {
+                f.u.samples_mut()[r * uw + c] = (110 + (r + c) / 2) as u8;
+                f.v.samples_mut()[r * uw + c] = (150 - (r + c) / 2) as u8;
+            }
+        }
+        f
+    }
+
+    /// Translate one plane by `(dx, dy)` whole pixels with edge replication.
+    fn translate_plane(
+        src: &crate::frame_assembly::Plane,
+        dst: &mut crate::frame_assembly::Plane,
+        dx: i32,
+        dy: i32,
+    ) {
+        let w = src.width() as i32;
+        let h = src.height() as i32;
+        for r in 0..h {
+            for c in 0..w {
+                let sr = (r + dy).clamp(0, h - 1);
+                let sc = (c + dx).clamp(0, w - 1);
+                let v = src.samples()[(sr * w + sc) as usize];
+                dst.samples_mut()[(r * w + c) as usize] = v;
+            }
+        }
+    }
+
+    /// Translate a frame's luma+chroma by `(dx, dy)` whole pixels with edge
+    /// replication, producing a "previous frame" the source moved away from.
+    fn translate(src: &Frame, dx: i32, dy: i32) -> Frame {
+        let mut out = Frame::new(src.h_fragments, src.v_fragments);
+        translate_plane(&src.y, &mut out.y, dx, dy);
+        // Chroma is half-resolution, so the chroma shift is half the luma one.
+        translate_plane(&src.u, &mut out.u, dx / 2, dy / 2);
+        translate_plane(&src.v, &mut out.v, dx / 2, dy / 2);
+        out
     }
 
     fn psnr(a: &[u8], b: &[u8]) -> f64 {
@@ -873,5 +1360,154 @@ mod tests {
         );
         assert_eq!(p_recon.u.samples(), key_recon.u.samples());
         assert_eq!(p_recon.v.samples(), key_recon.v.samples());
+    }
+
+    // ===== Motion-estimated encoder (encode_inter_frame_me) =====
+
+    /// The motion-estimated encoder reduces to the all-zero-MV shape when
+    /// the source equals the reference: no MV beats zero-MV by the margin,
+    /// so every MB stays `CODE_INTER_NO_MV` and the frame round-trips
+    /// **exactly** (the ME path is a strict superset of the zero-MV path).
+    #[test]
+    fn me_unchanged_frame_round_trips_exactly() {
+        let prev = gradient(4, 4);
+        let source = prev.clone();
+        let out = round_trip_me(&source, &prev, 16);
+        assert_eq!(
+            out.y.samples(),
+            source.y.samples(),
+            "ME unchanged luma must round-trip exactly"
+        );
+        assert_eq!(out.u.samples(), source.u.samples());
+        assert_eq!(out.v.samples(), source.v.samples());
+    }
+
+    /// The ME encoder's bytes always round-trip through the decoder without
+    /// error and the reconstruction tracks the source above a floor — the
+    /// core correctness invariant (encoder MV-grid / availability / residual
+    /// state matches the decoder's reconstruction).
+    #[test]
+    fn me_translated_source_round_trips_above_floor() {
+        // The previous frame is the source shifted right+down by 3 luma px;
+        // the encoder should find an MV near (+12, +12) ¼-pel that brings the
+        // prediction close to the source, then code the small residual.
+        let source = gradient(4, 4);
+        let prev = translate(&source, 3, 3);
+        let out = round_trip_me(&source, &prev, 32);
+        let y = psnr(source.y.samples(), out.y.samples());
+        assert!(
+            y >= 28.0,
+            "ME translated-source luma PSNR {y:.2} dB below floor"
+        );
+        assert_eq!(out.y.width(), 32);
+    }
+
+    /// Motion estimation *helps*: on a translated gradient the ME encoder
+    /// (which can pick a non-zero MV) reconstructs the source at least as
+    /// faithfully as the zero-MV-only encoder, and strictly better when the
+    /// shift is large enough that a real MV reduces the residual. We compare
+    /// the reconstruction PSNR of the two encoders at the same quantiser.
+    #[test]
+    fn me_beats_zero_mv_on_translation() {
+        let source = gradient(6, 6);
+        let prev = translate(&source, 4, 0);
+        let q = 40;
+        let me_out = round_trip_me(&source, &prev, q);
+        let zero_out = round_trip(&source, &prev, q);
+        let me_psnr = psnr(source.y.samples(), me_out.y.samples());
+        let zero_psnr = psnr(source.y.samples(), zero_out.y.samples());
+        assert!(
+            me_psnr >= zero_psnr,
+            "ME ({me_psnr:.2} dB) should be at least as good as zero-MV \
+             ({zero_psnr:.2} dB) on a translated source"
+        );
+    }
+
+    /// A single-MB ME P-frame round-trips — the smallest grid through the
+    /// motion-search + New-MV emit + differential-reference path.
+    #[test]
+    fn me_single_mb_round_trips() {
+        let source = gradient(2, 2);
+        let prev = translate(&source, 2, 1);
+        let out = round_trip_me(&source, &prev, 36);
+        assert_eq!(out.y.width(), 16);
+        let y = psnr(source.y.samples(), out.y.samples());
+        assert!(y >= 26.0, "single-MB ME luma PSNR {y:.2} dB too low");
+    }
+
+    /// A multi-MB ME frame where adjacent MBs share a common motion exercises
+    /// the §11 differential-reference path: the second MB in a row codes its
+    /// MV relative to the left neighbour's reconstructed MV (a small delta),
+    /// and the decoder must reconstruct the same absolute MV. The frame
+    /// round-trips above a floor, proving the encoder's differential-MV
+    /// emission matches the decoder's reconstruction.
+    #[test]
+    fn me_shared_motion_differential_round_trips() {
+        let source = gradient(8, 4);
+        let prev = translate(&source, 5, 2);
+        let out = round_trip_me(&source, &prev, 28);
+        let y = psnr(source.y.samples(), out.y.samples());
+        let u = psnr(source.u.samples(), out.u.samples());
+        let v = psnr(source.v.samples(), out.v.samples());
+        assert!(y >= 28.0, "shared-motion luma PSNR {y:.2} dB below floor");
+        assert!(u >= 28.0, "shared-motion U PSNR {u:.2} dB below floor");
+        assert!(v >= 28.0, "shared-motion V PSNR {v:.2} dB below floor");
+    }
+
+    /// Full keyframe → ME-P-frame GOP: encode/decode an I-frame, seed the §4
+    /// refs from the reconstruction, then encode a translated P-frame with
+    /// the ME encoder and decode it through `decode_inter_frame_with_refs`.
+    /// The realistic two-frame pipeline with real motion.
+    #[test]
+    fn me_keyframe_then_pframe_gop_round_trips() {
+        use crate::frame_header::{Vp6FrameHeader, Vp6HeaderTail};
+        use crate::inter_frame::{decode_inter_frame_with_refs, ReferenceFrames};
+        use crate::intra_frame::decode_intra_frame;
+
+        let q = 32u8;
+        let key_source = gradient(4, 4);
+        let key_bytes = crate::intra_encode::encode_intra_frame(&key_source, q).expect("I-encode");
+        let hdr = Vp6FrameHeader::parse(&key_bytes).expect("header prefix");
+        let mut bc = BoolCoder::new(&key_bytes[hdr.raw_prefix_len..]).expect("bool coder");
+        let _tail =
+            Vp6HeaderTail::parse_with(&mut bc, true, hdr.profile.unwrap(), hdr.version.unwrap())
+                .expect("tail");
+        let key_recon = decode_intra_frame(
+            &mut bc,
+            key_source.h_fragments,
+            key_source.v_fragments,
+            hdr.dct_q_mask,
+            &IntraProbs::keyframe(),
+            &DEFAULT_SCAN_ORDER,
+        )
+        .expect("I-decode");
+
+        let refs = ReferenceFrames::from_keyframe(key_recon.clone());
+        let probs = keyframe_inter_probs();
+        let filter = bilinear_filter();
+        let (prev_bordered, _golden) = refs.bordered();
+
+        // The P-frame source is the decoded keyframe shifted — so a real MV
+        // near (-shift) brings the prediction back onto the source.
+        let p_source = translate(&key_recon, 3, 2);
+
+        let p_bytes = encode_inter_frame_me(&p_source, &prev_bordered, q, &probs, &filter)
+            .expect("ME P-encode");
+        let mut p_bc = BoolCoder::new(&p_bytes).expect("P bool coder");
+        let p_recon = decode_inter_frame_with_refs(
+            &mut p_bc,
+            p_source.h_fragments,
+            p_source.v_fragments,
+            q,
+            &probs,
+            &DEFAULT_SCAN_ORDER,
+            &filter,
+            &refs,
+        )
+        .expect("P-decode");
+
+        let y = psnr(p_source.y.samples(), p_recon.y.samples());
+        assert!(y >= 28.0, "ME GOP P-frame luma PSNR {y:.2} dB below floor");
+        assert_eq!(p_recon.y.width(), 32);
     }
 }
