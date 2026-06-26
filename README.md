@@ -69,13 +69,14 @@ sub-streams** (each pass exists — `mode_prob_update`, `mv_prob_update`,
 to the header tail wants a conformant `.vp6` fixture to validate, so the
 top-level driver currently decodes only the no-update / single-partition
 / BoolCoder-coefficient shape the in-tree encoders produce), the **`Encoder`
-registration**, and per-frame probability-update and rate-control surfaces. The encoder's
+registration**, and and the per-frame probability-update surface. The encoder's
 **motion estimation** (single-vector `CODE_INTER_PLUS_MV` with a two-stage
 box-then-¼-pel luma search and §11 differential-MV emission), its
-**Nearest/Near implicit-MV modes**, its **Golden-frame encode modes**, and
-its **FourMV encode mode** (four independent per-block vectors) **now exist**
+**Nearest/Near implicit-MV modes**, its **Golden-frame encode modes**, its
+**FourMV encode mode** (four independent per-block vectors), and a
+**rate-control quantiser selector** (`rate_control`) **now exist**
 (`encode_inter_frame_me` / `encode_inter_frame_me_golden` /
-`encode_inter_frame_me_fourmv`).
+`encode_inter_frame_me_fourmv` / `rate_control::select_quantiser_for_budget`).
 
 ### Implemented stages
 
@@ -291,6 +292,18 @@ its **FourMV encode mode** (four independent per-block vectors) **now exist**
   Golden-aware / FourMV data partition so each encoded P-frame is a
   self-describing packet `decode_frame::Vp6Decoder::decode_packet` consumes
   end-to-end.
+- **`rate_control`** is the per-frame quantiser selector. The encoders take a
+  fixed §9 `DctQMask`; `rate_control` solves the inverse — pick the index that
+  hits a bit budget. It exploits the §15-table monotonicity (the dequant factor
+  decreases with the index, so encoded size is weakly monotonically
+  non-decreasing in `DctQMask`) to binary-search the `0..=63` space against a
+  caller `encode(q) -> Vec<u8>` closure: `select_quantiser_for_budget` returns
+  the finest index whose output fits a hard cap, `select_quantiser_for_target_size`
+  the index closest to a target size, each returning a `QuantiserChoice { q,
+  size, bytes }` (the chosen index + its already-encoded partition). A
+  real-encoder integration test confirms the in-tree encoder's output is
+  genuinely monotone in `q` and the budget search fits with the next-finer index
+  overflowing.
 
 ### Inter (P-frame) path — decodes end-to-end to pixels
 

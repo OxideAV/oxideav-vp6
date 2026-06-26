@@ -868,6 +868,7 @@ pub mod mv_encode;
 pub mod mv_prob_update;
 pub mod near_mv;
 pub mod prob_update;
+pub mod rate_control;
 pub mod raw_bits;
 pub mod reconstruct;
 pub mod scaling;
@@ -971,6 +972,9 @@ pub use near_mv::{
 };
 pub use prob_update::{
     decode_new_node_prob, update_ac_probs, update_dc_probs, update_zero_run_probs,
+};
+pub use rate_control::{
+    select_quantiser_for_budget, select_quantiser_for_target_size, QuantiserChoice, MAX_Q, MIN_Q,
 };
 pub use raw_bits::{RawBitError, RawBitReader};
 pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};

@@ -8,6 +8,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 373, 2026-06-26)
 
+- **`rate_control` — per-frame quantiser selection (rate control)**, landing
+  the encoder's third named "lack". The VP6 encoders take a fixed §9 `DctQMask`
+  index; `rate_control` solves the inverse problem — pick the index that hits a
+  bit budget / target frame size. It exploits the §15-table monotonicity (the
+  dequant factor **decreases** with the index, so encoded partition size is
+  weakly **monotonically non-decreasing** in `DctQMask`) to binary-search the
+  `0..=63` index space against a caller-supplied `encode(q) -> Vec<u8>` closure:
+  - `select_quantiser_for_budget(budget_bytes, encode)` — the **finest** index
+    whose real output fits a hard byte cap (best quality under the cap),
+    falling back to `MIN_Q` when even the coarsest index overflows.
+  - `select_quantiser_for_target_size(target_bytes, encode)` — the index whose
+    output size is **closest** to a target (over- or under-shoot), the
+    nearest-size building block for a constant-bitrate driver.
+  - `QuantiserChoice { q, size, bytes }` returns the chosen index **and** its
+    already-encoded partition so the caller doesn't re-encode; `MIN_Q` / `MAX_Q`
+    pin the `0..=63` bounds.
+  Eleven tests: the budget/target selection logic against a synthetic monotone
+  encoder (finest-that-fits, exact-boundary, min-q fallback, huge-budget →
+  max-q, nearest-even-if-over, exact hit), a brute-force cross-check of the
+  binary search across step shapes + budgets, error propagation, and a
+  **real-encoder integration** test that confirms the in-tree intra encoder's
+  output size is genuinely monotone in `q` and that the budget search picks a q
+  whose real output fits the cap with the next-finer index overflowing it.
+  `select_quantiser_for_budget` / `select_quantiser_for_target_size` /
+  `QuantiserChoice` / `MIN_Q` / `MAX_Q` are re-exported from the crate root.
+  An encoder-side policy layer over the §9 `DctQMask` field; no third-party VP6
+  source consulted.
+
 - **`inter_encode::encode_inter_frame_me_fourmv` — the FourMV P-frame
   encoder**, landing the encoder's second named "lack" (FourMV encode modes).
   A strict superset of `encode_inter_frame_me` that codes a macroblock
