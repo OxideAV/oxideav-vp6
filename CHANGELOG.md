@@ -6,6 +6,53 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 373, 2026-06-26)
+
+- **`inter_encode::encode_inter_frame_me_golden` — the Golden-Frame-aware
+  motion-estimated P-frame encoder**, a strict superset of
+  `encode_inter_frame_me` that codes each macroblock against **either** the
+  previous-frame **or** the Golden-Frame reference, whichever reconstructs more
+  cheaply. This lands the encoder's first of three named "lacks" (Golden-frame
+  encode modes). Per MB:
+  - **Per-reference mode inputs** (`mb_inputs_for_ref`): the luma motion search,
+    the §10 Nearest/Near candidate walk, the §11 differential reference, and
+    every candidate's 16×16 luma SAD are all computed twice — once against
+    `prev` filtered on `ReferenceBucket::InterLast`, once against `golden`
+    filtered on `ReferenceBucket::InterGolden` — so each reference's
+    Nearest/Near reuse and differential-MV reconstruction match what the decoder
+    resolves for the corresponding `*_GOLD*` / previous-frame mode.
+  - **Reference decision** (`decide_mb_mode_golden`): the cheaper-reconstruction
+    reference wins, with a `GOLDEN_SWITCH_PENALTY` (`128`) SAD hysteresis so a
+    marginal Golden win that loses the same-reference §14 DC / §11 differential-MV
+    continuity (and costs marginally more §10 mode-tree bits) doesn't flip the
+    reference. The previous-frame set emits `CODE_INTER_NO_MV` /
+    `CODE_INTER_NEAREST_MV` / `CODE_INTER_NEAR_MV` / `CODE_INTER_PLUS_MV`; the
+    Golden set emits `CODE_USING_GOLDEN` / `CODE_GOLD_NEAREST_MV` /
+    `CODE_GOLD_NEAR_MV` / `CODE_GOLDEN_MV`.
+  - **Reference-aware block emit**: `encode_inter_block` now threads the block's
+    actual `ReferenceBucket` (was hardcoded `InterLast`) into the §14 DC
+    prediction and the per-plane coded-DC grids, so a mixed previous/golden
+    frame's same-reference DC filter is correct. The §10 probXmitted
+    availability row is still resolved on the previous-frame bucket, exactly as
+    the decoder indexes it.
+  - `encode_inter_frame_me_golden_packet` is the §9-self-describing dual
+    (Table 1 prefix + Table 3 tail `RefreshGoldenFrame = 0` / `UseHuffman = 0`),
+    keeping the keyframe-seeded Golden Frame the body's `*_GOLD*` MBs predict
+    from, so a Golden-aware P-frame decodes end-to-end through the top-level
+    `decode_frame::Vp6Decoder`.
+  Six round-trip / decision tests against `decode_inter_frame`: golden-wins
+  (`prev` is unrelated → every MB switches to `CODE_USING_GOLDEN`, ≥30 dB luma
+  + chroma); the identical-references reduction (unchanged frame is **exact**);
+  a mixed previous↔golden frame crossing a reference transition mid-frame; a
+  full keyframe → Golden-aware P-frame GOP recovering the source from the Golden
+  reference through the §4 `ReferenceFrames`; and a `decide_mb_mode_golden`
+  unit test pinning the switch-penalty boundary. All memory-bounded (small
+  grids; the search is `O(range² · 256)` SAD adds per reference per MB).
+  `encode_inter_frame_me_golden`, `encode_inter_frame_me_golden_packet` and
+  `GOLDEN_SWITCH_PENALTY` are re-exported from the crate root. Derived solely
+  from the decode pipeline it inverts (§10 Table 4 / §11 / §14 / §17.2); no
+  third-party VP6 source consulted.
+
 ### Added (clean-room round 366, 2026-06-25)
 
 - **`inter_encode::encode_inter_frame_me` — the motion-estimated P-frame

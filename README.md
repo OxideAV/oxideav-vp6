@@ -69,12 +69,12 @@ sub-streams** (each pass exists — `mode_prob_update`, `mv_prob_update`,
 to the header tail wants a conformant `.vp6` fixture to validate, so the
 top-level driver currently decodes only the no-update / single-partition
 / BoolCoder-coefficient shape the in-tree encoders produce), the **`Encoder`
-registration**, and the encoder's richer mode decision (the Nearest/Near
-implicit-MV modes, Golden-frame modes and FourMV), per-frame
+registration**, and the encoder's richer mode decision (FourMV encode modes), per-frame
 probability-update and rate-control surfaces. The encoder's **motion
 estimation** (single-vector `CODE_INTER_PLUS_MV` with a two-stage
-box-then-¼-pel luma search and §11 differential-MV emission) **now
-exists** (`encode_inter_frame_me`).
+box-then-¼-pel luma search and §11 differential-MV emission) and its
+**Nearest/Near implicit-MV modes** and **Golden-frame encode modes**
+**now exist** (`encode_inter_frame_me` / `encode_inter_frame_me_golden`).
 
 ### Implemented stages
 
@@ -242,10 +242,34 @@ exists** (`encode_inter_frame_me`).
   `B(MvSignProbs)` sign. `encode_mv_pair` is the `(dx, dy)` dual of
   `decode_mv_pair`. Round-trip tests pin every short component, the full
   `0..=255` magnitude range, and mixed pairs against the decoder.
+- **`inter_encode::encode_inter_frame_me_golden`** is the **Golden-Frame-aware
+  motion-estimated P-frame encoder** — a strict superset of
+  `encode_inter_frame_me` that codes each macroblock against **either** the
+  previous-frame **or** the Golden-Frame reference. Per MB it builds the §10
+  single-vector mode decision twice via `mb_inputs_for_ref` — once against
+  `prev` (filtered on `ReferenceBucket::InterLast`), once against `golden`
+  (filtered on `ReferenceBucket::InterGolden`) — and `decide_mb_mode_golden`
+  takes the cheaper reconstruction, with a `GOLDEN_SWITCH_PENALTY` SAD
+  hysteresis so a marginal Golden win that loses the same-reference §14 DC / §11
+  differential-MV continuity (and costs marginally more §10 mode-tree bits)
+  doesn't flip the reference. The chosen reference's mode set is emitted
+  (`CODE_INTER_*` for the previous frame, `CODE_USING_GOLDEN` /
+  `CODE_GOLD_NEAREST_MV` / `CODE_GOLD_NEAR_MV` / `CODE_GOLDEN_MV` for the
+  Golden Frame), and `encode_inter_block` threads each block's actual reference
+  bucket into the §14 DC prediction + per-plane coded-DC grids so a mixed
+  previous/golden frame's same-reference DC filter matches the decoder. The §10
+  probXmitted availability row is resolved on the previous-frame bucket exactly
+  as the decoder indexes it. Round-trip tests against `decode_inter_frame` pin:
+  golden-wins (unrelated `prev` → every MB `CODE_USING_GOLDEN`, ≥30 dB luma +
+  chroma); the identical-references reduction (unchanged frame **exact**); a
+  mixed previous↔golden frame; a full keyframe → Golden-aware P-frame GOP
+  recovering the source from the Golden reference through the §4
+  `ReferenceFrames`; and a `decide_mb_mode_golden` switch-penalty boundary test.
 - **`inter_encode::encode_inter_frame_packet` /
-  `encode_inter_frame_me_packet`** prepend the §9 InterHeader (Table 1
-  prefix + Table 3 BoolCoder tail) to the zero-MV / motion-estimated data
-  partition so each encoded P-frame is a self-describing packet
+  `encode_inter_frame_me_packet` / `encode_inter_frame_me_golden_packet`**
+  prepend the §9 InterHeader (Table 1 prefix + Table 3 BoolCoder tail) to the
+  zero-MV / motion-estimated / Golden-aware data partition so each encoded
+  P-frame is a self-describing packet
   `decode_frame::Vp6Decoder::decode_packet` consumes end-to-end.
 
 ### Inter (P-frame) path — decodes end-to-end to pixels
