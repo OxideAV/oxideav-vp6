@@ -317,6 +317,22 @@ impl FilterConfig {
             loop_filter_qi,
         }
     }
+
+    /// The Simple-profile / VP6.0 default filter configuration: §11.4 fixed
+    /// bilinear interpolation with the §11.3 prediction loop filter disabled.
+    ///
+    /// This is the operative config the top-level decoder derives for the
+    /// keyframe-baseline P-frame shape the in-tree encoders emit (Simple
+    /// profile → bilinear; no `UseLoopFilter`), exposed as a named constructor
+    /// so the encoder and the decode path share one source of truth instead of
+    /// hand-building the `PredictionFilterPolicy::Fixed(FilterFamily::Bilinear)`
+    /// literal.
+    pub fn bilinear() -> Self {
+        FilterConfig {
+            policy: PredictionFilterPolicy::Fixed(crate::inter::FilterFamily::Bilinear),
+            loop_filter_qi: None,
+        }
+    }
 }
 
 /// One block-grid cell of the §14 DC-prediction neighbour grid: the

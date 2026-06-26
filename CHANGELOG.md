@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 373, 2026-06-26)
 
+- **`encoder` — `oxideav-core` `Encoder` registration** (`Vp6CodecEncoder`,
+  `make_encoder` / `make_encoder_with_q`), closing the last named encoder
+  "lack" (the `Encoder` shell was previously unregistered). The codec's
+  `register_codecs` now wires `.encoder(make_encoder)` alongside the decoder, so
+  `CodecRegistry::first_encoder` resolves a VP6 encoder under id `"vp6"`.
+  `Vp6CodecEncoder` is a GOP-aware adapter: the first frame (and every
+  `keyframe_interval`-th after) emits a §9 keyframe packet via
+  `encode_intra_frame`; every other frame a motion-estimated P-frame packet via
+  `encode_inter_frame_me_packet` against the **decoded** previous frame. The
+  reference is maintained by decoding the encoder's own output through an
+  internal `Vp6Decoder`, so the pixels the encoder predicts from are
+  byte-identical to a downstream decoder's reconstruction — the round-trip is
+  closed by construction. Geometry: §2 fragment-based (`h_fragments = width/8`),
+  width/height must be multiples of 8 within the §9 8-bit fragment fields;
+  4:2:0 only. `FilterConfig::bilinear()` is a new named constructor for the
+  Simple/VP6.0 default (fixed bilinear, no loop filter) the encoder and decode
+  path now share. Six tests: dimension validation, `output_params` propagation,
+  a keyframe round-trip **through the `Encoder` → `Decoder` trait surfaces**, a
+  keyframe → P-frame GOP (second frame is a P-frame, both decode in GOP order),
+  registry resolution, and the NeedMore→Eof drain contract.
+
 - **`rate_control` — per-frame quantiser selection (rate control)**, landing
   the encoder's third named "lack". The VP6 encoders take a fixed §9 `DctQMask`
   index; `rate_control` solves the inverse problem — pick the index that hits a

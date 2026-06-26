@@ -68,13 +68,14 @@ sub-streams** (each pass exists — `mode_prob_update`, `mv_prob_update`,
 `prob_update`, `scan_update` — but the exact Figure-5 ordering relative
 to the header tail wants a conformant `.vp6` fixture to validate, so the
 top-level driver currently decodes only the no-update / single-partition
-/ BoolCoder-coefficient shape the in-tree encoders produce), the **`Encoder`
-registration**, and and the per-frame probability-update surface. The encoder's
-**motion estimation** (single-vector `CODE_INTER_PLUS_MV` with a two-stage
-box-then-¼-pel luma search and §11 differential-MV emission), its
+/ BoolCoder-coefficient shape the in-tree encoders produce). The encoder is
+now **registered** as an `oxideav-core` `Encoder` (`encoder::Vp6CodecEncoder`
+/ `make_encoder`, a GOP-aware keyframe + motion-estimated-P-frame adapter),
+and its **motion estimation** (single-vector `CODE_INTER_PLUS_MV` with a
+two-stage box-then-¼-pel luma search and §11 differential-MV emission), its
 **Nearest/Near implicit-MV modes**, its **Golden-frame encode modes**, its
 **FourMV encode mode** (four independent per-block vectors), and a
-**rate-control quantiser selector** (`rate_control`) **now exist**
+**rate-control quantiser selector** (`rate_control`) **all exist**
 (`encode_inter_frame_me` / `encode_inter_frame_me_golden` /
 `encode_inter_frame_me_fourmv` / `rate_control::select_quantiser_for_budget`).
 
@@ -371,20 +372,30 @@ box-then-¼-pel luma search and §11 differential-MV emission), its
   `oxideav_core::Decoder` trait (packet-queue → 3-plane 4:2:0
   `VideoFrame`) and install it under id `"vp6"` with the On2 / Flash /
   Matroska container tags. `register()` is no longer a no-op.
+- **`encoder::Vp6CodecEncoder` + `make_encoder`** wrap the keyframe +
+  motion-estimated-P-frame encoders in the `oxideav_core::Encoder` trait, now
+  registered alongside the decoder (`register_codecs` wires
+  `.encoder(make_encoder)`, so `CodecRegistry::first_encoder` resolves a VP6
+  encoder under `"vp6"`). A GOP-aware adapter: a keyframe packet
+  (`encode_intra_frame`) at the start of every GOP, a motion-estimated P-frame
+  packet (`encode_inter_frame_me_packet`) otherwise, against the **decoded**
+  previous frame — the reference is maintained by decoding the encoder's own
+  output through an internal `Vp6Decoder`, so the round-trip is closed by
+  construction. Tests round-trip a keyframe and a keyframe → P-frame GOP
+  **through the `Encoder` → `Decoder` trait surfaces**.
 - **`inter_encode::encode_inter_frame_packet`** is the §9 InterHeader
   emit that turns the data-partition-only `encode_inter_frame` into a
   self-describing P-frame packet `decode_packet` consumes.
 
 ### Blocked / remaining
 
-- **In-header probability-update sequencing + `Encoder` registration** —
-  the §10 mode-prob / §11.2 MV-prob / §13 Figure-5 coefficient-prob / §12
-  scan-update passes all exist (`mode_prob_update`, `mv_prob_update`,
-  `prob_update`, `scan_update`) but their exact Figure-1/Figure-5
-  ordering relative to the header tail wants a conformant `.vp6` fixture
-  to validate; the top-level driver therefore decodes only the no-update
-  frame shape so far. An `oxideav-core` `Encoder` shell over the
-  `encode_*_frame` paths is likewise unregistered.
+- **In-header probability-update sequencing** — the §10 mode-prob /
+  §11.2 MV-prob / §13 Figure-5 coefficient-prob / §12 scan-update passes all
+  exist (`mode_prob_update`, `mv_prob_update`, `prob_update`, `scan_update`)
+  but their exact Figure-1/Figure-5 ordering relative to the header tail wants
+  a conformant `.vp6` fixture to validate; the top-level driver therefore
+  decodes only the no-update frame shape so far. (The `oxideav-core` `Encoder`
+  registration is **now landed** — see `encoder::Vp6CodecEncoder` above.)
 - **DOCS-GAP — FourMV MB neighbour representative.** §10 defines the
   Nearest/Near walk over "decoded macroblock neighbors" (one MV per
   neighbour MB), but never states which of a `CODE_INTER_FOURMV` MB's
@@ -392,7 +403,12 @@ box-then-¼-pel luma search and §11 differential-MV emission), its
   *later* MB's `NearMacroBlocks` list, nor which it contributes as the
   §11 differential reference for an immediately-right/below `New` MB.
   `reconstruct_fourmv_macroblock` exposes all four vectors and defers
-  the choice rather than guess.
+  the choice rather than guess. The **encoder sidesteps** this gap: a FourMV
+  MB contributes `None` to the neighbour grid (exactly as the decoder records
+  it), so `encode_inter_frame_me_fourmv` round-trips a FourMV MB without the
+  representative being defined — but a conformant bitstream that *relies* on a
+  FourMV MB as a later neighbour's Nearest/Near or differential reference still
+  needs the gap closed to decode.
 - **High-bit-depth / scaling resampling math** and **sample-exact
   validation against a conformant `.vp6` bitstream** — the latter
   needs an encoder-produced fixture.

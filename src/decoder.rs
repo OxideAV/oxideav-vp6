@@ -169,6 +169,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(VP6_CODEC_ID))
             .capabilities(caps)
             .decoder(make_decoder)
+            .encoder(crate::encoder::make_encoder)
             .tags([
                 CodecTag::fourcc(b"VP60"),
                 CodecTag::fourcc(b"VP61"),

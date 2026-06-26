@@ -845,6 +845,7 @@ pub mod dct_decode;
 pub mod decode_frame;
 pub mod decoder;
 pub mod dequant;
+pub mod encoder;
 pub mod forward_dct;
 pub mod fourmv;
 pub mod frame_assembly;
