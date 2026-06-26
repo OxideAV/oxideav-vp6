@@ -137,6 +137,15 @@ impl Vp6Decoder {
         self.refs.is_some()
     }
 
+    /// The §4 reference-frame state (previous-frame + Golden Frame buffers),
+    /// or `None` until the first keyframe seeds them. Lets a Golden-aware
+    /// encoder built on this decoder read the **decoded** Golden Frame to
+    /// predict its `*_GOLD*` macroblocks against the exact pixels a downstream
+    /// decoder holds.
+    pub fn references(&self) -> Option<&crate::inter_frame::ReferenceFrames> {
+        self.refs.as_ref()
+    }
+
     fn decode_keyframe(
         &mut self,
         header: &Vp6FrameHeader,

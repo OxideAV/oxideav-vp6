@@ -1975,6 +1975,36 @@ pub fn encode_inter_frame_me_golden_packet(
     probs: &InterProbs,
     filter: &FilterConfig,
 ) -> Result<Vec<u8>, Error> {
+    encode_inter_frame_me_golden_packet_refresh(
+        source, prev, golden, dct_q_mask, probs, filter, false,
+    )
+}
+
+/// Encode a Golden-aware motion-estimated P-frame packet with an explicit §4
+/// `RefreshGoldenFrame` flag.
+///
+/// Same as [`encode_inter_frame_me_golden_packet`] but emits
+/// `RefreshGoldenFrame = refresh_golden` in the Table 3 tail. When `true`, the
+/// decoder replaces its Golden Frame with this decoded P-frame (§4) after the
+/// frame — letting a GOP periodically advance the Golden reference instead of
+/// pinning it to the keyframe. The body still predicts the `*_GOLD*` MBs from
+/// the **current** (pre-refresh) `golden` buffer; the refresh applies *after*
+/// the decode, so the caller's reference bookkeeping must mirror the §4 update.
+///
+/// # Errors
+///
+/// Propagates [`Error::NotImplemented`] from [`encode_inter_frame_me_golden`]
+/// for an over-large frame geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_inter_frame_me_golden_packet_refresh(
+    source: &Frame,
+    prev: &BorderedRef,
+    golden: &BorderedRef,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    filter: &FilterConfig,
+    refresh_golden: bool,
+) -> Result<Vec<u8>, Error> {
     let dct_q_mask = dct_q_mask & 0x3F;
 
     // --- §9 raw-bit header prefix (Table 1, byte-aligned) ---
@@ -1993,7 +2023,7 @@ pub fn encode_inter_frame_me_golden_packet(
         probs,
         filter,
         |enc| {
-            enc.encode_b1(0); // RefreshGoldenFrame = 0
+            enc.encode_b1(u8::from(refresh_golden)); // RefreshGoldenFrame
             enc.encode_b1(0); // UseHuffman = 0
         },
     )?;
@@ -2863,6 +2893,54 @@ mod tests {
         assert!(
             y >= 30.0,
             "golden-GOP P-frame luma PSNR {y:.2} dB below floor"
+        );
+    }
+
+    /// A `RefreshGoldenFrame = 1` P-frame packet advances the decoder's Golden
+    /// buffer to that frame's reconstruction (§4), so a *subsequent* P-frame
+    /// predicting from Golden sees the refreshed content. Drives a keyframe → P1
+    /// (RefreshGolden) → and checks the decoder's `references()` Golden buffer
+    /// changed away from the keyframe.
+    #[test]
+    fn golden_refresh_packet_advances_golden_buffer() {
+        use crate::decode_frame::Vp6Decoder;
+
+        let q = 24u8;
+        let key = gradient(4, 4);
+        let probs = keyframe_inter_probs();
+        let filter = bilinear_filter();
+
+        let key_packet = crate::intra_encode::encode_intra_frame(&key, q).expect("I-encode");
+        let mut dec = Vp6Decoder::new();
+        let key_recon = dec.decode_packet(&key_packet).expect("I-decode");
+        // After the keyframe, Golden == previous == keyframe recon.
+        let golden_before = dec.references().expect("refs").golden.clone();
+        assert_eq!(golden_before.y.samples(), key_recon.y.samples());
+
+        // A content-changed P1 with RefreshGoldenFrame = 1.
+        let prev_b = BorderedRef::new(&key_recon);
+        let golden_b = BorderedRef::new(&key_recon);
+        let mut p1_source = key_recon.clone();
+        for (i, s) in p1_source.y.samples_mut().iter_mut().enumerate() {
+            *s = s.wrapping_add((i % 5) as u8);
+        }
+        let p1 = encode_inter_frame_me_golden_packet_refresh(
+            &p1_source, &prev_b, &golden_b, q, &probs, &filter, true,
+        )
+        .expect("golden-refresh P1");
+        let p1_recon = dec.decode_packet(&p1).expect("P1 decode");
+
+        let golden_after = dec.references().expect("refs").golden.clone();
+        // The Golden buffer now matches the P1 reconstruction, not the keyframe.
+        assert_eq!(
+            golden_after.y.samples(),
+            p1_recon.y.samples(),
+            "RefreshGoldenFrame=1 must advance Golden to the P-frame recon"
+        );
+        assert_ne!(
+            golden_after.y.samples(),
+            golden_before.y.samples(),
+            "Golden buffer should have changed from the keyframe"
         );
     }
 

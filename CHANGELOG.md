@@ -8,6 +8,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 373, 2026-06-26)
 
+- **`encode_inter_frame_me_golden_packet_refresh` + `Vp6Decoder::references`** —
+  the §4 Golden-Frame **refresh** path for the Golden-aware encoder. The new
+  packet variant emits an explicit `RefreshGoldenFrame` flag in the Table 3
+  tail; when `true`, the decoder replaces its Golden Frame with the decoded
+  P-frame after the frame (§4), letting a GOP periodically advance the Golden
+  reference instead of pinning it to the keyframe.
+  `encode_inter_frame_me_golden_packet` is now a thin wrapper passing
+  `false`. `Vp6Decoder::references()` exposes the §4 reference state (previous +
+  Golden buffers) so a Golden-aware encoder reads the **decoded** Golden Frame.
+  A decode-side test drives keyframe → `RefreshGoldenFrame=1` P-frame and
+  asserts the decoder's Golden buffer advances from the keyframe to the P-frame
+  reconstruction.
+
 - **`encoder` — `oxideav-core` `Encoder` registration** (`Vp6CodecEncoder`,
   `make_encoder` / `make_encoder_with_q`), closing the last named encoder
   "lack" (the `Encoder` shell was previously unregistered). The codec's

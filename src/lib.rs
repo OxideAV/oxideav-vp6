@@ -921,8 +921,9 @@ pub use inter::{
 pub use inter_encode::{
     encode_inter_frame, encode_inter_frame_me, encode_inter_frame_me_fourmv,
     encode_inter_frame_me_fourmv_packet, encode_inter_frame_me_golden,
-    encode_inter_frame_me_golden_packet, encode_inter_frame_me_packet, encode_inter_frame_packet,
-    FOURMV_SAD_MARGIN, GOLDEN_SWITCH_PENALTY, ME_LAMBDA_SAD,
+    encode_inter_frame_me_golden_packet, encode_inter_frame_me_golden_packet_refresh,
+    encode_inter_frame_me_packet, encode_inter_frame_packet, FOURMV_SAD_MARGIN,
+    GOLDEN_SWITCH_PENALTY, ME_LAMBDA_SAD,
 };
 pub use inter_frame::{
     decode_inter_frame, decode_inter_frame_with_refs, BorderedRef, FilterConfig, InterProbs,
