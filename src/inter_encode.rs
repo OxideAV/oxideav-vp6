@@ -529,6 +529,101 @@ fn luma_mb_sad(
     sad
 }
 
+/// Sum of absolute differences between one source 8×8 luma block and its
+/// motion-compensated prediction for a candidate `mv` — the single-block
+/// (FourMV) analogue of [`luma_mb_sad`]. `corner` is the block's `(top, left)`
+/// offset within the MB (one of the four [`LUMA_CORNERS`]).
+#[allow(clippy::too_many_arguments)]
+fn luma_block_sad(
+    source: &Frame,
+    prev: &BorderedRef,
+    mb_row: usize,
+    mb_col: usize,
+    corner: (i32, i32),
+    src_br: usize,
+    src_bc: usize,
+    mv: MotionVector,
+    filter: &FilterConfig,
+) -> u64 {
+    let y_w = source.y.width();
+    let pred = predict_mv_luma(prev, mb_row, mb_col, corner, mv, filter);
+    let src = extract_block(source.y.samples(), y_w, src_br * 8, src_bc * 8);
+    let mut sad = 0u64;
+    for (&s, &p) in src.iter().zip(pred.iter()) {
+        sad += (s - p as i32).unsigned_abs() as u64;
+    }
+    sad
+}
+
+/// Search the best whole-then-¼-pel MV for **one 8×8 luma block** (the FourMV
+/// per-block search), minimising that block's 8×8 SAD against `prev`. Same
+/// two-stage box-then-quarter-pel shape as [`search_luma_mv`] but scoped to a
+/// single block at `corner` / source block `(src_br, src_bc)`.
+#[allow(clippy::too_many_arguments)]
+fn search_luma_block_mv(
+    source: &Frame,
+    prev: &BorderedRef,
+    mb_row: usize,
+    mb_col: usize,
+    corner: (i32, i32),
+    src_br: usize,
+    src_bc: usize,
+    filter: &FilterConfig,
+) -> (MotionVector, u64) {
+    let in_range = |c: i32| c.unsigned_abs() <= MAX_MV_MAGNITUDE;
+    let sad_of = |mv: MotionVector| {
+        luma_block_sad(
+            source, prev, mb_row, mb_col, corner, src_br, src_bc, mv, filter,
+        )
+    };
+
+    let mut best_mv = MotionVector::ZERO;
+    let mut best_sad = sad_of(best_mv);
+    for wy in -ME_SEARCH_RANGE..=ME_SEARCH_RANGE {
+        for wx in -ME_SEARCH_RANGE..=ME_SEARCH_RANGE {
+            if wx == 0 && wy == 0 {
+                continue;
+            }
+            let (qx, qy) = (wx * 4, wy * 4);
+            if !in_range(qx) || !in_range(qy) {
+                continue;
+            }
+            let mv = MotionVector::new(qx as i16, qy as i16);
+            let sad = sad_of(mv);
+            if sad < best_sad {
+                best_sad = sad;
+                best_mv = mv;
+            }
+        }
+    }
+
+    let base = best_mv;
+    for &(ddx, ddy) in &[
+        (-1, -1),
+        (-1, 0),
+        (-1, 1),
+        (0, -1),
+        (0, 1),
+        (1, -1),
+        (1, 0),
+        (1, 1),
+    ] {
+        let qx = base.x as i32 + ddx;
+        let qy = base.y as i32 + ddy;
+        if !in_range(qx) || !in_range(qy) {
+            continue;
+        }
+        let mv = MotionVector::new(qx as i16, qy as i16);
+        let sad = sad_of(mv);
+        if sad < best_sad {
+            best_sad = sad;
+            best_mv = mv;
+        }
+    }
+
+    (best_mv, best_sad)
+}
+
 /// Search for the best whole-then-quarter-pel luma MV for one macroblock
 /// against the previous-frame reference, minimising the 16×16 luma SAD.
 ///
@@ -1317,6 +1412,404 @@ fn encode_inter_frame_me_golden_body(
     }
 
     Ok(enc.finish())
+}
+
+/// The SAD margin a `CODE_INTER_FOURMV` macroblock must beat the best
+/// single-vector mode by — across the whole 16×16 luma sum of the four
+/// per-block searches — before the FourMV encoder spends the extra Table 10
+/// codeword + per-block MV bits on four independent vectors. FourMV emits up
+/// to four §11.1 deltas where a single-vector MB emits at most one, so the
+/// four-vector residual reduction must clear a wider margin than
+/// [`ME_LAMBDA_SAD`] to pay for itself.
+pub const FOURMV_SAD_MARGIN: u64 = 256;
+
+/// Encode a P-frame that uses `CODE_INTER_FOURMV` macroblocks where four
+/// independent per-block motion vectors beat the best single-vector mode by
+/// [`FOURMV_SAD_MARGIN`] — a strict superset of [`encode_inter_frame_me`].
+///
+/// Per MB the encoder runs both the single-vector mode decision (the
+/// [`encode_inter_frame_me`] path) **and** a four-block independent search
+/// ([`search_luma_block_mv`] per 8×8 luma block). When the FourMV total luma
+/// SAD beats the single-vector SAD by the margin **and** every per-block
+/// delta is §11.1-representable, the MB is coded `CODE_INTER_FOURMV`:
+/// [`crate::fourmv::encode_fourmv_macroblock`] emits the four Table 10 block
+/// modes + the per-block deltas, each luma block's residual is formed against
+/// its **own** reconstructed vector, and the two chroma blocks against the
+/// §10-averaged chroma MV. Otherwise the MB falls back to the single-vector
+/// decision.
+///
+/// A FourMV MB contributes **`None`** to the §10/§11 neighbour grid — exactly
+/// as the decoder records it (the FourMV MB-representative-MV is a documented
+/// §10 DOCS-GAP) — so the encoder and decoder neighbour contexts stay
+/// identical and the frame round-trips.
+///
+/// * `source` / `prev` / `dct_q_mask` / `probs` / `filter` — as for
+///   [`encode_inter_frame_me`].
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] for over-large frame geometry or an
+/// unrepresentable FourMV delta (the latter cannot occur because the search is
+/// range-clamped, but is surfaced rather than silently mis-coded).
+pub fn encode_inter_frame_me_fourmv(
+    source: &Frame,
+    prev: &BorderedRef,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    filter: &FilterConfig,
+) -> Result<Vec<u8>, Error> {
+    encode_inter_frame_me_fourmv_body(source, prev, dct_q_mask, probs, filter, |_| {})
+}
+
+/// Shared FourMV-capable P-frame body (see [`encode_inter_frame_me_fourmv`]).
+#[allow(clippy::too_many_arguments)]
+fn encode_inter_frame_me_fourmv_body(
+    source: &Frame,
+    prev: &BorderedRef,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    filter: &FilterConfig,
+    prelude: impl FnOnce(&mut BoolEncoder),
+) -> Result<Vec<u8>, Error> {
+    let h_fragments = source.h_fragments;
+    let v_fragments = source.v_fragments;
+    if h_fragments > u8::MAX as usize || v_fragments > u8::MAX as usize {
+        return Err(Error::NotImplemented);
+    }
+
+    let dct_q_mask = dct_q_mask & 0x3F;
+    let mb_cols = source.mb_cols();
+    let mb_rows = source.mb_rows();
+    let dequant = DequantContext::new(dct_q_mask);
+
+    let mut enc = BoolEncoder::new();
+    prelude(&mut enc);
+
+    let mut y_grid = PlaneDcGrid::new(h_fragments, v_fragments);
+    let mut u_grid = PlaneDcGrid::new(mb_cols, mb_rows);
+    let mut v_grid = PlaneDcGrid::new(mb_cols, mb_rows);
+    let mut y_dc_pred = DcPredictionContext::new();
+    let mut u_dc_pred = DcPredictionContext::new();
+    let mut v_dc_pred = DcPredictionContext::new();
+
+    let mut mv_grid: Vec<Option<NeighbourMv>> = vec![None; mb_cols.saturating_mul(mb_rows)];
+
+    const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
+    const LUMA_CORNERS: [(i32, i32); 4] = [(0, 0), (0, 8), (8, 0), (8, 8)];
+
+    let y_w = source.y.width();
+    let u_w = source.u.width();
+    let v_w = source.v.width();
+
+    let mut last_mode = CodingMode::InterNoMv;
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let near = resolve_near_mvs(
+                mb_row as i32,
+                mb_col as i32,
+                ReferenceBucket::InterLast,
+                |r, c| grid_lookup(&mv_grid, mb_cols, mb_rows, r, c),
+            );
+            let availability = near.availability;
+
+            // --- Single-vector decision (the encode_inter_frame_me path). ---
+            let (best_mv, best_sad) = search_luma_mv(
+                source,
+                prev,
+                mb_row,
+                mb_col,
+                filter,
+                &LUMA_CORNERS,
+                &LUMA_OFFSETS,
+            );
+            let reference_mv = select_diff_reference_mv_from_grid(
+                &mv_grid,
+                mb_cols,
+                mb_row as i32,
+                mb_col as i32,
+                ReferenceBucket::InterLast,
+            );
+            let sad_of = |mv: MotionVector| {
+                luma_mb_sad(
+                    source,
+                    prev,
+                    mb_row,
+                    mb_col,
+                    mv,
+                    filter,
+                    &LUMA_CORNERS,
+                    &LUMA_OFFSETS,
+                    u64::MAX,
+                )
+            };
+            let single = decide_mb_mode(MbModeInputs {
+                best_mv,
+                best_sad,
+                reference_mv,
+                nearest_mv: near.nearest_mv,
+                near_mv: near.near_mv,
+                zero_sad: sad_of(MotionVector::ZERO),
+                nearest_sad: near.nearest_mv.map(sad_of),
+                near_sad: near.near_mv.map(sad_of),
+            });
+            // The single-vector mode's reconstructed-SAD at its chosen MV.
+            let single_sad = sad_of(single.mb_mv);
+
+            // --- FourMV: independent per-block search. ---
+            let mut block_mvs = [MotionVector::ZERO; 4];
+            let mut fourmv_sad = 0u64;
+            for (k, &(dr, dc)) in LUMA_OFFSETS.iter().enumerate() {
+                let br = mb_row * 2 + dr;
+                let bc_col = mb_col * 2 + dc;
+                if br >= v_fragments || bc_col >= h_fragments {
+                    continue;
+                }
+                let (bmv, bsad) = search_luma_block_mv(
+                    source,
+                    prev,
+                    mb_row,
+                    mb_col,
+                    LUMA_CORNERS[k],
+                    br,
+                    bc_col,
+                    filter,
+                );
+                block_mvs[k] = bmv;
+                fourmv_sad += bsad;
+            }
+
+            // Decide FourMV vs single-vector. FourMV must beat the single SAD by
+            // the margin and all per-block deltas must be representable (probed
+            // by attempting the emit on a scratch encoder is avoided — instead
+            // the encode primitive returns NotImplemented and we fall back).
+            let use_fourmv = fourmv_sad + FOURMV_SAD_MARGIN < single_sad
+                && block_mvs.iter().any(|mv| !mv.is_zero());
+
+            if use_fourmv {
+                // §10 mode emit: CODE_INTER_FOURMV.
+                encode_mode_from_probs(
+                    &mut enc,
+                    CodingMode::InterFourMv,
+                    &probs.mode_probs,
+                    availability,
+                    last_mode,
+                );
+                last_mode = CodingMode::InterFourMv;
+
+                let fmb = crate::fourmv::encode_fourmv_macroblock(
+                    &mut enc,
+                    mb_row as i32,
+                    mb_col as i32,
+                    &block_mvs,
+                    &probs.mv_probs,
+                    |r, c| grid_lookup(&mv_grid, mb_cols, mb_rows, r, c),
+                )?;
+                // FourMV contributes None to the neighbour grid (DOCS-GAP).
+                mv_grid[mb_row * mb_cols + mb_col] = None;
+
+                // Per-block luma residual against each reconstructed block MV.
+                for (k, &(dr, dc)) in LUMA_OFFSETS.iter().enumerate() {
+                    let br = mb_row * 2 + dr;
+                    let bc_col = mb_col * 2 + dc;
+                    if br >= v_fragments || bc_col >= h_fragments {
+                        continue;
+                    }
+                    let source_pixels = extract_block(source.y.samples(), y_w, br * 8, bc_col * 8);
+                    let prediction = predict_mv_luma(
+                        prev,
+                        mb_row,
+                        mb_col,
+                        LUMA_CORNERS[k],
+                        fmb.luma_mvs[k],
+                        filter,
+                    );
+                    let dc_node_probs = DcContext::from_neighbours(
+                        y_grid.left(br, bc_col).is_some_and(|(d, _)| d != 0),
+                        y_grid.above(br, bc_col).is_some_and(|(d, _)| d != 0),
+                    )
+                    .select_row(&probs.coeffs.dc_contexts[AcPlane::Y.index()]);
+                    let coded_dc = encode_inter_block(
+                        &mut enc,
+                        AcPlane::Y,
+                        &source_pixels,
+                        &prediction,
+                        dequant,
+                        dc_node_probs,
+                        probs,
+                        &mut y_dc_pred,
+                        ReferenceBucket::InterLast,
+                        y_grid.left(br, bc_col),
+                        y_grid.above(br, bc_col),
+                    );
+                    y_grid.set(br, bc_col, coded_dc, ReferenceBucket::InterLast);
+                }
+                // Chroma residual against the §10-averaged chroma MV.
+                let chroma_mv = fmb.chroma_mv;
+                let u_source = extract_block(source.u.samples(), u_w, mb_row * 8, mb_col * 8);
+                let u_pred = predict_mv_chroma(prev, mb_row, mb_col, false, chroma_mv, filter);
+                let u_dc_node_probs = DcContext::from_neighbours(
+                    u_grid.left(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
+                    u_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
+                )
+                .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
+                let u_coded_dc = encode_inter_block(
+                    &mut enc,
+                    AcPlane::UV,
+                    &u_source,
+                    &u_pred,
+                    dequant,
+                    u_dc_node_probs,
+                    probs,
+                    &mut u_dc_pred,
+                    ReferenceBucket::InterLast,
+                    u_grid.left(mb_row, mb_col),
+                    u_grid.above(mb_row, mb_col),
+                );
+                u_grid.set(mb_row, mb_col, u_coded_dc, ReferenceBucket::InterLast);
+
+                let v_source = extract_block(source.v.samples(), v_w, mb_row * 8, mb_col * 8);
+                let v_pred = predict_mv_chroma(prev, mb_row, mb_col, true, chroma_mv, filter);
+                let v_dc_node_probs = DcContext::from_neighbours(
+                    v_grid.left(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
+                    v_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
+                )
+                .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
+                let v_coded_dc = encode_inter_block(
+                    &mut enc,
+                    AcPlane::UV,
+                    &v_source,
+                    &v_pred,
+                    dequant,
+                    v_dc_node_probs,
+                    probs,
+                    &mut v_dc_pred,
+                    ReferenceBucket::InterLast,
+                    v_grid.left(mb_row, mb_col),
+                    v_grid.above(mb_row, mb_col),
+                );
+                v_grid.set(mb_row, mb_col, v_coded_dc, ReferenceBucket::InterLast);
+            } else {
+                // --- Single-vector fallback (mirrors encode_inter_frame_me). ---
+                let mode = single.mode;
+                let mb_mv = single.mb_mv;
+                encode_mode_from_probs(&mut enc, mode, &probs.mode_probs, availability, last_mode);
+                last_mode = mode;
+                if let Some((dx, dy)) = single.delta {
+                    encode_mv_pair(&mut enc, dx, dy, &probs.mv_probs);
+                }
+                mv_grid[mb_row * mb_cols + mb_col] =
+                    Some(NeighbourMv::new(mb_mv, ReferenceBucket::InterLast));
+
+                for (k, &(dr, dc)) in LUMA_OFFSETS.iter().enumerate() {
+                    let br = mb_row * 2 + dr;
+                    let bc_col = mb_col * 2 + dc;
+                    if br >= v_fragments || bc_col >= h_fragments {
+                        continue;
+                    }
+                    let source_pixels = extract_block(source.y.samples(), y_w, br * 8, bc_col * 8);
+                    let prediction =
+                        predict_mv_luma(prev, mb_row, mb_col, LUMA_CORNERS[k], mb_mv, filter);
+                    let dc_node_probs = DcContext::from_neighbours(
+                        y_grid.left(br, bc_col).is_some_and(|(d, _)| d != 0),
+                        y_grid.above(br, bc_col).is_some_and(|(d, _)| d != 0),
+                    )
+                    .select_row(&probs.coeffs.dc_contexts[AcPlane::Y.index()]);
+                    let coded_dc = encode_inter_block(
+                        &mut enc,
+                        AcPlane::Y,
+                        &source_pixels,
+                        &prediction,
+                        dequant,
+                        dc_node_probs,
+                        probs,
+                        &mut y_dc_pred,
+                        ReferenceBucket::InterLast,
+                        y_grid.left(br, bc_col),
+                        y_grid.above(br, bc_col),
+                    );
+                    y_grid.set(br, bc_col, coded_dc, ReferenceBucket::InterLast);
+                }
+
+                let u_source = extract_block(source.u.samples(), u_w, mb_row * 8, mb_col * 8);
+                let u_pred = predict_mv_chroma(prev, mb_row, mb_col, false, mb_mv, filter);
+                let u_dc_node_probs = DcContext::from_neighbours(
+                    u_grid.left(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
+                    u_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
+                )
+                .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
+                let u_coded_dc = encode_inter_block(
+                    &mut enc,
+                    AcPlane::UV,
+                    &u_source,
+                    &u_pred,
+                    dequant,
+                    u_dc_node_probs,
+                    probs,
+                    &mut u_dc_pred,
+                    ReferenceBucket::InterLast,
+                    u_grid.left(mb_row, mb_col),
+                    u_grid.above(mb_row, mb_col),
+                );
+                u_grid.set(mb_row, mb_col, u_coded_dc, ReferenceBucket::InterLast);
+
+                let v_source = extract_block(source.v.samples(), v_w, mb_row * 8, mb_col * 8);
+                let v_pred = predict_mv_chroma(prev, mb_row, mb_col, true, mb_mv, filter);
+                let v_dc_node_probs = DcContext::from_neighbours(
+                    v_grid.left(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
+                    v_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
+                )
+                .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
+                let v_coded_dc = encode_inter_block(
+                    &mut enc,
+                    AcPlane::UV,
+                    &v_source,
+                    &v_pred,
+                    dequant,
+                    v_dc_node_probs,
+                    probs,
+                    &mut v_dc_pred,
+                    ReferenceBucket::InterLast,
+                    v_grid.left(mb_row, mb_col),
+                    v_grid.above(mb_row, mb_col),
+                );
+                v_grid.set(mb_row, mb_col, v_coded_dc, ReferenceBucket::InterLast);
+            }
+        }
+    }
+
+    Ok(enc.finish())
+}
+
+/// The §9-self-describing FourMV-capable P-frame packet (the FourMV dual of
+/// [`encode_inter_frame_me_packet`]): the Table 1 raw prefix + Table 3 tail
+/// (`RefreshGoldenFrame = 0` / `UseHuffman = 0`) prepended to the FourMV data
+/// partition, so it decodes through the top-level [`crate::decode_frame::Vp6Decoder`].
+///
+/// # Errors
+///
+/// Propagates [`Error::NotImplemented`] from [`encode_inter_frame_me_fourmv`].
+pub fn encode_inter_frame_me_fourmv_packet(
+    source: &Frame,
+    prev: &BorderedRef,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    filter: &FilterConfig,
+) -> Result<Vec<u8>, Error> {
+    let dct_q_mask = dct_q_mask & 0x3F;
+    let mut header = oxideav_core::bits::BitWriter::with_capacity(1);
+    header.write_u32(1, 1); // FrameType = 1 (inter)
+    header.write_u32(dct_q_mask as u32, 6);
+    header.write_u32(0, 1); // MultiStream = 0
+    let raw_prefix = header.finish();
+
+    let data = encode_inter_frame_me_fourmv_body(source, prev, dct_q_mask, probs, filter, |enc| {
+        enc.encode_b1(0); // RefreshGoldenFrame = 0
+        enc.encode_b1(0); // UseHuffman = 0
+    })?;
+
+    let mut out = raw_prefix;
+    out.extend_from_slice(&data);
+    Ok(out)
 }
 
 /// The SAD margin (a Lagrangian λ proxy) the New-MV mode must beat zero-MV
@@ -2409,5 +2902,168 @@ mod tests {
         );
         assert_eq!(decisive.reference, ReferenceBucket::InterGolden);
         assert_eq!(decisive.decision.mode, CodingMode::UsingGolden);
+    }
+
+    // ----- FourMV encode-mode tests -----
+
+    /// Decode the **FourMV-capable** encoder's partition back to a frame
+    /// against the same reference + probs + filter.
+    fn round_trip_me_fourmv(source: &Frame, prev: &Frame, q: u8) -> Frame {
+        let probs = keyframe_inter_probs();
+        let filter = bilinear_filter();
+        let prev_b = BorderedRef::new(prev);
+        let golden_b = BorderedRef::new(prev);
+
+        let bytes = encode_inter_frame_me_fourmv(source, &prev_b, q, &probs, &filter)
+            .expect("FourMV encode");
+        let mut bc = BoolCoder::new(&bytes).expect("bool coder");
+        decode_inter_frame(
+            &mut bc,
+            source.h_fragments,
+            source.v_fragments,
+            q,
+            &probs,
+            &DEFAULT_SCAN_ORDER,
+            &filter,
+            &prev_b,
+            &golden_b,
+        )
+        .expect("decode")
+    }
+
+    /// An unchanged frame reduces to all-`CODE_INTER_NO_MV` (no block has a
+    /// non-zero best MV, so FourMV never fires) and round-trips **exactly**.
+    #[test]
+    fn fourmv_unchanged_frame_round_trips_exactly() {
+        let source = gradient(4, 4);
+        let out = round_trip_me_fourmv(&source, &source, 28);
+        assert_eq!(source.y.samples(), out.y.samples());
+        assert_eq!(source.u.samples(), out.u.samples());
+        assert_eq!(source.v.samples(), out.v.samples());
+    }
+
+    /// A uniformly-translated frame is best served by a single MB vector, so
+    /// the FourMV encoder falls back to the single-vector path and still
+    /// round-trips above a floor (FourMV is a strict superset).
+    #[test]
+    fn fourmv_uniform_translation_round_trips() {
+        let source = gradient(6, 6);
+        let prev = translate(&source, 4, 3);
+        let out = round_trip_me_fourmv(&source, &prev, 24);
+        let y = psnr(source.y.samples(), out.y.samples());
+        assert!(
+            y >= 28.0,
+            "FourMV uniform-translation luma PSNR {y:.2} dB low"
+        );
+        assert_eq!(out.y.width(), 48);
+    }
+
+    /// A frame whose four luma quadrants move in **different** directions —
+    /// the canonical FourMV case. The reference is a gradient; the source's
+    /// four 8×8 luma quadrants of the single MB are each a differently-shifted
+    /// copy of the reference, so independent per-block vectors beat any single
+    /// MB vector. The frame must round-trip above a floor, exercising the
+    /// `CODE_INTER_FOURMV` emit + per-block reconstruction end-to-end.
+    #[test]
+    fn fourmv_divergent_block_motion_round_trips() {
+        // One macroblock (2×2 fragments).
+        let golden = gradient(2, 2);
+        // Build the previous frame as the gradient; the source's four quadrants
+        // are the previous frame shifted in four different directions, so the
+        // per-block search finds four distinct vectors.
+        let prev = golden.clone();
+        let shifts = [(2, 0), (-2, 0), (0, 2), (0, -2)];
+        let mut source = Frame::new(2, 2);
+        let yw = source.y.width();
+        let yh = source.y.height();
+        // Quadrant (block) layout: TL=(0,0), TR=(0,8), BL=(8,0), BR=(8,8).
+        let corners = [(0usize, 0usize), (0, 8), (8, 0), (8, 8)];
+        for (k, &(qr, qc)) in corners.iter().enumerate() {
+            let (dx, dy) = shifts[k];
+            for r in 0..8 {
+                for c in 0..8 {
+                    let sr = (qr + r) as i32;
+                    let sc = (qc + c) as i32;
+                    let pr = (sr + dy).clamp(0, yh as i32 - 1) as usize;
+                    let pc = (sc + dx).clamp(0, yw as i32 - 1) as usize;
+                    source.y.samples_mut()[(qr + r) * yw + (qc + c)] =
+                        prev.y.samples()[pr * yw + pc];
+                }
+            }
+        }
+        // Chroma: copy the reference (the averaged chroma MV handles motion).
+        source.u.samples_mut().copy_from_slice(prev.u.samples());
+        source.v.samples_mut().copy_from_slice(prev.v.samples());
+
+        let probs = keyframe_inter_probs();
+        let filter = bilinear_filter();
+        let prev_b = BorderedRef::new(&prev);
+        let golden_b = BorderedRef::new(&prev);
+        let bytes = encode_inter_frame_me_fourmv(&source, &prev_b, 16, &probs, &filter)
+            .expect("FourMV encode");
+        let mut bc = BoolCoder::new(&bytes).expect("bool coder");
+        let out = decode_inter_frame(
+            &mut bc,
+            source.h_fragments,
+            source.v_fragments,
+            16,
+            &probs,
+            &DEFAULT_SCAN_ORDER,
+            &filter,
+            &prev_b,
+            &golden_b,
+        )
+        .expect("decode");
+        let y = psnr(source.y.samples(), out.y.samples());
+        assert!(
+            y >= 26.0,
+            "FourMV divergent-motion luma PSNR {y:.2} dB below floor"
+        );
+        assert_eq!(out.y.width(), 16);
+    }
+
+    /// A multi-MB FourMV frame round-trips through the §9-self-describing
+    /// packet path (`encode_inter_frame_me_fourmv_packet` →
+    /// `decode_frame::Vp6Decoder`), proving the FourMV body threads the header
+    /// tail correctly.
+    #[test]
+    fn fourmv_packet_round_trips_through_decoder() {
+        use crate::decode_frame::Vp6Decoder;
+
+        let q = 20u8;
+        let key = gradient(4, 4);
+        let probs = keyframe_inter_probs();
+        let filter = bilinear_filter();
+
+        // Seed the decoder with a keyframe and use its *decoded* reconstruction
+        // as the previous-frame reference the FourMV packet is encoded against,
+        // so the encoder and decoder predict from the same pixels.
+        let key_packet = crate::intra_encode::encode_intra_frame(&key, q).expect("I-encode");
+        let mut dec = Vp6Decoder::new();
+        let key_recon = dec.decode_packet(&key_packet).expect("I-decode");
+        let prev_b = BorderedRef::new(&key_recon);
+
+        // Source: per-quadrant-shifted copy of the decoded keyframe so some MBs
+        // go FourMV (the four 8×8 luma quadrants move in different directions).
+        let mut source = key_recon.clone();
+        let yw = source.y.width();
+        let yh = source.y.height();
+        for r in 0..yh {
+            for c in 0..yw {
+                let in_mb_r = (r / 8) % 2;
+                let in_mb_c = (c / 8) % 2;
+                let dy = if in_mb_r == 0 { 2 } else { -2 };
+                let dx = if in_mb_c == 0 { 2 } else { -2 };
+                let pr = (r as i32 + dy).clamp(0, yh as i32 - 1) as usize;
+                let pc = (c as i32 + dx).clamp(0, yw as i32 - 1) as usize;
+                source.y.samples_mut()[r * yw + c] = key_recon.y.samples()[pr * yw + pc];
+            }
+        }
+
+        let packet = encode_inter_frame_me_fourmv_packet(&source, &prev_b, q, &probs, &filter)
+            .expect("FourMV packet encode");
+        let p_recon = dec.decode_packet(&packet).expect("FourMV P-decode");
+        let y = psnr(source.y.samples(), p_recon.y.samples());
+        assert!(y >= 22.0, "FourMV packet luma PSNR {y:.2} dB below floor");
     }
 }

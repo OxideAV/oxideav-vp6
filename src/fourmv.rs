@@ -353,6 +353,117 @@ where
     })
 }
 
+/// Emit one Table 10 two-bit per-block coding-mode codeword — the exact
+/// inverse of [`decode_fourmv_block_mode`]. `mode` must be one of the four
+/// reduced-set modes; the codeword is its index in [`FOURMV_BLOCK_MODES`],
+/// emitted MSB-first via [`crate::bool_coder::BoolEncoder::encode_b`].
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] if `mode` is not one of the four Table 10 modes
+/// ([`CodingMode::InterNoMv`] / [`CodingMode::InterPlusMv`] /
+/// [`CodingMode::InterNearestMv`] / [`CodingMode::InterNearMv`]).
+pub fn encode_fourmv_block_mode(
+    enc: &mut crate::bool_coder::BoolEncoder,
+    mode: CodingMode,
+) -> Result<(), Error> {
+    let idx = FOURMV_BLOCK_MODES
+        .iter()
+        .position(|&m| m == mode)
+        .ok_or(Error::NotImplemented)?;
+    enc.encode_b(idx as u32, 2);
+    Ok(())
+}
+
+/// Encode a `CODE_INTER_FOURMV` macroblock's full motion state — the
+/// bit-for-bit inverse of [`reconstruct_fourmv_macroblock`].
+///
+/// Given the four **target** per-block luma motion vectors (raster TL, TR,
+/// BL, BR), the encoder chooses each block's Table 10 mode by matching the
+/// target against the reconstructable candidates the decoder would produce —
+/// the same MB-level §10 Nearest/Near neighbour MVs and the §11 differential
+/// reference the decoder resolves — and emits:
+///
+/// * `CODE_INTER_NO_MV` (`00`) when the target is `(0, 0)`;
+/// * `CODE_INTER_NEAREST_MV` (`10`) / `CODE_INTER_NEAR_MV` (`11`) when the
+///   target equals the MB-level Nearest / Near neighbour MV (no MV bits);
+/// * `CODE_INTER_PLUS_MV` (`01`) otherwise — the §11.1 delta `target −
+///   differential_reference` (via [`crate::mv_encode::encode_mv_pair`]),
+///   which the caller must guarantee representable (`|delta| ≤ 0xFF`).
+///
+/// All four Table 10 codewords are emitted first (raster order), then the
+/// `InterPlusMv` deltas in the same order — matching the decoder's read
+/// order. Returns the reconstructed [`FourMvMacroblock`] (block modes,
+/// per-block luma MVs and the §10-averaged chroma MV) so the caller forms its
+/// residual against the **exact** MVs the decoder reconstructs.
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] if an `InterPlusMv` delta is out of the §11.1
+/// representable range.
+pub fn encode_fourmv_macroblock<F>(
+    enc: &mut crate::bool_coder::BoolEncoder,
+    row: i32,
+    col: i32,
+    target_luma_mvs: &[MotionVector; NUM_LUMA_BLOCKS_PER_MB],
+    mv_probs: &[MvProbs; 2],
+    mut neighbour_at: F,
+) -> Result<FourMvMacroblock, Error>
+where
+    F: FnMut(i32, i32) -> Option<NeighbourMv>,
+{
+    let reference = ReferenceBucket::InterLast;
+    // The MB-level Nearest/Near walk is shared by all four blocks (the decoder
+    // re-runs the same walk per implicit block; it is deterministic given the
+    // unchanged neighbour grid, so resolving it once is equivalent).
+    let near = resolve_near_mvs(row, col, reference, &mut neighbour_at);
+    let reference_mv = select_diff_reference_mv(row, col, reference, &mut neighbour_at);
+
+    // Choose each block's Table 10 mode by matching the target MV against the
+    // candidates the decoder can reconstruct, preferring the no-MV-bits modes.
+    let mut block_modes = [CodingMode::InterNoMv; NUM_LUMA_BLOCKS_PER_MB];
+    let mut deltas: [Option<(i32, i32)>; NUM_LUMA_BLOCKS_PER_MB] = [None; NUM_LUMA_BLOCKS_PER_MB];
+    let mut recon_luma_mvs = [MotionVector::ZERO; NUM_LUMA_BLOCKS_PER_MB];
+
+    for (i, &target) in target_luma_mvs.iter().enumerate() {
+        if target.is_zero() {
+            block_modes[i] = CodingMode::InterNoMv;
+            recon_luma_mvs[i] = MotionVector::ZERO;
+        } else if near.nearest_mv == Some(target) {
+            block_modes[i] = CodingMode::InterNearestMv;
+            recon_luma_mvs[i] = target;
+        } else if near.near_mv == Some(target) {
+            block_modes[i] = CodingMode::InterNearMv;
+            recon_luma_mvs[i] = target;
+        } else {
+            let dx = target.x as i32 - reference_mv.x as i32;
+            let dy = target.y as i32 - reference_mv.y as i32;
+            if dx.unsigned_abs() > 0xFF || dy.unsigned_abs() > 0xFF {
+                return Err(Error::NotImplemented);
+            }
+            block_modes[i] = CodingMode::InterPlusMv;
+            deltas[i] = Some((dx, dy));
+            recon_luma_mvs[i] = reconstruct_diff_mv(reference_mv, target);
+        }
+    }
+
+    // Emit the four Table 10 codewords first (decoder read order), then the
+    // InterPlusMv deltas in the same raster order.
+    for &mode in &block_modes {
+        encode_fourmv_block_mode(enc, mode)?;
+    }
+    for delta in deltas.iter().flatten() {
+        crate::mv_encode::encode_mv_pair(enc, delta.0, delta.1, mv_probs);
+    }
+
+    let chroma_mv = derive_fourmv_chroma_mv(&recon_luma_mvs);
+    Ok(FourMvMacroblock {
+        block_modes,
+        luma_mvs: recon_luma_mvs,
+        chroma_mv,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,5 +946,51 @@ mod tests {
             }
             assert_eq!(mb.chroma_mv, derive_fourmv_chroma_mv(&mb.luma_mvs));
         }
+    }
+
+    /// `encode_fourmv_macroblock` is the bit-for-bit inverse of
+    /// `reconstruct_fourmv_macroblock`: encoding four target per-block MVs and
+    /// decoding them back recovers the same reconstructed luma vectors, block
+    /// modes and chroma MV. No MB-level neighbour, so every non-zero target is
+    /// coded `InterPlusMv` (against the zero differential reference) and a zero
+    /// target as `InterNoMv`.
+    #[test]
+    fn encode_fourmv_macroblock_round_trips() {
+        use crate::bool_coder::BoolEncoder;
+
+        let probs = [MvProbs::defaults(0), MvProbs::defaults(1)];
+        let targets = [
+            MotionVector::new(5, -3),
+            MotionVector::new(0, 0),
+            MotionVector::new(-12, 7),
+            MotionVector::new(20, 20),
+        ];
+        let mut enc = BoolEncoder::new();
+        let encoded = encode_fourmv_macroblock(&mut enc, 4, 4, &targets, &probs, |_, _| None)
+            .expect("encode");
+        let bytes = enc.finish();
+        let mut bc = BoolCoder::new(&bytes).expect("BoolCoder init");
+        let decoded =
+            reconstruct_fourmv_macroblock(&mut bc, 4, 4, &probs, |_, _| None).expect("decode");
+
+        assert_eq!(encoded.luma_mvs, decoded.luma_mvs);
+        assert_eq!(encoded.block_modes, decoded.block_modes);
+        assert_eq!(encoded.chroma_mv, decoded.chroma_mv);
+        // With no neighbour, the reconstructed vectors equal the targets.
+        assert_eq!(decoded.luma_mvs, targets);
+        // Mode assignment: zero → NoMv, others → PlusMv.
+        assert_eq!(decoded.block_modes[1], CodingMode::InterNoMv);
+        assert_eq!(decoded.block_modes[0], CodingMode::InterPlusMv);
+    }
+
+    /// `encode_fourmv_block_mode` rejects a mode outside the Table 10 reduced
+    /// set (e.g. a Golden mode), surfacing `NotImplemented` rather than
+    /// mis-coding it.
+    #[test]
+    fn encode_fourmv_block_mode_rejects_out_of_set() {
+        use crate::bool_coder::BoolEncoder;
+        let mut enc = BoolEncoder::new();
+        let err = encode_fourmv_block_mode(&mut enc, CodingMode::UsingGolden);
+        assert!(matches!(err, Err(Error::NotImplemented)));
     }
 }

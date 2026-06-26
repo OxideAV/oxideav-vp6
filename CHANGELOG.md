@@ -8,6 +8,45 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 373, 2026-06-26)
 
+- **`inter_encode::encode_inter_frame_me_fourmv` — the FourMV P-frame
+  encoder**, landing the encoder's second named "lack" (FourMV encode modes).
+  A strict superset of `encode_inter_frame_me` that codes a macroblock
+  `CODE_INTER_FOURMV` — four independent per-Y-block motion vectors — when that
+  beats the best single-vector mode by `FOURMV_SAD_MARGIN` (`256`). Per MB:
+  - **Per-block search** (`search_luma_block_mv` / `luma_block_sad`): each 8×8
+    luma block runs its own box-then-¼-pel search; the four block SADs sum to
+    the FourMV total. The single-vector decision (`decide_mb_mode`) runs in
+    parallel, and the MB takes FourMV only when the four-vector total clears the
+    margin **and** at least one block vector is non-zero.
+  - **`fourmv::encode_fourmv_macroblock`** — the bit-for-bit inverse of
+    `reconstruct_fourmv_macroblock`: it chooses each block's Table 10 mode by
+    matching the target against the reconstructable candidates the decoder
+    produces (zero → `CODE_INTER_NO_MV`; MB-level §10 Nearest/Near match →
+    `CODE_INTER_NEAREST_MV` / `CODE_INTER_NEAR_MV`, no MV bits; else
+    `CODE_INTER_PLUS_MV` with the §11.1 delta against the §11 differential
+    reference), emits the four Table 10 two-bit codewords (raster order) then
+    the per-block deltas, and returns the reconstructed `FourMvMacroblock` so
+    the caller forms each luma block's residual against its **own**
+    reconstructed vector and the two chroma blocks against the §10-averaged
+    chroma MV. `encode_fourmv_block_mode` is the single-codeword inverse of
+    `decode_fourmv_block_mode`.
+  - A FourMV MB contributes **`None`** to the §10/§11 neighbour grid — exactly
+    as the decoder records it (the FourMV MB-representative-MV is the documented
+    §10 DOCS-GAP) — so the encoder and decoder neighbour contexts stay
+    identical; the round-trip is correct **without** resolving that gap.
+  - `encode_inter_frame_me_fourmv_packet` is the §9-self-describing dual.
+  Six tests: an unchanged-frame exact reduction; a uniform-translation
+  single-vector fallback; the canonical **divergent-block-motion** round-trip
+  (the four luma quadrants move in four directions → `CODE_INTER_FOURMV` fires
+  and reconstructs above a floor); a multi-MB FourMV packet through the
+  top-level `Vp6Decoder`; the `encode_fourmv_macroblock` ↔
+  `reconstruct_fourmv_macroblock` primitive round-trip; and the out-of-set mode
+  rejection. All memory-bounded (per-block search is `O(range² · 64)` SAD adds).
+  `encode_inter_frame_me_fourmv`, `encode_inter_frame_me_fourmv_packet` and
+  `FOURMV_SAD_MARGIN` are re-exported from the crate root. Derived solely from
+  the §10 Table 10 / §11 decode pipeline it inverts; no third-party VP6 source
+  consulted.
+
 - **`inter_encode::encode_inter_frame_me_golden` — the Golden-Frame-aware
   motion-estimated P-frame encoder**, a strict superset of
   `encode_inter_frame_me` that codes each macroblock against **either** the

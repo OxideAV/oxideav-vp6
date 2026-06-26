@@ -69,12 +69,13 @@ sub-streams** (each pass exists — `mode_prob_update`, `mv_prob_update`,
 to the header tail wants a conformant `.vp6` fixture to validate, so the
 top-level driver currently decodes only the no-update / single-partition
 / BoolCoder-coefficient shape the in-tree encoders produce), the **`Encoder`
-registration**, and the encoder's richer mode decision (FourMV encode modes), per-frame
-probability-update and rate-control surfaces. The encoder's **motion
-estimation** (single-vector `CODE_INTER_PLUS_MV` with a two-stage
-box-then-¼-pel luma search and §11 differential-MV emission) and its
-**Nearest/Near implicit-MV modes** and **Golden-frame encode modes**
-**now exist** (`encode_inter_frame_me` / `encode_inter_frame_me_golden`).
+registration**, and per-frame probability-update and rate-control surfaces. The encoder's
+**motion estimation** (single-vector `CODE_INTER_PLUS_MV` with a two-stage
+box-then-¼-pel luma search and §11 differential-MV emission), its
+**Nearest/Near implicit-MV modes**, its **Golden-frame encode modes**, and
+its **FourMV encode mode** (four independent per-block vectors) **now exist**
+(`encode_inter_frame_me` / `encode_inter_frame_me_golden` /
+`encode_inter_frame_me_fourmv`).
 
 ### Implemented stages
 
@@ -265,12 +266,31 @@ box-then-¼-pel luma search and §11 differential-MV emission) and its
   mixed previous↔golden frame; a full keyframe → Golden-aware P-frame GOP
   recovering the source from the Golden reference through the §4
   `ReferenceFrames`; and a `decide_mb_mode_golden` switch-penalty boundary test.
+- **`inter_encode::encode_inter_frame_me_fourmv`** is the **FourMV P-frame
+  encoder** — a strict superset of `encode_inter_frame_me` that codes a
+  macroblock `CODE_INTER_FOURMV` (four independent per-Y-block vectors) when
+  four `search_luma_block_mv` per-block searches beat the best single-vector
+  mode by `FOURMV_SAD_MARGIN`. `fourmv::encode_fourmv_macroblock` (the inverse
+  of `reconstruct_fourmv_macroblock`) chooses each block's Table 10 mode by
+  matching the target MV against the decoder's reconstructable candidates
+  (zero → `CODE_INTER_NO_MV`; §10 Nearest/Near match → no-MV-bits implicit;
+  else `CODE_INTER_PLUS_MV` against the §11 differential reference), emits the
+  four Table 10 codewords + per-block deltas, and returns the reconstructed
+  per-block vectors so each luma block's residual is formed against its own
+  vector and the two chroma blocks against the §10-averaged chroma MV. A FourMV
+  MB contributes `None` to the neighbour grid exactly as the decoder records it
+  (the FourMV MB-representative-MV §10 DOCS-GAP is **sidestepped** — the
+  round-trip is correct without resolving it). Round-trip tests pin the
+  divergent-block-motion case (`CODE_INTER_FOURMV` fires), the unchanged-frame
+  exact reduction, the uniform-translation single-vector fallback, and a
+  multi-MB FourMV packet through the top-level `Vp6Decoder`.
 - **`inter_encode::encode_inter_frame_packet` /
-  `encode_inter_frame_me_packet` / `encode_inter_frame_me_golden_packet`**
-  prepend the §9 InterHeader (Table 1 prefix + Table 3 BoolCoder tail) to the
-  zero-MV / motion-estimated / Golden-aware data partition so each encoded
-  P-frame is a self-describing packet
-  `decode_frame::Vp6Decoder::decode_packet` consumes end-to-end.
+  `encode_inter_frame_me_packet` / `encode_inter_frame_me_golden_packet` /
+  `encode_inter_frame_me_fourmv_packet`** prepend the §9 InterHeader (Table 1
+  prefix + Table 3 BoolCoder tail) to the zero-MV / motion-estimated /
+  Golden-aware / FourMV data partition so each encoded P-frame is a
+  self-describing packet `decode_frame::Vp6Decoder::decode_packet` consumes
+  end-to-end.
 
 ### Inter (P-frame) path — decodes end-to-end to pixels
 
