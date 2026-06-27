@@ -840,6 +840,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod block_decode;
 pub mod bool_coder;
+pub mod coeff_prob_update;
 pub mod dc_pred;
 pub mod dct_decode;
 pub mod decode_frame;
@@ -885,6 +886,10 @@ pub use block_decode::{
     dequantize_to_raster, AcProbBank, BlockCoeffs, DequantizedBlock, ZeroRunProbBank, BLOCK_SIZE,
 };
 pub use bool_coder::{BoolCoder, BoolEncoder};
+pub use coeff_prob_update::{
+    decode_coefficient_prob_updates, encode_coefficient_prob_updates,
+    encode_coefficient_prob_updates_with_scan, CoeffProbBanks,
+};
 pub use dc_pred::{
     average_both_neighbours, sign as dc_sign, DcPredictionContext, Neighbour, ReferenceBucket,
 };
