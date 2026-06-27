@@ -62,7 +62,6 @@ use crate::frame_assembly::Frame;
 use crate::frame_header::{CodingProfile, Vp3Version, Vp6FrameHeader, Vp6HeaderTail};
 use crate::inter_frame::{decode_inter_frame_with_refs, FilterConfig, InterProbs, ReferenceFrames};
 use crate::intra_frame::decode_intra_frame;
-use crate::scan::DEFAULT_SCAN_ORDER;
 use crate::Error;
 
 /// A stateful VP6 frame decoder: feed it whole compressed frames in
@@ -222,7 +221,29 @@ impl Vp6Decoder {
         let (h_fragments, v_fragments) = refs.coded_fragments();
 
         let filter = FilterConfig::from_header(&tail, header.dct_q_mask);
-        let probs = InterProbs::keyframe();
+
+        // §8 Figure 1 pre-data sub-streams, in the exact bitstream-map
+        // order: §10 Mode Probability Updates → §11.2 MV Tree → §8
+        // Figure 5 Coefficient Probability Updates → per-MB data. Each
+        // bank starts from its baseline and the (typically empty) update
+        // pass mutates it in place. (Cross-frame persistence of these
+        // banks is a follow-up; the in-tree encoder emits only no-update
+        // prefixes, for which per-frame baseline reseeding is exact.)
+        let mut mode_probs = crate::modes::VP6_BASELINE_XMITTED_PROBS;
+        let mut mv_probs = [
+            crate::mv_decode::MvProbs::defaults(crate::mv_decode::MV_AXIS_X),
+            crate::mv_decode::MvProbs::defaults(crate::mv_decode::MV_AXIS_Y),
+        ];
+        crate::mode_prob_update::update_mode_probs(&mut bc, &mut mode_probs)?;
+        crate::mv_prob_update::update_mv_probs(&mut bc, &mut mv_probs)?;
+        let mut coeff_banks = CoeffProbBanks::keyframe();
+        let scan = decode_coefficient_prob_updates(&mut bc, &mut coeff_banks)?;
+
+        let probs = InterProbs {
+            mode_probs,
+            mv_probs,
+            coeffs: coeff_banks.to_intra_probs(),
+        };
 
         let frame = decode_inter_frame_with_refs(
             &mut bc,
@@ -230,7 +251,7 @@ impl Vp6Decoder {
             v_fragments,
             header.dct_q_mask,
             &probs,
-            &DEFAULT_SCAN_ORDER,
+            &scan,
             &filter,
             refs,
         )?;

@@ -68,6 +68,32 @@ use crate::token_encode::encode_block_coefficients;
 use crate::tokens::{AcPlane, DcContext};
 use crate::Error;
 
+/// Emit the three §8 Figure 1 pre-data sub-streams a conformant inter
+/// frame carries between the §9 InterHeader tail and the per-macroblock
+/// data, all in no-update form:
+///
+/// 1. §10 Mode Probability Updates (Table 7/8) — three situations, each
+///    a cleared `SetNewBaselineProbs` + `VectorUpdatesPresentFlag`.
+/// 2. §11.2 MV Tree (Table 13/14/15) — every per-record update flag
+///    cleared.
+/// 3. §8 Figure 5 Coefficient Probability Updates — §13.2 DC / §12.2
+///    scan / §13.3.3 ZRL / §13.3 AC, every flag cleared.
+///
+/// This is exactly the order §8 Figure 1 fixes (Frame Header → Mode
+/// Probability Updates → Mv Tree → Single-Stream Macroblock Info, whose
+/// Figure 2 opens with the Figure-5 coefficient updates). The matching
+/// decoder consumes the symmetric prefix
+/// ([`crate::decode_frame::Vp6Decoder`]) before the per-MB walk, so the
+/// carried §10 / §11.2 / §13 banks survive unchanged and the bytes
+/// round-trip. An encoder that re-trains probabilities would replace these
+/// no-update emitters with the corresponding update passes; the ordering
+/// is identical either way.
+pub(crate) fn emit_inter_pre_data_substreams(enc: &mut BoolEncoder) {
+    crate::mode_prob_update::encode_no_mode_prob_updates(enc);
+    crate::mv_prob_update::encode_no_mv_prob_updates(enc);
+    crate::coeff_prob_update::encode_coefficient_prob_updates(enc);
+}
+
 /// Quantise one 8x8 raster-order residual-DCT block into scan-order
 /// quantised coefficients — identical to the intra encoder's quantiser
 /// (the §15 dequant inverse), but applied to the inter residual's
@@ -1805,6 +1831,7 @@ pub fn encode_inter_frame_me_fourmv_packet(
     let data = encode_inter_frame_me_fourmv_body(source, prev, dct_q_mask, probs, filter, |enc| {
         enc.encode_b1(0); // RefreshGoldenFrame = 0
         enc.encode_b1(0); // UseHuffman = 0
+        emit_inter_pre_data_substreams(enc);
     })?;
 
     let mut out = raw_prefix;
@@ -1899,6 +1926,7 @@ pub fn encode_inter_frame_packet(
     let data = encode_inter_frame_body(source, prev, dct_q_mask, probs, filter, |enc| {
         enc.encode_b1(0); // RefreshGoldenFrame = 0
         enc.encode_b1(0); // UseHuffman = 0
+        emit_inter_pre_data_substreams(enc);
     })?;
 
     let mut out = raw_prefix;
@@ -1943,6 +1971,7 @@ pub fn encode_inter_frame_me_packet(
     let data = encode_inter_frame_me_body(source, prev, dct_q_mask, probs, filter, |enc| {
         enc.encode_b1(0); // RefreshGoldenFrame = 0
         enc.encode_b1(0); // UseHuffman = 0
+        emit_inter_pre_data_substreams(enc);
     })?;
 
     let mut out = raw_prefix;
@@ -2025,6 +2054,7 @@ pub fn encode_inter_frame_me_golden_packet_refresh(
         |enc| {
             enc.encode_b1(u8::from(refresh_golden)); // RefreshGoldenFrame
             enc.encode_b1(0); // UseHuffman = 0
+            emit_inter_pre_data_substreams(enc);
         },
     )?;
 

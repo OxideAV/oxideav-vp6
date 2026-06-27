@@ -113,7 +113,7 @@
 
 use crate::mv_decode::{MvProbs, NUM_MV_AXES, NUM_MV_SIZE_NODES, NUM_SHORT_MV_NODES};
 use crate::prob_update::decode_new_node_prob;
-use crate::{BoolCoder, Error};
+use crate::{BoolCoder, BoolEncoder, Error};
 
 /// Default `UpdateIsMvShortProbabilities[2]` flag-probability bank
 /// from §11.2.
@@ -369,13 +369,89 @@ pub fn update_mv_probs(
     Ok(())
 }
 
+/// Emit the §11.2 *no-update* MV-probability sub-stream — the minimal
+/// Table-13 traversal an encoder that does not re-train any MV
+/// probabilities produces.
+///
+/// Every per-record `*ProbUpdateFlag` is the cleared `B(flag_prob)`
+/// zero-branch (no `b(7)` value follows), walked in the exact order
+/// [`update_mv_probs`] reads (the four top-level discriminator/sign
+/// records x then y, then the two seven-record short-tree axes, then the
+/// two eight-record long-bit axes). This is the bit-for-bit inverse of an
+/// [`update_mv_probs`] that reads a stream with no updates: every entry of
+/// the carried `[MvProbs; 2]` bank survives unchanged (§11.2 persistence).
+// Index loops keep the per-record `UPDATE_*[axis][..]` flag lookups
+// aligned with the Table 13 / 14 / 15 traversal `update_mv_probs` reads.
+#[allow(clippy::needless_range_loop)]
+pub fn encode_no_mv_prob_updates(enc: &mut BoolEncoder) {
+    // Steps 1-4: per-axis (is_short, sign) discriminator flags, x then y.
+    for axis in 0..NUM_MV_AXES {
+        enc.encode_bool(0, UPDATE_IS_MV_SHORT_PROBABILITIES[axis]);
+        enc.encode_bool(0, UPDATE_MV_SIGN_PROBABILITIES[axis]);
+    }
+
+    // Steps 5-6: ShortVec{X,Y}TreeNodeProbs — seven records per axis.
+    for axis in 0..NUM_MV_AXES {
+        for node in 0..NUM_SHORT_MV_NODES {
+            enc.encode_bool(0, UPDATE_SHORT_VECTOR_NODE_PROBABILITIES[axis][node]);
+        }
+    }
+
+    // Steps 7-8: LongVec{X,Y}BitProbs — eight records per axis.
+    for axis in 0..NUM_MV_AXES {
+        for k in 0..NUM_MV_SIZE_NODES {
+            enc.encode_bool(0, UPDATE_LONG_VECTOR_BIT_PROBABILITIES[axis][k]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv_decode::MV_AXIS_X;
+    use crate::mv_decode::{MvProbs, MV_AXIS_X, MV_AXIS_Y};
 
     fn bc_over(bytes: &[u8]) -> BoolCoder<'_> {
         BoolCoder::new(bytes).expect("at least 4 bytes")
+    }
+
+    /// The encoder's no-update §11.2 sub-stream decodes back to a no-op:
+    /// the carried `[MvProbs; 2]` bank survives `update_mv_probs`
+    /// unchanged, proving `encode_no_mv_prob_updates` emits exactly the
+    /// Table 13/14/15 flags `update_mv_probs` reads, in order.
+    #[test]
+    fn no_mv_update_round_trips_to_carried_bank() {
+        let mut enc = BoolEncoder::new();
+        encode_no_mv_prob_updates(&mut enc);
+        let bytes = enc.finish();
+
+        let baseline = [MvProbs::defaults(MV_AXIS_X), MvProbs::defaults(MV_AXIS_Y)];
+        let mut probs = baseline;
+        let mut bc = BoolCoder::new(&bytes).expect("bc");
+        update_mv_probs(&mut bc, &mut probs).expect("decode");
+        assert_eq!(
+            probs, baseline,
+            "no-update must leave the MV bank untouched"
+        );
+    }
+
+    /// A perturbed MV bank also survives a no-update pass (§11.2 inter
+    /// persistence): is_short / sign / short-tree / long-bit slots are
+    /// all preserved.
+    #[test]
+    fn no_mv_update_preserves_perturbed_bank() {
+        let mut probs = [MvProbs::defaults(MV_AXIS_X), MvProbs::defaults(MV_AXIS_Y)];
+        probs[0].is_short = 99;
+        probs[1].sign = 12;
+        probs[0].short[3] = 200;
+        probs[1].size[5] = 7;
+        let before = probs;
+
+        let mut enc = BoolEncoder::new();
+        encode_no_mv_prob_updates(&mut enc);
+        let bytes = enc.finish();
+        let mut bc = BoolCoder::new(&bytes).expect("bc");
+        update_mv_probs(&mut bc, &mut probs).expect("decode");
+        assert_eq!(probs, before);
     }
 
     // A NOTE ON BOOLCODER BEHAVIOUR AT THE §11.2 FLAG-PROBABILITY

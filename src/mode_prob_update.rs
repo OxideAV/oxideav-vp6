@@ -248,10 +248,69 @@ pub fn update_mode_probs(
     Ok(())
 }
 
+/// Emit the §10 *no-update* mode-probability sub-stream — the minimal
+/// Table 7/8 traversal an encoder that re-trains no mode probabilities
+/// produces.
+///
+/// For each of the three [`ModeAvailability`] situations (in
+/// [`ModeAvailability::ALL`] order — the same order [`update_mode_probs`]
+/// reads), this emits a cleared `SetNewBaselineProbs B(174)` followed by a
+/// cleared `VectorUpdatesPresentFlag B(254)`, with no `WhichVector` and no
+/// `ModeProbUpdateVector` body. This is the bit-for-bit inverse of an
+/// [`update_mode_probs`] that reads a stream with no updates: the carried
+/// `probXmitted[3][20]` table survives unchanged (§10 P-frame persistence).
+pub fn encode_no_mode_prob_updates(enc: &mut crate::bool_coder::BoolEncoder) {
+    for _situation in ModeAvailability::ALL {
+        // SetNewBaselineProbs = 0 (no VP6_ModeVq copy).
+        enc.encode_bool(0, SET_NEW_BASELINE_PROBS_FLAG);
+        // VectorUpdatesPresentFlag = 0 (no 20-record update body).
+        enc.encode_bool(0, VECTOR_UPDATES_PRESENT_FLAG);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bool_coder::BoolEncoder;
     use crate::modes::VP6_BASELINE_XMITTED_PROBS;
+
+    // --- no-update round trip ---------------------------------------------
+
+    /// The encoder's no-update §10 sub-stream decodes back to a no-op:
+    /// a carried `probXmitted[3][20]` table (here the baseline) survives
+    /// `update_mode_probs` unchanged, and the encoder emits exactly the
+    /// flags the decoder reads.
+    #[test]
+    fn no_mode_update_round_trips_to_carried_table() {
+        let mut enc = BoolEncoder::new();
+        encode_no_mode_prob_updates(&mut enc);
+        let bytes = enc.finish();
+
+        let mut bc = BoolCoder::new(&bytes).expect("bc");
+        let mut probs = VP6_BASELINE_XMITTED_PROBS;
+        update_mode_probs(&mut bc, &mut probs).expect("decode");
+        assert_eq!(
+            probs, VP6_BASELINE_XMITTED_PROBS,
+            "no-update must be a no-op"
+        );
+    }
+
+    /// A non-baseline carried table also survives a no-update pass (§10
+    /// P-frame persistence): every perturbed entry is preserved.
+    #[test]
+    fn no_mode_update_preserves_perturbed_table() {
+        let mut probs = VP6_BASELINE_XMITTED_PROBS;
+        probs[0][0] = 17;
+        probs[2][19] = 200;
+        let before = probs;
+
+        let mut enc = BoolEncoder::new();
+        encode_no_mode_prob_updates(&mut enc);
+        let bytes = enc.finish();
+        let mut bc = BoolCoder::new(&bytes).expect("bc");
+        update_mode_probs(&mut bc, &mut probs).expect("decode");
+        assert_eq!(probs, before);
+    }
 
     // --- static surface ----------------------------------------------------
 
