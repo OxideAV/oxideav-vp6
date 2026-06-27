@@ -33,22 +33,37 @@
 //!   ([`ReferenceFrames`]), seeded from the first keyframe and updated
 //!   after every decoded frame per the §4 / `RefreshGoldenFrame` rules.
 //!
-//! ## Probability sub-streams
+//! ## Probability sub-streams (§8 Figure 1 / Figure 5)
 //!
-//! A conformant header is followed by the §10 mode-probability,
-//! §11.2 MV-probability and §13 coefficient-probability update
-//! sub-streams *before* the per-macroblock data, all in the same
-//! BoolCoder partition (when `MultiStream == 0`). Those update passes are
-//! implemented (`mode_prob_update`, `mv_prob_update`, `prob_update`,
-//! `scan_update`) but their exact Figure-5 ordering relative to the
-//! header tail needs a conformant `.vp6` fixture to pin down (see the
-//! README "Blocked / remaining" note). This module therefore decodes
-//! frames whose header signals **no probability updates** — the shape the
-//! in-tree `intra_encode` / `inter_encode` encoders produce — by seeding
-//! the keyframe-baseline banks ([`IntraProbs::keyframe`] /
-//! [`InterProbs::keyframe`]) and dispatching directly. When the fixture
-//! lands, the update passes slot in between the tail parse and the
-//! dispatch with no change to this module's public surface.
+//! The §8 *Bitstream Map* fixes the order of the pre-data sub-streams that
+//! sit between the §9 header and the per-macroblock data (all in the same
+//! BoolCoder partition when `MultiStream == 0`):
+//!
+//! * **Keyframe** (Figure 1 → Figure 2): the per-MB info opens directly
+//!   with the §8 Figure 5 *Coefficient Probability Updates* pass. There is
+//!   no §10 mode or §11.2 MV tree on an I-frame (§10: I-frame MBs are
+//!   implicitly intra, so no mode signaling).
+//! * **Inter frame** (Figure 1): §10 *Mode Probability Updates* → §11.2
+//!   *Mv Tree* → §8 Figure 5 *Coefficient Probability Updates* → per-MB
+//!   data.
+//!
+//! This module sequences exactly that order. [`decode_keyframe`] consumes
+//! the Figure-5 pass ([`decode_coefficient_prob_updates`]) and
+//! [`decode_interframe`] consumes all three passes
+//! ([`crate::mode_prob_update::update_mode_probs`] →
+//! [`crate::mv_prob_update::update_mv_probs`] →
+//! [`decode_coefficient_prob_updates`]) before dispatching. Each bank
+//! starts from its baseline and the (typically empty) update pass mutates
+//! it in place; the resulting banks + active §12.2 scan order thread into
+//! the per-MB decode. The in-tree encoders emit the matching prefix, so a
+//! keyframe carrying real §13 node-probability updates round-trips
+//! end-to-end (see `keyframe_with_coeff_prob_updates_round_trips`).
+//!
+//! Cross-frame **persistence** of the §10 / §11.2 / §13 banks (carrying a
+//! P-frame's mutated banks into the next frame instead of reseeding the
+//! baseline) is a follow-up; the in-tree encoder emits only no-update
+//! prefixes on inter frames, for which per-frame baseline reseeding is
+//! bit-exact.
 //!
 //! ## Provenance
 //!
@@ -99,10 +114,15 @@ impl Vp6Decoder {
     /// * [`Error::NotImplemented`] if:
     ///   * the first frame is not a keyframe (no reference / profile to
     ///     inherit);
-    ///   * a frame signals `MultiStream == 1`, `UseHuffman == 1`, or a
-    ///     non-default scan / probability update — paths whose exact
-    ///     bitstream sequencing awaits a conformant fixture;
+    ///   * a frame signals `MultiStream == 1` (the two-partition split,
+    ///     §6) or `UseHuffman == 1` (the Huffman second-partition coder,
+    ///     §7) — paths not yet wired through this single-partition driver;
     ///   * a keyframe carries an unsupported profile/version combination.
+    ///
+    /// The §8 Figure 1 / Figure 5 probability-update sub-streams **are**
+    /// consumed in spec order (keyframe: Figure 5; inter: §10 → §11.2 →
+    /// Figure 5), so a frame carrying real coefficient / mode / MV
+    /// probability updates decodes correctly.
     pub fn decode_packet(&mut self, bytes: &[u8]) -> Result<Frame, Error> {
         let header = Vp6FrameHeader::parse(bytes)?;
 
@@ -158,10 +178,9 @@ impl Vp6Decoder {
         let mut bc = BoolCoder::new(tail_bytes)?;
         let tail = Vp6HeaderTail::parse_with(&mut bc, true, profile, version)?;
 
-        // No §13 probability-update sub-stream is consumed (see module
-        // docs): the keyframe banks are the §13 baselines. A conformant
-        // header that signalled UseHuffman uses a different coefficient
-        // coder than this BoolCoder dispatch.
+        // A header signalling UseHuffman uses the §7 Huffman coder for the
+        // second partition rather than this single-partition BoolCoder
+        // coefficient dispatch.
         if tail.use_huffman {
             return Err(Error::NotImplemented);
         }
@@ -352,6 +371,62 @@ mod tests {
         assert!(dec.has_reference(), "keyframe must seed §4 refs");
         let y = psnr(src.y.samples(), out.y.samples());
         assert!(y >= 28.0, "luma PSNR {y:.2} dB below floor");
+    }
+
+    /// A keyframe whose §8 Figure 5 sub-stream carries **real** §13
+    /// coefficient-probability updates round-trips through `decode_packet`:
+    /// the encoder codes its tokens against the updated banks and emits the
+    /// matching Figure-5 updates, the decoder seeds the keyframe baselines
+    /// and applies the decoded updates to recover the identical banks, and
+    /// the pixels reconstruct to the same floor as the no-update keyframe.
+    /// This exercises the Figure-5 *content* path (set NewNodeProbValue
+    /// records), not just the all-cleared no-update prefix.
+    #[test]
+    fn keyframe_with_coeff_prob_updates_round_trips() {
+        use crate::coeff_prob_update::CoeffProbBanks;
+        use crate::intra_encode::encode_intra_frame_with_banks;
+
+        let src = pattern_frame(4, 4);
+
+        // A non-baseline (but representable: even / 1) target bank across
+        // all three §13 node-prob families.
+        let mut banks = CoeffProbBanks::keyframe();
+        banks.dc_probs[0][0] = 200;
+        banks.dc_probs[1][4] = 64;
+        banks.ac_probs[0][0][0][0] = 100;
+        banks.ac_probs[1][2][3][5] = 220;
+        banks.zrl_probs[0][2] = 80;
+        banks.zrl_probs[1][9] = 2;
+
+        let bytes = encode_intra_frame_with_banks(&src, 48, &banks).expect("encode");
+
+        let mut dec = Vp6Decoder::new();
+        let out = dec.decode_packet(&bytes).expect("decode");
+
+        assert_eq!(out.y.width(), 32);
+        assert!(dec.has_reference(), "keyframe must seed §4 refs");
+        let y = psnr(src.y.samples(), out.y.samples());
+        assert!(
+            y >= 28.0,
+            "luma PSNR {y:.2} dB below floor — Figure-5 content path regression"
+        );
+
+        // The updated-bank keyframe must reconstruct *identically* to the
+        // baseline-bank keyframe at the same q: the §13 node probabilities
+        // change only the entropy coding, never the decoded coefficients,
+        // so the pixels are bit-for-bit the same.
+        let baseline_bytes = encode_intra_frame(&src, 48).expect("encode baseline");
+        let mut dec2 = Vp6Decoder::new();
+        let baseline_out = dec2
+            .decode_packet(&baseline_bytes)
+            .expect("decode baseline");
+        assert_eq!(
+            out.y.samples(),
+            baseline_out.y.samples(),
+            "node-prob updates must not change decoded pixels"
+        );
+        assert_eq!(out.u.samples(), baseline_out.u.samples());
+        assert_eq!(out.v.samples(), baseline_out.v.samples());
     }
 
     /// A flat keyframe round-trips exactly through the top-level driver.

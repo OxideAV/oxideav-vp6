@@ -939,7 +939,7 @@ pub use interp::{
     bicubic_block, bicubic_point, bilinear_block, bilinear_point, var_16_point, BICUBIC_FILTER_SET,
     BICUBIC_VP61_INDEX, BILINEAR_CHROMA_FILTERS, BILINEAR_LUMA_FILTERS,
 };
-pub use intra_encode::encode_intra_frame;
+pub use intra_encode::{encode_intra_frame, encode_intra_frame_with_banks};
 pub use intra_frame::{decode_intra_frame, IntraProbs};
 pub use loopfilter::{
     bound, boundary_whole_pixel, boundary_x, boundary_y, filter_horizontal_boundary,

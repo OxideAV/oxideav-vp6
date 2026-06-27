@@ -42,6 +42,7 @@
 //! in-tree errata. No external library code was consulted.
 
 use crate::bool_coder::BoolEncoder;
+use crate::coeff_prob_update::CoeffProbBanks;
 use crate::dc_pred::{DcPredictionContext, Neighbour, ReferenceBucket};
 use crate::dequant::DequantContext;
 use crate::forward_dct::fdct_block;
@@ -49,7 +50,7 @@ use crate::frame_assembly::{Frame, BLOCK_DIM};
 use crate::reconstruct::INTRA_DC_LEVEL_SHIFT;
 use crate::scan::DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG;
 use crate::token_encode::encode_block_coefficients;
-use crate::tokens::{baseline_ac_probs, baseline_dc_probs, dc_probs_to_node_contexts, AcPlane};
+use crate::tokens::AcPlane;
 use crate::Error;
 
 /// Quantise one 8x8 raster-order DCT-coefficient block into scan-order
@@ -226,6 +227,39 @@ fn encode_intra_block(
 /// the 8-bit `HFragments`/`VFragments` header fields (the §9 geometry is
 /// an `b(8)` per axis, so each is capped at 255).
 pub fn encode_intra_frame(frame: &Frame, dct_q_mask: u8) -> Result<Vec<u8>, Error> {
+    encode_intra_frame_with_banks(frame, dct_q_mask, &CoeffProbBanks::keyframe())
+}
+
+/// Encode a keyframe whose §8 Figure 5 sub-stream carries the §13
+/// coefficient-probability updates needed to reach `banks` from the
+/// keyframe baseline, and whose coefficient tokens are then BoolCoder-coded
+/// against those same updated `banks`.
+///
+/// This is the general form of [`encode_intra_frame`] (which passes
+/// [`CoeffProbBanks::keyframe`], i.e. no updates). It proves the Figure-5
+/// **content** path end-to-end: a downstream decoder seeds the keyframe
+/// baselines, applies the decoded updates to recover `banks`, and decodes
+/// the coefficient stream against the identical probabilities the encoder
+/// used — so the pixels round-trip exactly through
+/// [`crate::decode_frame::Vp6Decoder::decode_packet`].
+///
+/// The custom-scan half of `banks` (`band_assignment`) is **not** applied
+/// to the coefficient ordering here: node-probability updates change only
+/// the BoolCoder probabilities, not which coefficients are coded, so the
+/// default zig-zag scan is retained and only representable
+/// ([`crate::coeff_prob_update::node_prob_update_representable`]) node
+/// probabilities may differ from baseline. Pass a `banks` with the default
+/// `band_assignment`.
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] for an over-large frame geometry (the §9
+/// `b(8)` per-axis fragment cap).
+pub fn encode_intra_frame_with_banks(
+    frame: &Frame,
+    dct_q_mask: u8,
+    banks: &CoeffProbBanks,
+) -> Result<Vec<u8>, Error> {
     let h_fragments = frame.h_fragments;
     let v_fragments = frame.v_fragments;
     if h_fragments > u8::MAX as usize || v_fragments > u8::MAX as usize {
@@ -237,12 +271,13 @@ pub fn encode_intra_frame(frame: &Frame, dct_q_mask: u8) -> Result<Vec<u8>, Erro
     let mb_rows = frame.mb_rows();
     let dequant = DequantContext::new(dct_q_mask);
 
-    // Keyframe-baseline probability banks (every value 128). No §13
-    // per-frame updates are emitted, so the decoder must seed the same
-    // baselines via `IntraProbs::keyframe`.
-    let dc_contexts = dc_probs_to_node_contexts(&baseline_dc_probs());
-    let ac_probs = baseline_ac_probs();
-    let zrl_probs = crate::zrl::ZERO_RUN_PROB_DEFAULTS;
+    // The §13 banks the coefficient tokens are coded against. These match
+    // exactly what the decoder reconstructs by applying the Figure-5
+    // updates emitted below to its keyframe baselines.
+    let intra_probs = banks.to_intra_probs();
+    let dc_contexts = intra_probs.dc_contexts;
+    let ac_probs = intra_probs.ac_probs;
+    let zrl_probs = intra_probs.zrl_probs;
 
     // --- §9 raw-bit header prefix (byte-aligned) ---
     // Table 1 byte: FrameType(1)=0, DctQMask(6), MultiStream(1)=0.
@@ -281,12 +316,11 @@ pub fn encode_intra_frame(frame: &Frame, dct_q_mask: u8) -> Result<Vec<u8>, Erro
     // On a keyframe the per-MB info begins (Figure 2) with the Figure 5
     // coefficient prob-update pass — there is no §10 mode or §11.2 MV
     // tree on an I-frame (§10: "For I-frames each MB is implicitly
-    // encoded in intra-mode so no signaling of mode is" needed). This
-    // encoder re-trains no probabilities, so it emits the minimal
-    // no-update Figure-5 prefix (every per-node flag cleared, the
-    // scan-update bit cleared); the decoder seeds the keyframe baselines
-    // and applies the (empty) updates, leaving them at baseline.
-    crate::coeff_prob_update::encode_coefficient_prob_updates(&mut enc);
+    // encoded in intra-mode so no signaling of mode is" needed). Emit the
+    // updates that carry the keyframe baseline to `banks` (an empty pass
+    // when `banks == CoeffProbBanks::keyframe()`); the decoder seeds the
+    // baselines and applies these updates to recover the identical bank.
+    crate::coeff_prob_update::encode_coefficient_prob_updates_full(&mut enc, banks);
 
     // Per-plane coded-DC grids + §14 prediction contexts, mirroring the
     // decoder exactly.
