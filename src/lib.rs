@@ -888,7 +888,8 @@ pub use block_decode::{
 pub use bool_coder::{BoolCoder, BoolEncoder};
 pub use coeff_prob_update::{
     decode_coefficient_prob_updates, encode_coefficient_prob_updates,
-    encode_coefficient_prob_updates_with_scan, CoeffProbBanks,
+    encode_coefficient_prob_updates_full, encode_coefficient_prob_updates_with_scan,
+    node_prob_update_representable, CoeffProbBanks,
 };
 pub use dc_pred::{
     average_both_neighbours, sign as dc_sign, DcPredictionContext, Neighbour, ReferenceBucket,

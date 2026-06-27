@@ -294,6 +294,127 @@ fn encode_coeff_band_updates(enc: &mut BoolEncoder, band_assignment: &BandAssign
     }
 }
 
+/// The set of `NewNodeProbValue` targets a §13 node-probability update
+/// can actually express.
+///
+/// [`crate::prob_update::decode_new_node_prob`] decodes a set update as
+/// `b(7) → value`, then `prob = max(1, value * 2)`. The reachable target
+/// probabilities are therefore exactly `{1} ∪ {2, 4, …, 254}` (the even
+/// values, plus `1` standing in for the forbidden `0`). An odd target
+/// above `1` cannot be transmitted by the §13 update mechanism; this
+/// predicate lets a caller pick representable targets.
+pub fn node_prob_update_representable(target: u8) -> bool {
+    target == 1 || (target != 0 && target % 2 == 0)
+}
+
+/// The `b(7)` `NewNodeProbValue` that decodes to `target` via the §13
+/// `max(1, value * 2)` rule, or `None` if `target` is unrepresentable
+/// (see [`node_prob_update_representable`]).
+fn node_prob_update_value(target: u8) -> Option<u32> {
+    if target == 1 {
+        // value 0 → doubled 0 → clipped to 1.
+        Some(0)
+    } else if target != 0 && target % 2 == 0 {
+        Some((target >> 1) as u32)
+    } else {
+        None
+    }
+}
+
+/// Emit one §13 node-probability update record (the inverse of
+/// [`crate::prob_update::decode_new_node_prob`]).
+///
+/// If `target == current` emit the cleared `B(flag_prob)` flag (no
+/// update). Otherwise emit the set flag and the `b(7) NewNodeProbValue`
+/// that decodes to `target`. `target` must be representable
+/// ([`node_prob_update_representable`]); the function panics in debug on
+/// an unrepresentable target rather than silently emitting a wrong value.
+fn encode_node_prob_update(enc: &mut BoolEncoder, flag_prob: u8, current: u8, target: u8) {
+    if target == current {
+        enc.encode_bool(0, flag_prob);
+        return;
+    }
+    let value = node_prob_update_value(target)
+        .expect("node-prob update target must be representable (1 or even)");
+    enc.encode_bool(1, flag_prob);
+    enc.encode_b(value, 7);
+}
+
+/// Emit a §8 Figure 5 sub-stream that transforms the keyframe-baseline
+/// banks into `target` — emitting a real `NewNodeProbValue` for every
+/// DC / ZRL / AC node that differs from baseline, the §12.2 scan-update
+/// for the band assignment, in the exact Figure-5 order.
+///
+/// This is the general inverse of [`decode_coefficient_prob_updates`]
+/// against a [`CoeffProbBanks::keyframe`] starting point: decoding the
+/// emitted sub-stream over fresh keyframe banks reproduces `target`
+/// exactly. Every node probability in `target` must be representable by
+/// the §13 update mechanism ([`node_prob_update_representable`]) — i.e.
+/// `1` or even; the DC/AC/ZRL baselines are all `128` (even) and the
+/// decode rule only ever writes representable values, so any bank
+/// obtained by decoding is round-trippable.
+///
+/// # Panics
+///
+/// Debug-panics if any target node probability is an unrepresentable odd
+/// value `> 1`.
+// Index loops keep the per-node `*_UPDATE_PROBS[..]` flag lookups aligned
+// with the §13.2 / §13.3.3 / §13.3 Tables traversal the decoder reads.
+#[allow(clippy::needless_range_loop)]
+pub fn encode_coefficient_prob_updates_full(enc: &mut BoolEncoder, target: &CoeffProbBanks) {
+    let baseline = CoeffProbBanks::keyframe();
+
+    // 1. §13.2 DC node updates.
+    for plane in 0..NUM_PLANES {
+        for node in 0..NUM_TREE_NODES {
+            encode_node_prob_update(
+                enc,
+                VP6_DC_UPDATE_PROBS[plane][node],
+                baseline.dc_probs[plane][node],
+                target.dc_probs[plane][node],
+            );
+        }
+    }
+
+    // 2. §12.2 scan-update bit + (if custom) the band updates.
+    if target.band_assignment == DEFAULT_BAND_ASSIGNMENT {
+        enc.encode_b1(0);
+    } else {
+        enc.encode_b1(1);
+        encode_coeff_band_updates(enc, &target.band_assignment);
+    }
+
+    // 3. §13.3.3 ZRL node updates.
+    for band in 0..crate::zrl::NUM_ZRL_BANDS {
+        for node in 0..crate::zrl::NUM_ZRL_NODES {
+            encode_node_prob_update(
+                enc,
+                ZRL_UPDATE_PROBS[band][node],
+                baseline.zrl_probs[band][node],
+                target.zrl_probs[band][node],
+            );
+        }
+    }
+
+    // 4. §13.3 AC node updates, in the Table-31-outer walk order. Note
+    //    AcUpdateProbs is `[prec][plane][band][node]` while the AC bank
+    //    is `[plane][prec][band][node]` (the §13.3 transpose).
+    for prec in 0..crate::tokens::NUM_AC_PREC_CONTEXTS {
+        for plane in 0..NUM_PLANES {
+            for band in 0..crate::tokens::NUM_AC_BANDS {
+                for node in 0..NUM_TREE_NODES {
+                    encode_node_prob_update(
+                        enc,
+                        AC_UPDATE_PROBS[prec][plane][band][node],
+                        baseline.ac_probs[plane][prec][band][node],
+                        target.ac_probs[plane][prec][band][node],
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +527,73 @@ mod tests {
             seen[p as usize] = true;
         }
         assert!(seen.iter().all(|&s| s));
+    }
+
+    /// The §13 node-prob update target space is exactly `{1} ∪ even`.
+    #[test]
+    fn node_prob_update_representability() {
+        assert!(node_prob_update_representable(1));
+        assert!(node_prob_update_representable(2));
+        assert!(node_prob_update_representable(128));
+        assert!(node_prob_update_representable(254));
+        assert!(!node_prob_update_representable(0)); // forbidden node prob
+        assert!(!node_prob_update_representable(3)); // odd > 1 unreachable
+        assert!(!node_prob_update_representable(255));
+        // The b(7) value chosen decodes back through max(1, value*2).
+        assert_eq!(node_prob_update_value(1), Some(0));
+        assert_eq!(node_prob_update_value(2), Some(1));
+        assert_eq!(node_prob_update_value(254), Some(127));
+    }
+
+    /// A full-update Figure-5 sub-stream transforms the keyframe baseline
+    /// into an arbitrary representable target bank, round-tripping every
+    /// DC / ZRL / AC node probability and the custom scan exactly.
+    #[test]
+    fn full_update_substream_round_trips_target() {
+        // Build a target with representable (even / 1) node-prob deltas
+        // across all four banks, plus a custom scan.
+        let mut target = CoeffProbBanks::keyframe();
+        target.dc_probs[0][0] = 200;
+        target.dc_probs[1][6] = 2;
+        target.dc_probs[0][10] = 1; // the `1` escape (value 0)
+        target.zrl_probs[0][0] = 64;
+        target.zrl_probs[1][13] = 254;
+        target.ac_probs[0][0][0][0] = 80;
+        target.ac_probs[1][2][5][10] = 4;
+        target.band_assignment[1] = 2;
+        target.band_assignment[2] = 1;
+
+        let bytes = roundtrip(|enc| encode_coefficient_prob_updates_full(enc, &target));
+        let mut bc = BoolCoder::new(&bytes).expect("bc");
+
+        let mut banks = CoeffProbBanks::keyframe();
+        let scan = decode_coefficient_prob_updates(&mut bc, &mut banks).expect("decode");
+
+        assert_eq!(
+            banks, target,
+            "full Figure-5 update must round-trip the bank"
+        );
+        let expected =
+            custom_scan_order_to_raster(&build_custom_scan_order(&target.band_assignment));
+        assert_eq!(
+            scan, expected,
+            "custom scan must round-trip alongside the updates"
+        );
+    }
+
+    /// A full update with the default band assignment emits the cleared
+    /// scan bit and still round-trips the node-prob deltas.
+    #[test]
+    fn full_update_default_scan_round_trips() {
+        let mut target = CoeffProbBanks::keyframe();
+        target.dc_probs[0][3] = 50;
+        target.ac_probs[0][0][1][2] = 222;
+
+        let bytes = roundtrip(|enc| encode_coefficient_prob_updates_full(enc, &target));
+        let mut bc = BoolCoder::new(&bytes).expect("bc");
+        let mut banks = CoeffProbBanks::keyframe();
+        let scan = decode_coefficient_prob_updates(&mut bc, &mut banks).expect("decode");
+        assert_eq!(banks, target);
+        assert_eq!(scan, DEFAULT_SCAN_ORDER);
     }
 }
