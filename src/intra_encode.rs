@@ -277,6 +277,17 @@ pub fn encode_intra_frame(frame: &Frame, dct_q_mask: u8) -> Result<Vec<u8>, Erro
     enc.encode_b(0, 2); // ScalingMode = MAINTAIN_ASPECT_RATIO
     enc.encode_b1(0); // UseHuffman = 0
 
+    // --- §8 Figure 5 coefficient-probability-update sub-stream ---
+    // On a keyframe the per-MB info begins (Figure 2) with the Figure 5
+    // coefficient prob-update pass — there is no §10 mode or §11.2 MV
+    // tree on an I-frame (§10: "For I-frames each MB is implicitly
+    // encoded in intra-mode so no signaling of mode is" needed). This
+    // encoder re-trains no probabilities, so it emits the minimal
+    // no-update Figure-5 prefix (every per-node flag cleared, the
+    // scan-update bit cleared); the decoder seeds the keyframe baselines
+    // and applies the (empty) updates, leaving them at baseline.
+    crate::coeff_prob_update::encode_coefficient_prob_updates(&mut enc);
+
     // Per-plane coded-DC grids + §14 prediction contexts, mirroring the
     // decoder exactly.
     let mut y_grid = PlaneDcGrid::new(h_fragments, v_fragments);
@@ -382,7 +393,7 @@ mod tests {
     use super::*;
     use crate::bool_coder::BoolCoder;
     use crate::frame_header::{Vp6FrameHeader, Vp6HeaderTail};
-    use crate::intra_frame::{decode_intra_frame, IntraProbs};
+    use crate::intra_frame::decode_intra_frame;
     use crate::scan::DEFAULT_SCAN_ORDER;
 
     /// Build a source frame whose luma/chroma planes carry a
@@ -429,14 +440,25 @@ mod tests {
         assert_eq!(tail.v_fragments, Some(frame.v_fragments as u8));
         assert!(!tail.use_huffman);
 
-        let probs = IntraProbs::keyframe();
+        // The encoder now emits the §8 Figure 5 coefficient-prob-update
+        // sub-stream right after the header tail; consume it (a no-update
+        // pass that leaves the keyframe baselines untouched) before
+        // decoding the coefficient stream.
+        let mut banks = crate::coeff_prob_update::CoeffProbBanks::keyframe();
+        let scan = crate::coeff_prob_update::decode_coefficient_prob_updates(&mut bc, &mut banks)
+            .expect("figure-5 prefix");
+        assert_eq!(
+            scan, DEFAULT_SCAN_ORDER,
+            "no-update keyframe keeps default scan"
+        );
+        let probs = banks.to_intra_probs();
         decode_intra_frame(
             &mut bc,
             frame.h_fragments,
             frame.v_fragments,
             hdr.dct_q_mask,
             &probs,
-            &DEFAULT_SCAN_ORDER,
+            &scan,
         )
         .expect("decode")
     }

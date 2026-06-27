@@ -57,10 +57,11 @@
 //! No external library code was consulted.
 
 use crate::bool_coder::BoolCoder;
+use crate::coeff_prob_update::{decode_coefficient_prob_updates, CoeffProbBanks};
 use crate::frame_assembly::Frame;
 use crate::frame_header::{CodingProfile, Vp3Version, Vp6FrameHeader, Vp6HeaderTail};
 use crate::inter_frame::{decode_inter_frame_with_refs, FilterConfig, InterProbs, ReferenceFrames};
-use crate::intra_frame::{decode_intra_frame, IntraProbs};
+use crate::intra_frame::decode_intra_frame;
 use crate::scan::DEFAULT_SCAN_ORDER;
 use crate::Error;
 
@@ -169,14 +170,23 @@ impl Vp6Decoder {
         let h_fragments = tail.h_fragments.ok_or(Error::Truncated)? as usize;
         let v_fragments = tail.v_fragments.ok_or(Error::Truncated)? as usize;
 
-        let probs = IntraProbs::keyframe();
+        // §8 Figure 5 coefficient-probability-update sub-stream. On a
+        // keyframe the per-MB info (Figure 2) opens directly with this
+        // pass — there is no §10 mode or §11.2 MV tree on an I-frame
+        // (§10: I-frame MBs are implicitly intra, no mode signaling). The
+        // banks are reset to the §13 keyframe baselines, then the
+        // (typically empty) Figure-5 updates apply on top. The pass also
+        // yields the active §12.2 scan order.
+        let mut banks = CoeffProbBanks::keyframe();
+        let scan = decode_coefficient_prob_updates(&mut bc, &mut banks)?;
+        let probs = banks.to_intra_probs();
         let frame = decode_intra_frame(
             &mut bc,
             h_fragments,
             v_fragments,
             header.dct_q_mask,
             &probs,
-            &DEFAULT_SCAN_ORDER,
+            &scan,
         )?;
 
         // §4: a keyframe (re)seeds the previous-frame buffer and the
