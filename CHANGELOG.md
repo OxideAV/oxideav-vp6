@@ -6,6 +6,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 377, 2026-06-28)
+
+- **`coeff_prob_update` — §8 Figure 5 coefficient-probability-update
+  driver.** A new module that fuses the four already-implemented per-frame
+  passes (§13.2 DC node, §12.2 scan, §13.3.3 ZRL, §13.3 AC) into the single
+  spec-mandated order the §8 *Bitstream Map* (Figure 5, p. 20) fixes.
+  `decode_coefficient_prob_updates` runs the sequence over one `BoolCoder`,
+  mutating a `CoeffProbBanks` and returning the active §12.2 raster scan
+  order; `encode_coefficient_prob_updates` / `_with_scan` / `_full` are its
+  bit-for-bit inverses (minimal no-update prefix, custom-scan-only, and the
+  general full-update form emitting real `NewNodeProbValue` records).
+  `node_prob_update_representable` exposes the §13 `max(1, value*2)` target
+  space (`{1} ∪ even`).
+- **Top-level §8 Figure 1 / Figure 5 ordering wired into `decode_frame`.**
+  `decode_keyframe` now consumes the Figure-5 coefficient-prob-update pass
+  (a keyframe carries no §10/§11.2 tree — §10: I-frame MBs are implicitly
+  intra); `decode_interframe` consumes the full inter prefix §10 *Mode
+  Probability Updates* → §11.2 *Mv Tree* → Figure 5 before the per-MB walk.
+  The intra encoder + every inter packet encoder emit the symmetric prefix
+  (`emit_inter_pre_data_substreams`, `encode_no_mode_prob_updates`,
+  `encode_no_mv_prob_updates`). The §8 ordering is fully spec-pinned, so no
+  conformant `.vp6` fixture was needed (retiring the prior "needs a fixture"
+  caveat for the ordering question).
+- **`encode_intra_frame_with_banks` — real coeff-prob-update keyframe
+  round-trip.** The general form of `encode_intra_frame`: emits the Figure-5
+  updates carrying the baseline to an arbitrary representable
+  `CoeffProbBanks` and codes the §13 tokens against those banks.
+  `keyframe_with_coeff_prob_updates_round_trips` drives a keyframe whose
+  prefix sets real DC/AC/ZRL `NewNodeProbValue` records through the
+  top-level `decode_packet` and asserts the pixels reconstruct identically
+  to the baseline-bank keyframe (node probs change only the entropy coding).
+
 ### Added (clean-room round 373, 2026-06-26)
 
 - **`encode_inter_frame_me_golden_packet_refresh` + `Vp6Decoder::references`** —

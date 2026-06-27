@@ -63,12 +63,24 @@ emits a self-describing packet too: `encode_inter_frame_packet` prepends
 the §9 InterHeader (Table 1 prefix + Table 3 BoolCoder tail) to the data
 partition so the round-trip flows through `decode_packet`.
 
-What remains is the in-header **§10/§11.2/§13 probability-update
-sub-streams** (each pass exists — `mode_prob_update`, `mv_prob_update`,
-`prob_update`, `scan_update` — but the exact Figure-5 ordering relative
-to the header tail wants a conformant `.vp6` fixture to validate, so the
-top-level driver currently decodes only the no-update / single-partition
-/ BoolCoder-coefficient shape the in-tree encoders produce). The encoder is
+The top-level driver now sequences the **§8 Figure 1 / Figure 5
+probability-update sub-streams** in spec order. `coeff_prob_update`
+fuses the four §13/§12.2 passes into the single Figure-5 order the
+bitstream map fixes (DC node updates → scan-update bit + custom-scan
+body → ZRL updates → AC updates); `decode_keyframe` consumes the
+Figure-5 pass (a keyframe carries no §10/§11.2 tree — §10: I-frame MBs
+are implicitly intra), and `decode_interframe` consumes the full inter
+prefix §10 *Mode Probability Updates* → §11.2 *Mv Tree* → Figure 5
+*Coefficient Probability Updates* before the per-MB walk. The in-tree
+encoders emit the matching prefix (`emit_inter_pre_data_substreams` +
+the no-update / `_full` Figure-5 emitters), so a keyframe carrying
+**real** §13 node-probability updates round-trips end-to-end through
+`decode_packet` (`encode_intra_frame_with_banks` →
+`keyframe_with_coeff_prob_updates_round_trips`). What remains here is
+**cross-frame bank persistence** (carrying a P-frame's mutated §10/§11.2/§13
+banks into the next frame rather than reseeding the baseline) and the
+two-partition **MultiStream** (§6) / **Huffman** (§7) second-partition
+shapes. The encoder is
 now **registered** as an `oxideav-core` `Encoder` (`encoder::Vp6CodecEncoder`
 / `make_encoder`, a GOP-aware keyframe + motion-estimated-P-frame adapter),
 and its **motion estimation** (single-vector `CODE_INTER_PLUS_MV` with a
@@ -389,13 +401,30 @@ two-stage box-then-¼-pel luma search and §11 differential-MV emission), its
 
 ### Blocked / remaining
 
-- **In-header probability-update sequencing** — the §10 mode-prob /
-  §11.2 MV-prob / §13 Figure-5 coefficient-prob / §12 scan-update passes all
-  exist (`mode_prob_update`, `mv_prob_update`, `prob_update`, `scan_update`)
-  but their exact Figure-1/Figure-5 ordering relative to the header tail wants
-  a conformant `.vp6` fixture to validate; the top-level driver therefore
-  decodes only the no-update frame shape so far. (The `oxideav-core` `Encoder`
-  registration is **now landed** — see `encoder::Vp6CodecEncoder` above.)
+- **In-header probability-update sequencing — NOW WIRED.** The §8
+  Figure 1 / Figure 5 ordering is fully specified in `vp6_format.pdf` §8
+  (Figure 1's bullet list + Figure 5's within-pass order on p. 20), so no
+  fixture was needed to pin it down. `coeff_prob_update` fuses the four
+  §13/§12.2 passes in Figure-5 order; `decode_keyframe` consumes the
+  Figure-5 pass and `decode_interframe` consumes §10 → §11.2 → Figure 5
+  before the per-MB walk. The encoders emit the symmetric prefix
+  (`emit_inter_pre_data_substreams`, `encode_coefficient_prob_updates` /
+  `_with_scan` / `_full`, `encode_no_mode_prob_updates`,
+  `encode_no_mv_prob_updates`), and a keyframe carrying real §13
+  node-probability updates round-trips end-to-end through `decode_packet`.
+- **Cross-frame bank persistence (follow-up).** The §10/§11.2/§13 banks
+  currently reseed their baseline each frame rather than carrying a
+  P-frame's mutated banks forward (§13 persistence). The in-tree encoder
+  emits only no-update inter prefixes, for which per-frame baseline
+  reseeding is bit-exact; threading a persistent bank through `Vp6Decoder`
+  is the next step toward decoding a conformant stream that re-trains
+  probabilities across an inter frame.
+- **MultiStream (§6) / Huffman (§7) second partition (follow-up).** The
+  two-partition split (`MultiStream == 1`: modes/MVs in partition 1 at
+  partition-1, DCT tokens in partition 2 at `Buff2Offset`) and the Huffman
+  coefficient coder (`UseHuffman == 1`) are fully specified but not yet
+  wired through the single-partition fused per-MB driver; `decode_packet`
+  returns `NotImplemented` for both.
 - **DOCS-GAP — FourMV MB neighbour representative.** §10 defines the
   Nearest/Near walk over "decoded macroblock neighbors" (one MV per
   neighbour MB), but never states which of a `CODE_INTER_FOURMV` MB's
