@@ -8,6 +8,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 384, 2026-07-03)
 
+- **Golden-aware + FourMV MultiStream packets.** The `CoeffSink` routing
+  is threaded through the remaining two P-frame bodies, so
+  `encode_inter_frame_me_golden_multistream_packet` and
+  `encode_inter_frame_me_fourmv_multistream_packet` emit the §6
+  two-partition arrangement (BoolCoder or Huffman partition 2) for the
+  full mode surface — every in-tree P-frame shape now exists in all
+  three §5/§6 transports. Equivalence tests pin bit-identical decode vs
+  the single-stream Golden and FourMV packets for both transports.
+
 - **Inter-frame §13 re-training — real Figure-5 updates on P-frames.**
   `coeff_prob_update::encode_coefficient_prob_updates_from(current,
   target)` is the general inter-frame Figure-5 emitter (updates relative

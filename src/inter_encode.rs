@@ -226,35 +226,6 @@ fn tokenize_inter_block(
     (scan, coded_dc)
 }
 
-/// Tokenize + arithmetic-emit one inter block into `enc` — the fused
-/// single-sink form the Golden-aware and FourMV bodies use.
-#[allow(clippy::too_many_arguments)]
-fn encode_inter_block(
-    enc: &mut BoolEncoder,
-    plane: AcPlane,
-    source: &[i32; 64],
-    prediction: &[u8; 64],
-    dequant: DequantContext,
-    dc_node_probs: &[u8; crate::tokens::NUM_TREE_NODES],
-    probs: &InterProbs,
-    dc_pred: &mut DcPredictionContext,
-    reference: ReferenceBucket,
-    left: Option<(i32, ReferenceBucket)>,
-    above: Option<(i32, ReferenceBucket)>,
-) -> i32 {
-    let (scan, coded_dc) =
-        tokenize_inter_block(source, prediction, dequant, dc_pred, reference, left, above);
-    encode_block_coefficients(
-        enc,
-        plane,
-        dc_node_probs,
-        &probs.coeffs.ac_probs,
-        &probs.coeffs.zrl_probs,
-        &scan,
-    );
-    coded_dc
-}
-
 /// Where a P-frame body's §13 coefficient tokens go — the encoder-side
 /// dual of [`crate::coeff_source::CoeffSource`] (§5/§6):
 ///
@@ -1385,7 +1356,16 @@ pub fn encode_inter_frame_me_golden(
     probs: &InterProbs,
     filter: &FilterConfig,
 ) -> Result<Vec<u8>, Error> {
-    encode_inter_frame_me_golden_body(source, prev, golden, dct_q_mask, probs, filter, |_| {})
+    encode_inter_frame_me_golden_body(
+        source,
+        prev,
+        golden,
+        dct_q_mask,
+        probs,
+        filter,
+        |_| {},
+        &mut CoeffSink::Shared,
+    )
 }
 
 /// Shared Golden-aware motion-estimated P-frame body (see
@@ -1400,6 +1380,7 @@ fn encode_inter_frame_me_golden_body(
     probs: &InterProbs,
     filter: &FilterConfig,
     prelude: impl FnOnce(&mut BoolEncoder),
+    sink: &mut CoeffSink,
 ) -> Result<Vec<u8>, Error> {
     let h_fragments = source.h_fragments;
     let v_fragments = source.v_fragments;
@@ -1507,8 +1488,9 @@ fn encode_inter_frame_me_golden_body(
                     y_grid.above(br, bc_col).is_some_and(|(d, _)| d != 0),
                 )
                 .select_row(&probs.coeffs.dc_contexts[AcPlane::Y.index()]);
-                let coded_dc = encode_inter_block(
+                let coded_dc = emit_inter_block(
                     &mut enc,
+                    sink,
                     AcPlane::Y,
                     &source_pixels,
                     &prediction,
@@ -1531,8 +1513,9 @@ fn encode_inter_frame_me_golden_body(
                 u_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
             )
             .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
-            let u_coded_dc = encode_inter_block(
+            let u_coded_dc = emit_inter_block(
                 &mut enc,
+                sink,
                 AcPlane::UV,
                 &u_source,
                 &u_pred,
@@ -1554,8 +1537,9 @@ fn encode_inter_frame_me_golden_body(
                 v_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
             )
             .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
-            let v_coded_dc = encode_inter_block(
+            let v_coded_dc = emit_inter_block(
                 &mut enc,
+                sink,
                 AcPlane::UV,
                 &v_source,
                 &v_pred,
@@ -1619,7 +1603,15 @@ pub fn encode_inter_frame_me_fourmv(
     probs: &InterProbs,
     filter: &FilterConfig,
 ) -> Result<Vec<u8>, Error> {
-    encode_inter_frame_me_fourmv_body(source, prev, dct_q_mask, probs, filter, |_| {})
+    encode_inter_frame_me_fourmv_body(
+        source,
+        prev,
+        dct_q_mask,
+        probs,
+        filter,
+        |_| {},
+        &mut CoeffSink::Shared,
+    )
 }
 
 /// Shared FourMV-capable P-frame body (see [`encode_inter_frame_me_fourmv`]).
@@ -1631,6 +1623,7 @@ fn encode_inter_frame_me_fourmv_body(
     probs: &InterProbs,
     filter: &FilterConfig,
     prelude: impl FnOnce(&mut BoolEncoder),
+    sink: &mut CoeffSink,
 ) -> Result<Vec<u8>, Error> {
     let h_fragments = source.h_fragments;
     let v_fragments = source.v_fragments;
@@ -1794,8 +1787,9 @@ fn encode_inter_frame_me_fourmv_body(
                         y_grid.above(br, bc_col).is_some_and(|(d, _)| d != 0),
                     )
                     .select_row(&probs.coeffs.dc_contexts[AcPlane::Y.index()]);
-                    let coded_dc = encode_inter_block(
+                    let coded_dc = emit_inter_block(
                         &mut enc,
+                        sink,
                         AcPlane::Y,
                         &source_pixels,
                         &prediction,
@@ -1818,8 +1812,9 @@ fn encode_inter_frame_me_fourmv_body(
                     u_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
                 )
                 .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
-                let u_coded_dc = encode_inter_block(
+                let u_coded_dc = emit_inter_block(
                     &mut enc,
+                    sink,
                     AcPlane::UV,
                     &u_source,
                     &u_pred,
@@ -1840,8 +1835,9 @@ fn encode_inter_frame_me_fourmv_body(
                     v_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
                 )
                 .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
-                let v_coded_dc = encode_inter_block(
+                let v_coded_dc = emit_inter_block(
                     &mut enc,
+                    sink,
                     AcPlane::UV,
                     &v_source,
                     &v_pred,
@@ -1880,8 +1876,9 @@ fn encode_inter_frame_me_fourmv_body(
                         y_grid.above(br, bc_col).is_some_and(|(d, _)| d != 0),
                     )
                     .select_row(&probs.coeffs.dc_contexts[AcPlane::Y.index()]);
-                    let coded_dc = encode_inter_block(
+                    let coded_dc = emit_inter_block(
                         &mut enc,
+                        sink,
                         AcPlane::Y,
                         &source_pixels,
                         &prediction,
@@ -1903,8 +1900,9 @@ fn encode_inter_frame_me_fourmv_body(
                     u_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
                 )
                 .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
-                let u_coded_dc = encode_inter_block(
+                let u_coded_dc = emit_inter_block(
                     &mut enc,
+                    sink,
                     AcPlane::UV,
                     &u_source,
                     &u_pred,
@@ -1925,8 +1923,9 @@ fn encode_inter_frame_me_fourmv_body(
                     v_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
                 )
                 .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
-                let v_coded_dc = encode_inter_block(
+                let v_coded_dc = emit_inter_block(
                     &mut enc,
+                    sink,
                     AcPlane::UV,
                     &v_source,
                     &v_pred,
@@ -1971,11 +1970,19 @@ pub fn encode_inter_frame_me_fourmv_packet(
     header.write_u32(0, 16);
     let raw_prefix = header.finish();
 
-    let data = encode_inter_frame_me_fourmv_body(source, prev, dct_q_mask, probs, filter, |enc| {
-        enc.encode_b1(0); // RefreshGoldenFrame = 0
-        enc.encode_b1(0); // UseHuffman = 0
-        emit_inter_pre_data_substreams(enc);
-    })?;
+    let data = encode_inter_frame_me_fourmv_body(
+        source,
+        prev,
+        dct_q_mask,
+        probs,
+        filter,
+        |enc| {
+            enc.encode_b1(0); // RefreshGoldenFrame = 0
+            enc.encode_b1(0); // UseHuffman = 0
+            emit_inter_pre_data_substreams(enc);
+        },
+        &mut CoeffSink::Shared,
+    )?;
 
     let mut out = raw_prefix;
     out.extend_from_slice(&data);
@@ -2226,6 +2233,7 @@ pub fn encode_inter_frame_me_golden_packet_refresh(
             enc.encode_b1(0); // UseHuffman = 0
             emit_inter_pre_data_substreams(enc);
         },
+        &mut CoeffSink::Shared,
     )?;
 
     let mut out = raw_prefix;
@@ -2406,6 +2414,98 @@ pub fn encode_inter_frame_me_multistream_packet(
         CoeffSink::SeparateBool(BoolEncoder::new())
     };
     let p1 = encode_inter_frame_me_body(
+        source,
+        prev,
+        dct_q_mask,
+        probs,
+        filter,
+        |enc| {
+            enc.encode_b1(0); // RefreshGoldenFrame = 0
+            enc.encode_b1(u8::from(use_huffman)); // UseHuffman
+            emit_inter_pre_data_substreams(enc);
+        },
+        &mut sink,
+    )?;
+    let p2 = sink
+        .finish(&crate::coeff_prob_update::CoeffProbBanks::keyframe())
+        .expect("multistream sink always yields a partition 2");
+    assemble_multistream_inter_packet(dct_q_mask, p1, p2)
+}
+
+/// Encode a **Golden-aware** motion-estimated P-frame as a two-partition
+/// (`MultiStream == 1`) packet — the Golden dual of
+/// [`encode_inter_frame_me_multistream_packet`]: modes (including the
+/// `CODE_*GOLD*` set) and MV deltas ride partition 1; the §13 tokens
+/// ride partition 2 (BoolCoder or Huffman per `use_huffman`). Decoded
+/// pixels are bit-identical to [`encode_inter_frame_me_golden_packet`]'s.
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] for an over-large frame geometry or a
+/// partition-1 length overflowing the 16-bit `Buff2Offset`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_inter_frame_me_golden_multistream_packet(
+    source: &Frame,
+    prev: &BorderedRef,
+    golden: &BorderedRef,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    filter: &FilterConfig,
+    use_huffman: bool,
+) -> Result<Vec<u8>, Error> {
+    let dct_q_mask = dct_q_mask & 0x3F;
+    let mut sink = if use_huffman {
+        CoeffSink::Huffman(Vec::new())
+    } else {
+        CoeffSink::SeparateBool(BoolEncoder::new())
+    };
+    let p1 = encode_inter_frame_me_golden_body(
+        source,
+        prev,
+        golden,
+        dct_q_mask,
+        probs,
+        filter,
+        |enc| {
+            enc.encode_b1(0); // RefreshGoldenFrame = 0
+            enc.encode_b1(u8::from(use_huffman)); // UseHuffman
+            emit_inter_pre_data_substreams(enc);
+        },
+        &mut sink,
+    )?;
+    let p2 = sink
+        .finish(&crate::coeff_prob_update::CoeffProbBanks::keyframe())
+        .expect("multistream sink always yields a partition 2");
+    assemble_multistream_inter_packet(dct_q_mask, p1, p2)
+}
+
+/// Encode a **FourMV-capable** motion-estimated P-frame as a
+/// two-partition (`MultiStream == 1`) packet — the FourMV dual of
+/// [`encode_inter_frame_me_multistream_packet`]: `CODE_INTER_FOURMV`
+/// modes + the four per-block Table 10 codewords/deltas ride partition
+/// 1; the §13 tokens ride partition 2 (BoolCoder or Huffman per
+/// `use_huffman`). Decoded pixels are bit-identical to
+/// [`encode_inter_frame_me_fourmv_packet`]'s.
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] for an over-large frame geometry or a
+/// partition-1 length overflowing the 16-bit `Buff2Offset`.
+pub fn encode_inter_frame_me_fourmv_multistream_packet(
+    source: &Frame,
+    prev: &BorderedRef,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    filter: &FilterConfig,
+    use_huffman: bool,
+) -> Result<Vec<u8>, Error> {
+    let dct_q_mask = dct_q_mask & 0x3F;
+    let mut sink = if use_huffman {
+        CoeffSink::Huffman(Vec::new())
+    } else {
+        CoeffSink::SeparateBool(BoolEncoder::new())
+    };
+    let p1 = encode_inter_frame_me_fourmv_body(
         source,
         prev,
         dct_q_mask,
@@ -3534,6 +3634,136 @@ mod tests {
         let p_recon = dec.decode_packet(&packet).expect("FourMV P-decode");
         let y = psnr(source.y.samples(), p_recon.y.samples());
         assert!(y >= 22.0, "FourMV packet luma PSNR {y:.2} dB below floor");
+    }
+
+    /// A two-partition **FourMV** P-frame (both coefficient transports)
+    /// decodes to pixels bit-identical to the single-stream FourMV packet
+    /// — the §10/§11 decisions (including the Table 10 per-block modes)
+    /// are transport-independent.
+    #[test]
+    fn fourmv_multistream_matches_single_stream() {
+        use crate::decode_frame::Vp6Decoder;
+
+        let q = 20u8;
+        let key = gradient(4, 4);
+        let probs = keyframe_inter_probs();
+        let filter = bilinear_filter();
+
+        // Reference: single-stream FourMV packet through the decoder.
+        let key_packet = crate::intra_encode::encode_intra_frame(&key, q).expect("I-encode");
+        let mut dec_ss = Vp6Decoder::new();
+        let key_recon = dec_ss.decode_packet(&key_packet).expect("I-decode");
+        let prev_b = BorderedRef::new(&key_recon);
+
+        // Per-quadrant divergent motion so some MBs go FourMV.
+        let mut source = key_recon.clone();
+        let yw = source.y.width();
+        let yh = source.y.height();
+        for r in 0..yh {
+            for c in 0..yw {
+                let dy = if (r / 8) % 2 == 0 { 2 } else { -2 };
+                let dx = if (c / 8) % 2 == 0 { 2 } else { -2 };
+                let pr = (r as i32 + dy).clamp(0, yh as i32 - 1) as usize;
+                let pc = (c as i32 + dx).clamp(0, yw as i32 - 1) as usize;
+                source.y.samples_mut()[r * yw + c] = key_recon.y.samples()[pr * yw + pc];
+            }
+        }
+
+        let ss_packet = encode_inter_frame_me_fourmv_packet(&source, &prev_b, q, &probs, &filter)
+            .expect("ss FourMV encode");
+        let ss_out = dec_ss.decode_packet(&ss_packet).expect("ss FourMV decode");
+
+        for use_huffman in [false, true] {
+            let mut dec = Vp6Decoder::new();
+            let kf = dec.decode_packet(&key_packet).expect("I-decode");
+            let ms_packet = encode_inter_frame_me_fourmv_multistream_packet(
+                &source,
+                &BorderedRef::new(&kf),
+                q,
+                &probs,
+                &filter,
+                use_huffman,
+            )
+            .expect("ms FourMV encode");
+            let ms_out = dec.decode_packet(&ms_packet).expect("ms FourMV decode");
+            assert_eq!(
+                ms_out.y.samples(),
+                ss_out.y.samples(),
+                "use_huffman={use_huffman}"
+            );
+            assert_eq!(ms_out.u.samples(), ss_out.u.samples());
+            assert_eq!(ms_out.v.samples(), ss_out.v.samples());
+        }
+    }
+
+    /// A two-partition **Golden-aware** P-frame (both coefficient
+    /// transports) decodes to pixels bit-identical to the single-stream
+    /// Golden packet: a keyframe seeds Golden, a zero-MV P advances the
+    /// previous-frame buffer away from it, then the Golden-aware packet
+    /// codes a source resembling the keyframe so `CODE_*GOLD*` modes fire.
+    #[test]
+    fn golden_multistream_matches_single_stream() {
+        use crate::decode_frame::Vp6Decoder;
+
+        let q = 24u8;
+        let key = gradient(4, 4);
+        let probs = keyframe_inter_probs();
+        let filter = bilinear_filter();
+        let key_packet = crate::intra_encode::encode_intra_frame(&key, q).expect("I-encode");
+
+        // Drive one full chain and capture each packet so every decoder
+        // sees byte-identical history.
+        let mut dec_ss = Vp6Decoder::new();
+        let key_recon = dec_ss.decode_packet(&key_packet).expect("I-decode");
+
+        // P1: a flat-ish changed frame (advances prev; golden stays keyframe).
+        let mut p1_src = key_recon.clone();
+        for v in p1_src.y.samples_mut() {
+            *v = 40;
+        }
+        let p1_packet =
+            encode_inter_frame_packet(&p1_src, &BorderedRef::new(&key_recon), q, &probs, &filter)
+                .expect("P1 encode");
+        let _p1_recon = dec_ss.decode_packet(&p1_packet).expect("P1 decode");
+
+        // P2 (single-stream reference): source resembles the keyframe, so
+        // the Golden reference wins for most MBs.
+        let refs = dec_ss.references().expect("refs").clone();
+        let (prev_b, golden_b) = refs.bordered();
+        let p2_src = key_recon.clone();
+        let ss_packet =
+            encode_inter_frame_me_golden_packet(&p2_src, &prev_b, &golden_b, q, &probs, &filter)
+                .expect("ss golden encode");
+        let ss_out = dec_ss.decode_packet(&ss_packet).expect("ss golden decode");
+        // Sanity: the golden path must actually recover the key content.
+        let y = psnr(p2_src.y.samples(), ss_out.y.samples());
+        assert!(y >= 28.0, "golden reference not effective ({y:.2} dB)");
+
+        for use_huffman in [false, true] {
+            let mut dec = Vp6Decoder::new();
+            dec.decode_packet(&key_packet).expect("I-decode");
+            dec.decode_packet(&p1_packet).expect("P1 decode");
+            let refs2 = dec.references().expect("refs").clone();
+            let (prev2, golden2) = refs2.bordered();
+            let ms_packet = encode_inter_frame_me_golden_multistream_packet(
+                &p2_src,
+                &prev2,
+                &golden2,
+                q,
+                &probs,
+                &filter,
+                use_huffman,
+            )
+            .expect("ms golden encode");
+            let ms_out = dec.decode_packet(&ms_packet).expect("ms golden decode");
+            assert_eq!(
+                ms_out.y.samples(),
+                ss_out.y.samples(),
+                "use_huffman={use_huffman}"
+            );
+            assert_eq!(ms_out.u.samples(), ss_out.u.samples());
+            assert_eq!(ms_out.v.samples(), ss_out.v.samples());
+        }
     }
 
     /// Errata #155 lockstep: a FourMV MB's chroma-derived average vector
