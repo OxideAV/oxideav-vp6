@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 384, 2026-07-03)
 
+- **`huff_coeff` — the §13 Huffman coefficient coder, decode + encode.**
+  When `UseHuffman == 1` the second partition codes DCT tokens as raw
+  bits (§7.2) over trees derived from the same §13 probability banks the
+  arithmetic path uses. `HuffmanCoeffTables::from_banks` builds the
+  §13.2.2 per-plane DC trees (§13.1 `DCTTokenBoolTreeToHuffProbs` over
+  the *raw un-contexted* `DcProbs[2][11]`), the §13.3.2
+  `AcHuffTree[2][3][4]` over the Table 36 four-band split, and the
+  §13.3.3.2 `ZeroHuffTree[2]`, with §7-mandated clamping of zero leaf
+  products to 1. `decode_block_coefficients_huffman` implements the
+  §13.2.2 DC + §13.3.2 AC block decode with the cross-block
+  `CurrentDcRunLen` / `CurrentAc1RunLen` plane state
+  (`HuffmanRunState`), the §13.3.3.2 zero runs, and the §13.4 EOB/DC0
+  block-run decode (`decode_eob_or_dc0_run`, value space 1..=74);
+  `encode_frame_blocks_huffman` is its frame-level bit-for-bit inverse,
+  sizing the same-plane block runs by lookahead. Three spec-internal
+  inconsistencies (ZRL symbol↔run off-by-one that would loop forever as
+  printed, the `8 + R(6)` vs `9 + R(6)` long-escape base, and the
+  missing `− 1` on the DC run store) are disambiguated against the
+  §13.3.3.1 arithmetic value space and documented in the module docs.
+  19 round-trip tests cover every token category, both ZRL bands, the
+  long escape, cross-block and cross-plane runs, the >74 run split, the
+  Prec-context transitions, updated (non-baseline) banks, and the
+  clamped zero-probability leaf.
+
 - **Inter-frame `Buff2Offset` conformance (§9 Table 3).** The InterHeader
   opens with `Buff2Offset R(16)`, present "If (MultiStream == 1) ||
   (SIMPLE_PROFILE == 1)" — but the profile half of the gate needs the

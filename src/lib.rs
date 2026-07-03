@@ -851,6 +851,7 @@ pub mod forward_dct;
 pub mod fourmv;
 pub mod frame_assembly;
 pub mod frame_header;
+pub mod huff_coeff;
 pub mod huffman;
 pub mod idct;
 pub mod inter;
