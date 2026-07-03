@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 384, 2026-07-03)
 
+- **Cross-frame probability-bank persistence.** `Vp6Decoder` now carries
+  the §13.2/§13.3/§13.3.3 coefficient banks (+ the §12.2 band assignment
+  inside them), the §10 `probXmitted` bank, and the §11.2 two-axis MV
+  bank **across frames**, per the spec's persistence rules: each I-frame
+  resets every bank to its defaults; every frame's update sub-streams
+  mutate the banks in place; each P-frame starts from the values the
+  previous frame left behind ("For P-frames probXmitted values persist
+  from the previously decoded frame" / "updates are applied in respect of
+  the probability values used in the previous frame" / "persists from a
+  keyframe (I Frame) to each subsequent interframe" / §12.2 inter deltas
+  apply to the previous frame's custom scan). Tests pin a
+  keyframe-with-real-Figure-5-updates GOP whose P-frames are coded
+  against the *persisted* updated banks (exact reconstruction — baseline
+  reseeding would desynchronise the stream), continuation across a second
+  P-frame, and the reset at a new baseline keyframe.
+
 - **FourMV neighbour representative — DOCS-GAP closed (errata #155).**
   The staged errata now disambiguates which vector a `CODE_INTER_FOURMV`
   macroblock contributes to a later MB's §10 Nearest/Near scan and §11

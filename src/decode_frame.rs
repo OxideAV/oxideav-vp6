@@ -59,11 +59,16 @@
 //! keyframe carrying real §13 node-probability updates round-trips
 //! end-to-end (see `keyframe_with_coeff_prob_updates_round_trips`).
 //!
-//! Cross-frame **persistence** of the §10 / §11.2 / §13 banks (carrying a
-//! P-frame's mutated banks into the next frame instead of reseeding the
-//! baseline) is a follow-up; the in-tree encoder emits only no-update
-//! prefixes on inter frames, for which per-frame baseline reseeding is
-//! bit-exact.
+//! The §10 / §11.2 / §13 banks (and the §12.2 band assignment) are
+//! **persistent** across frames: each I-frame resets them to their
+//! defaults, every frame's update sub-streams mutate them in place, and
+//! the mutated banks carry into the next inter frame (§10 "For P-frames
+//! probXmitted values persist from the previously decoded frame"; §11.2
+//! "updates are applied in respect of the probability values used in the
+//! previous frame"; §13.2/§13.3/§13.3.3 "persists from a keyframe (I
+//! Frame) to each subsequent interframe"; §12.2 "For inter-coded frames
+//! deltas are applied to the custom scan order used in the previous
+//! frame").
 //!
 //! ## Provenance
 //!
@@ -98,7 +103,26 @@ pub struct Vp6Decoder {
     profile: Option<CodingProfile>,
     /// Version carried from the most recent I-frame (Table 3 omits it).
     version: Option<Vp3Version>,
+    /// The persistent §13.2/§13.3/§13.3.3 coefficient banks + §12.2 band
+    /// assignment: reset to the keyframe baselines at each I-frame, then
+    /// mutated in place by every frame's update sub-streams and carried
+    /// into the next frame ("The [DC/AC/ZeroRun]Probs array persists
+    /// from a keyframe to each subsequent interframe").
+    coeff_banks: Option<CoeffProbBanks>,
+    /// The persistent §10 `probXmitted[3][20]` bank ("At each I-frame
+    /// … initialized to a default set … For P-frames probXmitted values
+    /// persist from the previously decoded frame").
+    mode_probs: Option<ModeProbBank>,
+    /// The persistent §11 two-axis MV bank ("For inter frames updates
+    /// are applied in respect of the probability values used in the
+    /// previous frame … when an intra frame is decoded all the
+    /// probability values must all be reset to their defaults").
+    mv_probs: Option<[crate::mv_decode::MvProbs; 2]>,
 }
+
+/// The §10 `probXmitted[3][20]` bank type.
+type ModeProbBank =
+    [[u8; crate::modes::PROB_XMITTED_ROW_LEN]; crate::modes::NUM_PROBABILITY_SITUATIONS];
 
 impl Vp6Decoder {
     /// Construct a decoder with no carried state.
@@ -116,9 +140,9 @@ impl Vp6Decoder {
     /// * [`Error::NotImplemented`] if:
     ///   * the first frame is not a keyframe (no reference / profile to
     ///     inherit);
-    ///   * a frame signals `MultiStream == 1` (the two-partition split,
-    ///     §6) or `UseHuffman == 1` (the Huffman second-partition coder,
-    ///     §7) — paths not yet wired through this single-partition driver;
+    ///   * a frame signals `UseHuffman == 1` without a second partition
+    ///     (§5/§6: the Huffman coder only exists as a partition-2
+    ///     transport);
     ///   * a keyframe carries an unsupported profile/version combination.
     ///
     /// The §8 Figure 1 / Figure 5 probability-update sub-streams **are**
@@ -168,6 +192,9 @@ impl Vp6Decoder {
         self.refs = None;
         self.profile = None;
         self.version = None;
+        self.coeff_banks = None;
+        self.mode_probs = None;
+        self.mv_probs = None;
     }
 
     /// True once a keyframe has seeded the §4 reference buffers — i.e.
@@ -270,6 +297,18 @@ impl Vp6Decoder {
         self.profile = Some(profile);
         self.version = Some(version);
 
+        // Persistence: the keyframe's post-update §13 banks (+ §12.2
+        // band assignment) carry into the following inter frames ("The
+        // […]Probs array persists from a keyframe (I Frame) to each
+        // subsequent interframe"); the §10 probXmitted and §11.2 MV
+        // banks reset to their defaults at every I-frame.
+        self.coeff_banks = Some(banks);
+        self.mode_probs = Some(crate::modes::VP6_BASELINE_XMITTED_PROBS);
+        self.mv_probs = Some([
+            crate::mv_decode::MvProbs::defaults(crate::mv_decode::MV_AXIS_X),
+            crate::mv_decode::MvProbs::defaults(crate::mv_decode::MV_AXIS_Y),
+        ]);
+
         Ok(frame)
     }
 
@@ -303,18 +342,29 @@ impl Vp6Decoder {
         // §8 Figure 1 pre-data sub-streams, in the exact bitstream-map
         // order: §10 Mode Probability Updates → §11.2 MV Tree → §8
         // Figure 5 Coefficient Probability Updates → per-MB data. Each
-        // bank starts from its baseline and the (typically empty) update
-        // pass mutates it in place. (Cross-frame persistence of these
-        // banks is a follow-up; the in-tree encoder emits only no-update
-        // prefixes, for which per-frame baseline reseeding is exact.)
-        let mut mode_probs = crate::modes::VP6_BASELINE_XMITTED_PROBS;
-        let mut mv_probs = [
+        // bank starts from the values the *previous* frame left behind
+        // (§10 "For P-frames probXmitted values persist from the
+        // previously decoded frame"; §11.2 "updates are applied in
+        // respect of the probability values used in the previous frame";
+        // §13.2/§13.3/§13.3.3 "persists from a keyframe to each
+        // subsequent interframe") and the update pass mutates it in
+        // place; the mutated banks are stored back afterwards so the
+        // next frame continues from them. §12.2 scan deltas likewise
+        // apply to the previous frame's band assignment (carried inside
+        // the banks) rather than the default.
+        let mut mode_probs = self
+            .mode_probs
+            .unwrap_or(crate::modes::VP6_BASELINE_XMITTED_PROBS);
+        let mut mv_probs = self.mv_probs.unwrap_or([
             crate::mv_decode::MvProbs::defaults(crate::mv_decode::MV_AXIS_X),
             crate::mv_decode::MvProbs::defaults(crate::mv_decode::MV_AXIS_Y),
-        ];
+        ]);
         crate::mode_prob_update::update_mode_probs(&mut bc, &mut mode_probs)?;
         crate::mv_prob_update::update_mv_probs(&mut bc, &mut mv_probs)?;
-        let mut coeff_banks = CoeffProbBanks::keyframe();
+        let mut coeff_banks = self
+            .coeff_banks
+            .clone()
+            .unwrap_or_else(CoeffProbBanks::keyframe);
         let scan = decode_coefficient_prob_updates(&mut bc, &mut coeff_banks)?;
 
         let probs = InterProbs {
@@ -377,6 +427,11 @@ impl Vp6Decoder {
         if let Some(r) = self.refs.as_mut() {
             r.update_after_decode(frame.clone(), false, refresh_golden);
         }
+
+        // Persist this frame's post-update banks for the next frame.
+        self.coeff_banks = Some(coeff_banks);
+        self.mode_probs = Some(mode_probs);
+        self.mv_probs = Some(mv_probs);
 
         Ok(frame)
     }
@@ -933,6 +988,103 @@ mod tests {
             dec.decode_packet(&inside_prefix),
             Err(Error::Truncated)
         ));
+    }
+
+    /// §13 cross-frame bank persistence: a keyframe carrying **real**
+    /// Figure-5 coefficient-probability updates is followed by P-frames
+    /// whose (no-update) coefficient tokens are coded against the
+    /// keyframe's **updated** banks. The decoder must carry the mutated
+    /// banks across the frame boundary — reseeding the baseline would
+    /// desynchronise the arithmetic stream and corrupt the P-frames.
+    #[test]
+    fn coeff_banks_persist_from_keyframe_into_pframes() {
+        use crate::coeff_prob_update::CoeffProbBanks;
+        use crate::intra_encode::encode_intra_frame_with_banks;
+        use crate::mv_decode::{MvProbs, MV_AXIS_X, MV_AXIS_Y};
+
+        let src = pattern_frame(4, 4);
+        let q = 40;
+
+        // Non-baseline (representable) banks across all three §13
+        // families.
+        let mut banks = CoeffProbBanks::keyframe();
+        banks.dc_probs[0][0] = 200;
+        banks.dc_probs[1][4] = 64;
+        banks.ac_probs[0][0][0][0] = 100;
+        banks.ac_probs[1][2][3][5] = 220;
+        banks.zrl_probs[0][2] = 80;
+        banks.zrl_probs[1][9] = 2;
+
+        let mut dec = Vp6Decoder::new();
+        let kf_out = dec
+            .decode_packet(&encode_intra_frame_with_banks(&src, q, &banks).expect("encode I"))
+            .expect("decode I");
+
+        // P-frames coded against the *persisted* (updated) banks: the
+        // encoder threads the same banks; mode/MV banks are at their
+        // I-frame reset defaults.
+        let p_probs = InterProbs {
+            mode_probs: crate::modes::VP6_BASELINE_XMITTED_PROBS,
+            mv_probs: [MvProbs::defaults(MV_AXIS_X), MvProbs::defaults(MV_AXIS_Y)],
+            coeffs: banks.to_intra_probs(),
+        };
+        let filter = simple_inter_filter();
+
+        let p1_bytes =
+            encode_inter_frame_packet(&kf_out, &BorderedRef::new(&kf_out), q, &p_probs, &filter)
+                .expect("encode P1");
+        let p1_out = dec.decode_packet(&p1_bytes).expect("decode P1");
+        assert_eq!(
+            p1_out.y.samples(),
+            kf_out.y.samples(),
+            "P1 must decode against the persisted (updated) §13 banks"
+        );
+
+        // A second P-frame continues from the same persisted banks (the
+        // no-update P1 prefix left them unchanged).
+        let p2_bytes =
+            encode_inter_frame_packet(&p1_out, &BorderedRef::new(&p1_out), q, &p_probs, &filter)
+                .expect("encode P2");
+        let p2_out = dec.decode_packet(&p2_bytes).expect("decode P2");
+        assert_eq!(p2_out.y.samples(), p1_out.y.samples());
+        assert_eq!(p2_out.u.samples(), p1_out.u.samples());
+        assert_eq!(p2_out.v.samples(), p1_out.v.samples());
+    }
+
+    /// A new keyframe **resets** the persisted banks to the §13
+    /// baselines: after an updated-banks GOP, a plain baseline keyframe +
+    /// baseline-coded P-frame round-trip exactly.
+    #[test]
+    fn new_keyframe_resets_persisted_banks() {
+        use crate::coeff_prob_update::CoeffProbBanks;
+        use crate::intra_encode::encode_intra_frame_with_banks;
+
+        let src = pattern_frame(4, 4);
+        let q = 40;
+        let mut banks = CoeffProbBanks::keyframe();
+        banks.dc_probs[0][0] = 200;
+        banks.ac_probs[0][1][2][3] = 30;
+
+        let mut dec = Vp6Decoder::new();
+        dec.decode_packet(&encode_intra_frame_with_banks(&src, q, &banks).expect("encode I1"))
+            .expect("decode I1");
+
+        // Second keyframe: plain baseline. Must reset the banks.
+        let kf2_out = dec
+            .decode_packet(&encode_intra_frame(&src, q).expect("encode I2"))
+            .expect("decode I2");
+
+        let probs = InterProbs::keyframe();
+        let filter = simple_inter_filter();
+        let p_bytes =
+            encode_inter_frame_packet(&kf2_out, &BorderedRef::new(&kf2_out), q, &probs, &filter)
+                .expect("encode P");
+        let p_out = dec.decode_packet(&p_bytes).expect("decode P");
+        assert_eq!(
+            p_out.y.samples(),
+            kf2_out.y.samples(),
+            "baseline P after baseline keyframe must be exact (banks reset)"
+        );
     }
 
     /// An inter frame before any keyframe has no reference / profile —
