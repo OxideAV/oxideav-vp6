@@ -73,14 +73,21 @@ are implicitly intra), and `decode_interframe` consumes the full inter
 prefix §10 *Mode Probability Updates* → §11.2 *Mv Tree* → Figure 5
 *Coefficient Probability Updates* before the per-MB walk. The in-tree
 encoders emit the matching prefix (`emit_inter_pre_data_substreams` +
-the no-update / `_full` Figure-5 emitters), so a keyframe carrying
-**real** §13 node-probability updates round-trips end-to-end through
-`decode_packet` (`encode_intra_frame_with_banks` →
-`keyframe_with_coeff_prob_updates_round_trips`). What remains here is
-**cross-frame bank persistence** (carrying a P-frame's mutated §10/§11.2/§13
-banks into the next frame rather than reseeding the baseline) and the
-two-partition **MultiStream** (§6) / **Huffman** (§7) second-partition
-shapes. The encoder is
+the no-update / `_full` / `_from` Figure-5 emitters), so a keyframe
+carrying **real** §13 node-probability updates round-trips end-to-end
+through `decode_packet`, and a **P-frame can re-train** the banks
+mid-GOP (`encode_inter_frame_packet_with_banks`). The §10/§11.2/§13
+banks (+ the §12.2 band assignment) are **persistent** across frames per
+spec — reset at each I-frame, mutated by every frame's update
+sub-streams, carried into the next frame. The two-partition
+**MultiStream** (§6) arrangement and the **Huffman** (§7.2/§13.2.2/§13.3.2)
+second-partition coefficient coder are both implemented, decode and
+encode: `CoeffSource`/`CoeffSink` route the §13 tokens through any of
+the three §5/§6 transports (single-stream partition-1 BoolCoder,
+partition-2 BoolCoder at `Buff2Offset`, partition-2 raw-bit Huffman),
+every keyframe and P-frame shape (zero-MV / ME / Golden / FourMV) has a
+multistream packet emitter in both flavours, and equivalence tests pin
+bit-identical pixels across transports. The encoder is
 now **registered** as an `oxideav-core` `Encoder` (`encoder::Vp6CodecEncoder`
 / `make_encoder`, a GOP-aware keyframe + motion-estimated-P-frame adapter),
 and its **motion estimation** (single-vector `CODE_INTER_PLUS_MV` with a
@@ -412,32 +419,33 @@ two-stage box-then-¼-pel luma search and §11 differential-MV emission), its
   `_with_scan` / `_full`, `encode_no_mode_prob_updates`,
   `encode_no_mv_prob_updates`), and a keyframe carrying real §13
   node-probability updates round-trips end-to-end through `decode_packet`.
-- **Cross-frame bank persistence (follow-up).** The §10/§11.2/§13 banks
-  currently reseed their baseline each frame rather than carrying a
-  P-frame's mutated banks forward (§13 persistence). The in-tree encoder
-  emits only no-update inter prefixes, for which per-frame baseline
-  reseeding is bit-exact; threading a persistent bank through `Vp6Decoder`
-  is the next step toward decoding a conformant stream that re-trains
-  probabilities across an inter frame.
-- **MultiStream (§6) / Huffman (§7) second partition (follow-up).** The
-  two-partition split (`MultiStream == 1`: modes/MVs in partition 1 at
-  partition-1, DCT tokens in partition 2 at `Buff2Offset`) and the Huffman
-  coefficient coder (`UseHuffman == 1`) are fully specified but not yet
-  wired through the single-partition fused per-MB driver; `decode_packet`
-  returns `NotImplemented` for both.
-- **DOCS-GAP — FourMV MB neighbour representative.** §10 defines the
-  Nearest/Near walk over "decoded macroblock neighbors" (one MV per
-  neighbour MB), but never states which of a `CODE_INTER_FOURMV` MB's
-  four per-block vectors (or what combination) represents it in a
-  *later* MB's `NearMacroBlocks` list, nor which it contributes as the
-  §11 differential reference for an immediately-right/below `New` MB.
-  `reconstruct_fourmv_macroblock` exposes all four vectors and defers
-  the choice rather than guess. The **encoder sidesteps** this gap: a FourMV
-  MB contributes `None` to the neighbour grid (exactly as the decoder records
-  it), so `encode_inter_frame_me_fourmv` round-trips a FourMV MB without the
-  representative being defined — but a conformant bitstream that *relies* on a
-  FourMV MB as a later neighbour's Nearest/Near or differential reference still
-  needs the gap closed to decode.
+- **Cross-frame bank persistence — LANDED (round 384).** `Vp6Decoder`
+  carries the §13 coefficient banks (+ §12.2 band assignment), the §10
+  `probXmitted` bank and the §11.2 MV bank across frames per the spec's
+  persistence rules (reset at I-frames; P-frames start from the previous
+  frame's post-update values; §12.2 inter deltas apply to the previous
+  custom assignment). A P-frame can carry **real** Figure-5 updates
+  (`encode_coefficient_prob_updates_from` /
+  `encode_inter_frame_packet_with_banks`) and the re-trained banks
+  persist into following frames.
+- **MultiStream (§6) + Huffman (§7) second partition — LANDED (round
+  384).** `decode_packet` splits at `Buff2Offset` and dispatches on
+  `MultiStream`/`UseHuffman`; keyframes run the §6-general
+  `decode_intra_frame_from_source`, inter frames the Figure 3/4 two-pass
+  `decode_inter_frame_multistream` (all MB prediction info from
+  partition 1, then all coefficients from partition 2). `huff_coeff`
+  implements the full §13.1/§13.2.2/§13.3.2/§13.3.3.2/§13.4 Huffman
+  coefficient coder (tree derivation from the same §13 banks, cross-block
+  DC/AC1 run state, EOB/DC0 block runs) with a frame-level bit-exact
+  encoder. Three printed-spec inconsistencies (the §13.3.3.2 ZRL
+  symbol↔run off-by-one, the long-escape base, the §13.2.2 DC-run store
+  missing its `− 1`) are disambiguated against the §13.3.3.1 arithmetic
+  value space and documented in `huff_coeff`'s module docs.
+- **FourMV MB neighbour representative — DOCS-GAP CLOSED (errata #155,
+  round 384).** The representative a `CODE_INTER_FOURMV` MB contributes
+  to later MBs' §10 Nearest/Near scans and §11 differential references
+  is its §10 **chroma-derived average** (four Y vectors, rounded away
+  from zero). Decoder and encoder both record it in the neighbour grid.
 - **High-bit-depth / scaling resampling math** and **sample-exact
   validation against a conformant `.vp6` bitstream** — the latter
   needs an encoder-produced fixture.
