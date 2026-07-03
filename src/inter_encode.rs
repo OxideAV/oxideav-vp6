@@ -2233,6 +2233,79 @@ pub fn encode_inter_frame_me_golden_packet_refresh(
     Ok(out)
 }
 
+/// Encode a zero-MV P-frame packet whose §8 Figure 5 sub-stream carries
+/// **real** §13 coefficient-probability updates — the inter-frame
+/// re-training path the cross-frame bank persistence enables.
+///
+/// `prev_banks` are the §13 banks the previous frame left behind (what
+/// the decoder's persistent state holds when this packet arrives);
+/// `target_banks` the banks this frame re-trains to. The emitted
+/// Figure-5 pass covers exactly the differing nodes
+/// ([`crate::coeff_prob_update::encode_coefficient_prob_updates_from`]),
+/// and the §13 tokens are coded against `target_banks` — which the
+/// decoder reconstructs by applying the decoded updates to its
+/// persisted banks. The §10 mode / §11.2 MV banks must be at their
+/// I-frame reset defaults (this encoder emits no updates to them), and
+/// both bank arguments must keep the default §12.2 band assignment
+/// (the token quantiser uses the default zig-zag).
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] for an over-large frame geometry.
+pub fn encode_inter_frame_packet_with_banks(
+    source: &Frame,
+    prev: &BorderedRef,
+    dct_q_mask: u8,
+    prev_banks: &crate::coeff_prob_update::CoeffProbBanks,
+    target_banks: &crate::coeff_prob_update::CoeffProbBanks,
+    filter: &FilterConfig,
+) -> Result<Vec<u8>, Error> {
+    let dct_q_mask = dct_q_mask & 0x3F;
+
+    let probs = InterProbs {
+        mode_probs: crate::modes::VP6_BASELINE_XMITTED_PROBS,
+        mv_probs: [
+            crate::mv_decode::MvProbs::defaults(crate::mv_decode::MV_AXIS_X),
+            crate::mv_decode::MvProbs::defaults(crate::mv_decode::MV_AXIS_Y),
+        ],
+        coeffs: target_banks.to_intra_probs(),
+    };
+
+    // --- §9 raw-bit header prefix (Table 1 + Buff2Offset, byte-aligned) ---
+    let mut header = oxideav_core::bits::BitWriter::with_capacity(4);
+    header.write_u32(1, 1); // FrameType = 1 (inter)
+    header.write_u32(dct_q_mask as u32, 6);
+    header.write_u32(0, 1); // MultiStream = 0
+                            // Table 3 Buff2Offset R(16): present because the carried profile is
+                            // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
+    header.write_u32(0, 16);
+    let raw_prefix = header.finish();
+
+    let data = encode_inter_frame_body(
+        source,
+        prev,
+        dct_q_mask,
+        &probs,
+        filter,
+        |enc| {
+            enc.encode_b1(0); // RefreshGoldenFrame = 0
+            enc.encode_b1(0); // UseHuffman = 0
+            crate::mode_prob_update::encode_no_mode_prob_updates(enc);
+            crate::mv_prob_update::encode_no_mv_prob_updates(enc);
+            crate::coeff_prob_update::encode_coefficient_prob_updates_from(
+                enc,
+                prev_banks,
+                target_banks,
+            );
+        },
+        &mut CoeffSink::Shared,
+    )?;
+
+    let mut out = raw_prefix;
+    out.extend_from_slice(&data);
+    Ok(out)
+}
+
 /// Assemble a two-partition (`MultiStream == 1`) P-frame packet from its
 /// pieces: the Table 1 raw prefix + `Buff2Offset R(16)` (pointing at
 /// partition 2, measured from the start of the packet), partition 1,

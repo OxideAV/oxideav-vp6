@@ -1051,6 +1051,71 @@ mod tests {
         assert_eq!(p2_out.v.samples(), p1_out.v.samples());
     }
 
+    /// A P-frame carrying **real** §13 coefficient-probability updates
+    /// re-trains the persisted banks mid-GOP: I (baseline) → P1 whose
+    /// Figure-5 pass moves several nodes and whose tokens are coded
+    /// against the re-trained banks → P2 with no updates, coded against
+    /// the banks P1 left behind. Both P-frames must reconstruct exactly;
+    /// P2 only can if the decoder persisted P1's mutated banks.
+    #[test]
+    fn pframe_retrains_banks_mid_gop() {
+        use crate::coeff_prob_update::CoeffProbBanks;
+        use crate::inter_encode::encode_inter_frame_packet_with_banks;
+
+        let src = pattern_frame(4, 4);
+        let q = 40;
+
+        let mut dec = Vp6Decoder::new();
+        let kf_out = dec
+            .decode_packet(&encode_intra_frame(&src, q).expect("encode I"))
+            .expect("decode I");
+
+        // P1 re-trains: baseline → updated banks.
+        let baseline = CoeffProbBanks::keyframe();
+        let mut retrained = CoeffProbBanks::keyframe();
+        retrained.dc_probs[0][0] = 200;
+        retrained.dc_probs[1][2] = 64;
+        retrained.ac_probs[0][0][0][0] = 100;
+        retrained.ac_probs[1][1][2][4] = 240;
+        retrained.zrl_probs[0][5] = 44;
+
+        let filter = simple_inter_filter();
+        let p1_bytes = encode_inter_frame_packet_with_banks(
+            &kf_out,
+            &BorderedRef::new(&kf_out),
+            q,
+            &baseline,
+            &retrained,
+            &filter,
+        )
+        .expect("encode P1");
+        let p1_out = dec.decode_packet(&p1_bytes).expect("decode P1");
+        assert_eq!(
+            p1_out.y.samples(),
+            kf_out.y.samples(),
+            "P1 (re-training frame) must reconstruct exactly"
+        );
+
+        // P2: no further updates — coded against the banks P1 installed.
+        let p2_bytes = encode_inter_frame_packet_with_banks(
+            &p1_out,
+            &BorderedRef::new(&p1_out),
+            q,
+            &retrained,
+            &retrained,
+            &filter,
+        )
+        .expect("encode P2");
+        let p2_out = dec.decode_packet(&p2_bytes).expect("decode P2");
+        assert_eq!(
+            p2_out.y.samples(),
+            p1_out.y.samples(),
+            "P2 must decode against the banks P1 re-trained (persistence)"
+        );
+        assert_eq!(p2_out.u.samples(), p1_out.u.samples());
+        assert_eq!(p2_out.v.samples(), p1_out.v.samples());
+    }
+
     /// A new keyframe **resets** the persisted banks to the §13
     /// baselines: after an updated-banks GOP, a plain baseline keyframe +
     /// baseline-coded P-frame round-trip exactly.

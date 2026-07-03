@@ -8,6 +8,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 384, 2026-07-03)
 
+- **Inter-frame §13 re-training — real Figure-5 updates on P-frames.**
+  `coeff_prob_update::encode_coefficient_prob_updates_from(current,
+  target)` is the general inter-frame Figure-5 emitter (updates relative
+  to the banks the previous frame left behind, including §12.2 band
+  deltas relative to the previous custom assignment);
+  `encode_coefficient_prob_updates_full` is now the `current = baseline`
+  special case. `inter_encode::encode_inter_frame_packet_with_banks`
+  emits a P-frame packet whose Figure-5 pass re-trains the §13 banks and
+  whose tokens are coded against the re-trained values. A mid-GOP test
+  drives I → P1-with-updates → P2-no-updates and pins exact
+  reconstruction of both (P2 decodes only if the decoder persisted P1's
+  mutated banks).
+
 - **Cross-frame probability-bank persistence.** `Vp6Decoder` now carries
   the §13.2/§13.3/§13.3.3 coefficient banks (+ the §12.2 band assignment
   inside them), the §10 `probXmitted` bank, and the §11.2 two-axis MV

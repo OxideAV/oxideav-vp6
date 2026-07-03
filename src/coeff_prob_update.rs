@@ -283,9 +283,22 @@ pub fn encode_coefficient_prob_updates_with_scan(
 /// differs from the default zig-zag assignment, and when set the `b(4)`
 /// new band. A coefficient at its default band emits the cleared flag.
 fn encode_coeff_band_updates(enc: &mut BoolEncoder, band_assignment: &BandAssignment) {
+    encode_coeff_band_updates_from(enc, &DEFAULT_BAND_ASSIGNMENT, band_assignment);
+}
+
+/// Emit the §12.2 band-update body relative to an arbitrary incoming
+/// assignment (the inter-frame case: "deltas are applied to the custom
+/// scan order used in the previous frame"). A coefficient whose band
+/// matches `current`'s emits the cleared flag; a differing one emits
+/// the set flag + the `b(4)` new band.
+fn encode_coeff_band_updates_from(
+    enc: &mut BoolEncoder,
+    current: &BandAssignment,
+    target: &BandAssignment,
+) {
     for coeff in 1..64usize {
-        let band = band_assignment[coeff];
-        if band == DEFAULT_BAND_ASSIGNMENT[coeff] {
+        let band = target[coeff];
+        if band == current[coeff] {
             enc.encode_bool(0, COEFF_BAND_UPDATE_FLAG_PROBS[coeff]);
         } else {
             enc.encode_bool(1, COEFF_BAND_UPDATE_FLAG_PROBS[coeff]);
@@ -360,28 +373,54 @@ fn encode_node_prob_update(enc: &mut BoolEncoder, flag_prob: u8, current: u8, ta
 /// value `> 1`.
 // Index loops keep the per-node `*_UPDATE_PROBS[..]` flag lookups aligned
 // with the §13.2 / §13.3.3 / §13.3 Tables traversal the decoder reads.
-#[allow(clippy::needless_range_loop)]
 pub fn encode_coefficient_prob_updates_full(enc: &mut BoolEncoder, target: &CoeffProbBanks) {
-    let baseline = CoeffProbBanks::keyframe();
+    encode_coefficient_prob_updates_from(enc, &CoeffProbBanks::keyframe(), target);
+}
 
+/// Emit a §8 Figure 5 sub-stream that transforms `current` into
+/// `target` — the general **inter-frame** form of
+/// [`encode_coefficient_prob_updates_full`], exercising the §13
+/// cross-frame persistence: a P-frame's update pass starts from the
+/// banks the previous frame left behind, so the emitted
+/// `NewNodeProbValue` records cover exactly the nodes that differ
+/// between the two.
+///
+/// The §12.2 band assignment follows the same relative rule: a default
+/// `target` assignment emits the cleared scan-update bit (the decoder
+/// resets to the default zig-zag regardless of `current`); a custom
+/// `target` emits per-coefficient updates for the coefficients whose
+/// band differs from `current`'s ("For inter-coded frames deltas are
+/// applied to the custom scan order used in the previous frame").
+///
+/// # Panics
+///
+/// Debug-panics if any changed target node probability is an
+/// unrepresentable odd value `> 1`.
+#[allow(clippy::needless_range_loop)]
+pub fn encode_coefficient_prob_updates_from(
+    enc: &mut BoolEncoder,
+    current: &CoeffProbBanks,
+    target: &CoeffProbBanks,
+) {
     // 1. §13.2 DC node updates.
     for plane in 0..NUM_PLANES {
         for node in 0..NUM_TREE_NODES {
             encode_node_prob_update(
                 enc,
                 VP6_DC_UPDATE_PROBS[plane][node],
-                baseline.dc_probs[plane][node],
+                current.dc_probs[plane][node],
                 target.dc_probs[plane][node],
             );
         }
     }
 
-    // 2. §12.2 scan-update bit + (if custom) the band updates.
+    // 2. §12.2 scan-update bit + (if custom) the band updates relative
+    //    to the incoming assignment.
     if target.band_assignment == DEFAULT_BAND_ASSIGNMENT {
         enc.encode_b1(0);
     } else {
         enc.encode_b1(1);
-        encode_coeff_band_updates(enc, &target.band_assignment);
+        encode_coeff_band_updates_from(enc, &current.band_assignment, &target.band_assignment);
     }
 
     // 3. §13.3.3 ZRL node updates.
@@ -390,7 +429,7 @@ pub fn encode_coefficient_prob_updates_full(enc: &mut BoolEncoder, target: &Coef
             encode_node_prob_update(
                 enc,
                 ZRL_UPDATE_PROBS[band][node],
-                baseline.zrl_probs[band][node],
+                current.zrl_probs[band][node],
                 target.zrl_probs[band][node],
             );
         }
@@ -406,7 +445,7 @@ pub fn encode_coefficient_prob_updates_full(enc: &mut BoolEncoder, target: &Coef
                     encode_node_prob_update(
                         enc,
                         AC_UPDATE_PROBS[prec][plane][band][node],
-                        baseline.ac_probs[plane][prec][band][node],
+                        current.ac_probs[plane][prec][band][node],
                         target.ac_probs[plane][prec][band][node],
                     );
                 }
