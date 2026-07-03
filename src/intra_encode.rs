@@ -163,22 +163,18 @@ impl PlaneDcGrid {
     }
 }
 
-/// Encode one intra block: forward-DCT the level-shifted pixels,
-/// quantise, compute the §14 DC prediction delta, and emit the §13
-/// token stream. Returns the coded DC for the caller's grid update.
-#[allow(clippy::too_many_arguments)]
-fn encode_intra_block(
-    enc: &mut BoolEncoder,
-    plane: AcPlane,
+/// Tokenise one intra block: forward-DCT the level-shifted pixels,
+/// quantise, compute the §14 DC prediction delta. Returns `(scan,
+/// coded_dc)` — the scan-order token values (DC delta at position 0)
+/// plus the coded DC for the caller's grid update. Emission (arithmetic
+/// or Huffman) happens separately.
+fn tokenize_intra_block(
     pixels: &[i32; 64],
     dequant: DequantContext,
-    dc_node_probs: &[u8; crate::tokens::NUM_TREE_NODES],
-    ac_probs: &crate::block_decode::AcProbBank,
-    zrl_probs: &crate::block_decode::ZeroRunProbBank,
     dc_pred: &mut DcPredictionContext,
     left_dc: Option<i32>,
     above_dc: Option<i32>,
-) -> i32 {
+) -> ([i32; 64], i32) {
     // §16-dual forward DCT (raster order in, raster order out).
     let mut raster = [0i32; 64];
     fdct_block(pixels, &mut raster);
@@ -200,9 +196,142 @@ fn encode_intra_block(
     // The DC token carries the prediction *delta*; AC carries the
     // quantised coefficients directly.
     scan[0] = dc_delta;
-    encode_block_coefficients(enc, plane, dc_node_probs, ac_probs, zrl_probs, &scan);
+    (scan, coded_dc)
+}
 
-    coded_dc
+/// One tokenized block, ready for emission by whichever §5/§6 coder the
+/// frame shape selects: the Table 28 plane, the §13.2 Table 26 DC
+/// context (arithmetic emission only — Huffman ignores it), and the
+/// scan-order values with the §14 DC delta at position 0.
+pub(crate) struct TokenizedBlock {
+    pub plane: AcPlane,
+    pub dc_context: crate::tokens::DcContext,
+    pub scan: [i32; 64],
+}
+
+/// Walk the frame in decode order (§13 page 58: four luma raster
+/// blocks, then U, then V per macroblock) and tokenize every block —
+/// the coder-independent front half of the intra encoder. The §14 DC
+/// prediction contexts and per-plane coded-DC grids are threaded
+/// exactly as the decoder threads them, so the recorded
+/// [`TokenizedBlock::dc_context`] matches what the decoder derives.
+fn tokenize_intra_frame(frame: &Frame, dequant: DequantContext) -> Vec<TokenizedBlock> {
+    let h_fragments = frame.h_fragments;
+    let v_fragments = frame.v_fragments;
+    let mb_cols = frame.mb_cols();
+    let mb_rows = frame.mb_rows();
+
+    let mut y_grid = PlaneDcGrid::new(h_fragments, v_fragments);
+    let mut u_grid = PlaneDcGrid::new(mb_cols, mb_rows);
+    let mut v_grid = PlaneDcGrid::new(mb_cols, mb_rows);
+    let mut y_dc_pred = DcPredictionContext::new();
+    let mut u_dc_pred = DcPredictionContext::new();
+    let mut v_dc_pred = DcPredictionContext::new();
+
+    const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
+
+    let y_w = frame.y.width();
+    let u_w = frame.u.width();
+    let v_w = frame.v.width();
+
+    let mut blocks = Vec::with_capacity(mb_rows * mb_cols * 6);
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            // --- four luma blocks ---
+            for &(dr, dc) in LUMA_OFFSETS.iter() {
+                let br = mb_row * 2 + dr;
+                let bc_col = mb_col * 2 + dc;
+                if br >= v_fragments || bc_col >= h_fragments {
+                    continue;
+                }
+                let pixels = extract_levelshifted_block(frame.y.samples(), y_w, br * 8, bc_col * 8);
+                let dc_context = crate::tokens::DcContext::from_neighbours(
+                    y_grid.left(br, bc_col).is_some_and(|d| d != 0),
+                    y_grid.above(br, bc_col).is_some_and(|d| d != 0),
+                );
+                let (scan, coded_dc) = tokenize_intra_block(
+                    &pixels,
+                    dequant,
+                    &mut y_dc_pred,
+                    y_grid.left(br, bc_col),
+                    y_grid.above(br, bc_col),
+                );
+                y_grid.set(br, bc_col, coded_dc);
+                blocks.push(TokenizedBlock {
+                    plane: AcPlane::Y,
+                    dc_context,
+                    scan,
+                });
+            }
+
+            // --- U chroma block ---
+            let u_pixels =
+                extract_levelshifted_block(frame.u.samples(), u_w, mb_row * 8, mb_col * 8);
+            let u_dc_context = crate::tokens::DcContext::from_neighbours(
+                u_grid.left(mb_row, mb_col).is_some_and(|d| d != 0),
+                u_grid.above(mb_row, mb_col).is_some_and(|d| d != 0),
+            );
+            let (u_scan, u_coded_dc) = tokenize_intra_block(
+                &u_pixels,
+                dequant,
+                &mut u_dc_pred,
+                u_grid.left(mb_row, mb_col),
+                u_grid.above(mb_row, mb_col),
+            );
+            u_grid.set(mb_row, mb_col, u_coded_dc);
+            blocks.push(TokenizedBlock {
+                plane: AcPlane::UV,
+                dc_context: u_dc_context,
+                scan: u_scan,
+            });
+
+            // --- V chroma block ---
+            let v_pixels =
+                extract_levelshifted_block(frame.v.samples(), v_w, mb_row * 8, mb_col * 8);
+            let v_dc_context = crate::tokens::DcContext::from_neighbours(
+                v_grid.left(mb_row, mb_col).is_some_and(|d| d != 0),
+                v_grid.above(mb_row, mb_col).is_some_and(|d| d != 0),
+            );
+            let (v_scan, v_coded_dc) = tokenize_intra_block(
+                &v_pixels,
+                dequant,
+                &mut v_dc_pred,
+                v_grid.left(mb_row, mb_col),
+                v_grid.above(mb_row, mb_col),
+            );
+            v_grid.set(mb_row, mb_col, v_coded_dc);
+            blocks.push(TokenizedBlock {
+                plane: AcPlane::UV,
+                dc_context: v_dc_context,
+                scan: v_scan,
+            });
+        }
+    }
+    blocks
+}
+
+/// Emit an already-tokenized block sequence as §13 arithmetic tokens
+/// into `enc`, selecting each block's DC row from its recorded Table 26
+/// context — the emission back half shared by the single-stream and
+/// MultiStream-BoolCoder intra encoders.
+fn emit_blocks_arithmetic(
+    enc: &mut BoolEncoder,
+    blocks: &[TokenizedBlock],
+    probs: &crate::intra_frame::IntraProbs,
+) {
+    for tb in blocks {
+        let dc_node_probs = tb
+            .dc_context
+            .select_row(&probs.dc_contexts[tb.plane.index()]);
+        encode_block_coefficients(
+            enc,
+            tb.plane,
+            dc_node_probs,
+            &probs.ac_probs,
+            &probs.zrl_probs,
+            &tb.scan,
+        );
+    }
 }
 
 /// Encode a full intra (I-)frame from a source [`Frame`] into a VP6
@@ -267,17 +396,12 @@ pub fn encode_intra_frame_with_banks(
     }
 
     let dct_q_mask = dct_q_mask & 0x3F;
-    let mb_cols = frame.mb_cols();
-    let mb_rows = frame.mb_rows();
     let dequant = DequantContext::new(dct_q_mask);
 
     // The §13 banks the coefficient tokens are coded against. These match
     // exactly what the decoder reconstructs by applying the Figure-5
     // updates emitted below to its keyframe baselines.
     let intra_probs = banks.to_intra_probs();
-    let dc_contexts = intra_probs.dc_contexts;
-    let ac_probs = intra_probs.ac_probs;
-    let zrl_probs = intra_probs.zrl_probs;
 
     // --- §9 raw-bit header prefix (byte-aligned) ---
     // Table 1 byte: FrameType(1)=0, DctQMask(6), MultiStream(1)=0.
@@ -322,103 +446,96 @@ pub fn encode_intra_frame_with_banks(
     // baselines and applies these updates to recover the identical bank.
     crate::coeff_prob_update::encode_coefficient_prob_updates_full(&mut enc, banks);
 
-    // Per-plane coded-DC grids + §14 prediction contexts, mirroring the
-    // decoder exactly.
-    let mut y_grid = PlaneDcGrid::new(h_fragments, v_fragments);
-    let mut u_grid = PlaneDcGrid::new(mb_cols, mb_rows);
-    let mut v_grid = PlaneDcGrid::new(mb_cols, mb_rows);
-    let mut y_dc_pred = DcPredictionContext::new();
-    let mut u_dc_pred = DcPredictionContext::new();
-    let mut v_dc_pred = DcPredictionContext::new();
-
-    const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
-
-    let y_w = frame.y.width();
-    let u_w = frame.u.width();
-    let v_w = frame.v.width();
-    let dc_y = &dc_contexts[AcPlane::Y.index()];
-    let dc_uv = &dc_contexts[AcPlane::UV.index()];
-
-    for mb_row in 0..mb_rows {
-        for mb_col in 0..mb_cols {
-            // --- four luma blocks ---
-            for &(dr, dc) in LUMA_OFFSETS.iter() {
-                let br = mb_row * 2 + dr;
-                let bc_col = mb_col * 2 + dc;
-                if br >= v_fragments || bc_col >= h_fragments {
-                    continue;
-                }
-                let pixels = extract_levelshifted_block(frame.y.samples(), y_w, br * 8, bc_col * 8);
-                // §13.2 Table 26 DC context selects the node-prob row.
-                let dc_node_probs = crate::tokens::DcContext::from_neighbours(
-                    y_grid.left(br, bc_col).is_some_and(|d| d != 0),
-                    y_grid.above(br, bc_col).is_some_and(|d| d != 0),
-                )
-                .select_row(dc_y);
-                let coded_dc = encode_intra_block(
-                    &mut enc,
-                    AcPlane::Y,
-                    &pixels,
-                    dequant,
-                    dc_node_probs,
-                    &ac_probs,
-                    &zrl_probs,
-                    &mut y_dc_pred,
-                    y_grid.left(br, bc_col),
-                    y_grid.above(br, bc_col),
-                );
-                y_grid.set(br, bc_col, coded_dc);
-            }
-
-            // --- U chroma block ---
-            let u_pixels =
-                extract_levelshifted_block(frame.u.samples(), u_w, mb_row * 8, mb_col * 8);
-            let u_dc_node_probs = crate::tokens::DcContext::from_neighbours(
-                u_grid.left(mb_row, mb_col).is_some_and(|d| d != 0),
-                u_grid.above(mb_row, mb_col).is_some_and(|d| d != 0),
-            )
-            .select_row(dc_uv);
-            let u_coded_dc = encode_intra_block(
-                &mut enc,
-                AcPlane::UV,
-                &u_pixels,
-                dequant,
-                u_dc_node_probs,
-                &ac_probs,
-                &zrl_probs,
-                &mut u_dc_pred,
-                u_grid.left(mb_row, mb_col),
-                u_grid.above(mb_row, mb_col),
-            );
-            u_grid.set(mb_row, mb_col, u_coded_dc);
-
-            // --- V chroma block ---
-            let v_pixels =
-                extract_levelshifted_block(frame.v.samples(), v_w, mb_row * 8, mb_col * 8);
-            let v_dc_node_probs = crate::tokens::DcContext::from_neighbours(
-                v_grid.left(mb_row, mb_col).is_some_and(|d| d != 0),
-                v_grid.above(mb_row, mb_col).is_some_and(|d| d != 0),
-            )
-            .select_row(dc_uv);
-            let v_coded_dc = encode_intra_block(
-                &mut enc,
-                AcPlane::UV,
-                &v_pixels,
-                dequant,
-                v_dc_node_probs,
-                &ac_probs,
-                &zrl_probs,
-                &mut v_dc_pred,
-                v_grid.left(mb_row, mb_col),
-                v_grid.above(mb_row, mb_col),
-            );
-            v_grid.set(mb_row, mb_col, v_coded_dc);
-        }
-    }
+    // Tokenize the frame (coder-independent front half), then emit the
+    // §13 arithmetic tokens into the same partition-1 coder
+    // (single-stream: coefficients interleave nothing on an I-frame, so
+    // this is simply "all blocks after the Figure-5 pass").
+    let blocks = tokenize_intra_frame(frame, dequant);
+    emit_blocks_arithmetic(&mut enc, &blocks, &intra_probs);
 
     // Assemble: raw prefix then the BoolCoder partition.
     let mut out = raw_prefix;
     out.extend_from_slice(&enc.finish());
+    Ok(out)
+}
+
+/// Encode a keyframe as a **two-partition** (`MultiStream == 1`) packet
+/// (§6): partition 1 carries the §9 header tail + the §8 Figure-5
+/// (no-update) pass, partition 2 the §13 DCT tokens — BoolCoder-coded
+/// when `use_huffman` is `false`, raw-bit Huffman-coded (§7.2 /
+/// §13.2.2 / §13.3.2) when `true`. The raw prefix's `Buff2Offset`
+/// points at partition 2 (byte offset from the start of the packet, §9
+/// Table 2).
+///
+/// Same Simple/VP6.0 shape and keyframe-baseline banks as
+/// [`encode_intra_frame`]; the decoded pixels are bit-identical to the
+/// single-stream encoding at the same quantiser (the §5/§6 partition
+/// arrangement changes only the entropy transport, never the decoded
+/// coefficients).
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] for an over-large frame geometry (the §9
+/// `b(8)` per-axis fragment cap) or a partition-1 length that overflows
+/// the 16-bit `Buff2Offset` field.
+pub fn encode_intra_frame_multistream(
+    frame: &Frame,
+    dct_q_mask: u8,
+    use_huffman: bool,
+) -> Result<Vec<u8>, Error> {
+    let h_fragments = frame.h_fragments;
+    let v_fragments = frame.v_fragments;
+    if h_fragments > u8::MAX as usize || v_fragments > u8::MAX as usize {
+        return Err(Error::NotImplemented);
+    }
+
+    let dct_q_mask = dct_q_mask & 0x3F;
+    let dequant = DequantContext::new(dct_q_mask);
+    let banks = CoeffProbBanks::keyframe();
+    let intra_probs = banks.to_intra_probs();
+
+    // --- Partition 1: §9 tail + §8 Figure-5 (no-update) pass ---
+    let mut p1 = BoolEncoder::new();
+    p1.encode_b(v_fragments as u32, 8);
+    p1.encode_b(h_fragments as u32, 8);
+    p1.encode_b(v_fragments as u32, 8); // OutputVFragments = coded
+    p1.encode_b(h_fragments as u32, 8); // OutputHFragments = coded
+    p1.encode_b(0, 2); // ScalingMode = MAINTAIN_ASPECT_RATIO
+    p1.encode_b1(u8::from(use_huffman)); // UseHuffman
+    crate::coeff_prob_update::encode_coefficient_prob_updates(&mut p1);
+    let p1_bytes = p1.finish();
+
+    // --- Partition 2: the §13 tokens under the selected coder ---
+    let blocks = tokenize_intra_frame(frame, dequant);
+    let p2_bytes = if use_huffman {
+        let tables = crate::huff_coeff::HuffmanCoeffTables::from_banks(&banks);
+        let pairs: Vec<(AcPlane, [i32; 64])> =
+            blocks.iter().map(|tb| (tb.plane, tb.scan)).collect();
+        let mut w = oxideav_core::bits::BitWriter::new();
+        crate::huff_coeff::encode_frame_blocks_huffman(&mut w, &tables, &pairs);
+        w.finish()
+    } else {
+        let mut p2 = BoolEncoder::new();
+        emit_blocks_arithmetic(&mut p2, &blocks, &intra_probs);
+        p2.finish()
+    };
+
+    // --- §9 raw prefix with MultiStream = 1 + the real Buff2Offset ---
+    // The raw prefix is 4 bytes (Table 1 byte, Table 2 byte, 16-bit
+    // Buff2Offset); partition 2 starts right after partition 1.
+    let buff2_offset = 4usize + p1_bytes.len();
+    let buff2_offset = u16::try_from(buff2_offset).map_err(|_| Error::NotImplemented)?;
+    let mut header = oxideav_core::bits::BitWriter::with_capacity(8);
+    header.write_u32(0, 1); // FrameType = 0 (keyframe)
+    header.write_u32(dct_q_mask as u32, 6);
+    header.write_u32(1, 1); // MultiStream = 1
+    header.write_u32(6, 5); // Vp3VersionNo = 6 (VP6.0)
+    header.write_u32(0, 2); // VpProfile = 0 (Simple)
+    header.write_u32(0, 1); // Reserved
+    header.write_u32(buff2_offset as u32, 16); // Buff2Offset
+    let mut out = header.finish();
+    out.extend_from_slice(&p1_bytes);
+    out.extend_from_slice(&p2_bytes);
     Ok(out)
 }
 

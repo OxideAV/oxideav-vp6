@@ -73,10 +73,12 @@
 
 use crate::bool_coder::BoolCoder;
 use crate::coeff_prob_update::{decode_coefficient_prob_updates, CoeffProbBanks};
+use crate::coeff_source::CoeffSource;
 use crate::frame_assembly::Frame;
 use crate::frame_header::{CodingProfile, Vp3Version, Vp6FrameHeader, Vp6HeaderTail};
+use crate::huff_coeff::HuffmanCoeffTables;
 use crate::inter_frame::{decode_inter_frame_with_refs, FilterConfig, InterProbs, ReferenceFrames};
-use crate::intra_frame::decode_intra_frame;
+use crate::intra_frame::decode_intra_frame_from_source;
 use crate::Error;
 
 /// A stateful VP6 frame decoder: feed it whole compressed frames in
@@ -129,20 +131,34 @@ impl Vp6Decoder {
         // (`MultiStream || SIMPLE_PROFILE`) is evaluated correctly.
         let header = Vp6FrameHeader::parse_with_profile(bytes, self.profile)?;
 
-        // The §9 BoolCoder tail + the data partition begin immediately
-        // after the byte-aligned raw prefix (MultiStream == 0; the
-        // single-partition arrangement).
-        if header.multi_stream {
-            // Two-partition (MultiStream) sequencing needs the
-            // Buff2Offset split + a conformant fixture to validate.
-            return Err(Error::NotImplemented);
-        }
-        let tail_bytes = bytes.get(header.raw_prefix_len..).ok_or(Error::Truncated)?;
+        // §6: partition 1 (the §9 BoolCoder tail + mode/MV data) begins
+        // immediately after the byte-aligned raw prefix. With
+        // `MultiStream == 1` the §13 DCT tokens live in partition 2 at
+        // `Buff2Offset` (a byte offset from the start of the compressed
+        // frame buffer); with a single partition everything follows in
+        // partition 1 and any transmitted `Buff2Offset` is inert.
+        let (tail_bytes, partition2) = if header.multi_stream {
+            let off = header.buff2_offset.ok_or(Error::Truncated)? as usize;
+            if off <= header.raw_prefix_len || off > bytes.len() {
+                return Err(Error::Truncated);
+            }
+            (
+                bytes
+                    .get(header.raw_prefix_len..off)
+                    .ok_or(Error::Truncated)?,
+                Some(bytes.get(off..).ok_or(Error::Truncated)?),
+            )
+        } else {
+            (
+                bytes.get(header.raw_prefix_len..).ok_or(Error::Truncated)?,
+                None,
+            )
+        };
 
         if header.is_keyframe {
-            self.decode_keyframe(&header, tail_bytes)
+            self.decode_keyframe(&header, tail_bytes, partition2)
         } else {
-            self.decode_interframe(&header, tail_bytes)
+            self.decode_interframe(&header, tail_bytes, partition2)
         }
     }
 
@@ -173,6 +189,7 @@ impl Vp6Decoder {
         &mut self,
         header: &Vp6FrameHeader,
         tail_bytes: &[u8],
+        partition2: Option<&[u8]>,
     ) -> Result<Frame, Error> {
         // Profile / version are transmitted on the keyframe (Table 2).
         let profile = header.profile.ok_or(Error::Truncated)?;
@@ -181,10 +198,9 @@ impl Vp6Decoder {
         let mut bc = BoolCoder::new(tail_bytes)?;
         let tail = Vp6HeaderTail::parse_with(&mut bc, true, profile, version)?;
 
-        // A header signalling UseHuffman uses the §7 Huffman coder for the
-        // second partition rather than this single-partition BoolCoder
-        // coefficient dispatch.
-        if tail.use_huffman {
+        // §5/§6: the Huffman coder only exists as a second-partition
+        // transport; UseHuffman with a single partition is inconsistent.
+        if tail.use_huffman && partition2.is_none() {
             return Err(Error::NotImplemented);
         }
 
@@ -197,18 +213,55 @@ impl Vp6Decoder {
         // (§10: I-frame MBs are implicitly intra, no mode signaling). The
         // banks are reset to the §13 keyframe baselines, then the
         // (typically empty) Figure-5 updates apply on top. The pass also
-        // yields the active §12.2 scan order.
+        // yields the active §12.2 scan order. The pass always rides
+        // partition 1's coder (Figures 2/3/4 all open with it; in the
+        // Huffman arrangement partition 2 is raw bits and cannot carry
+        // BoolCoder-coded updates).
         let mut banks = CoeffProbBanks::keyframe();
         let scan = decode_coefficient_prob_updates(&mut bc, &mut banks)?;
         let probs = banks.to_intra_probs();
-        let frame = decode_intra_frame(
-            &mut bc,
-            h_fragments,
-            v_fragments,
-            header.dct_q_mask,
-            &probs,
-            &scan,
-        )?;
+
+        // §6 coefficient transport dispatch: single-stream reads the
+        // tokens from the same partition-1 coder; MultiStream builds a
+        // second source over partition 2 (BoolCoder or §7.2 Huffman per
+        // UseHuffman).
+        let frame = match partition2 {
+            None => {
+                let mut src = CoeffSource::Bool(&mut bc);
+                decode_intra_frame_from_source(
+                    &mut src,
+                    h_fragments,
+                    v_fragments,
+                    header.dct_q_mask,
+                    &probs,
+                    &scan,
+                )?
+            }
+            Some(p2) if tail.use_huffman => {
+                let tables = HuffmanCoeffTables::from_banks(&banks);
+                let mut src = CoeffSource::huffman(p2, &tables);
+                decode_intra_frame_from_source(
+                    &mut src,
+                    h_fragments,
+                    v_fragments,
+                    header.dct_q_mask,
+                    &probs,
+                    &scan,
+                )?
+            }
+            Some(p2) => {
+                let mut bc2 = BoolCoder::new(p2)?;
+                let mut src = CoeffSource::Bool(&mut bc2);
+                decode_intra_frame_from_source(
+                    &mut src,
+                    h_fragments,
+                    v_fragments,
+                    header.dct_q_mask,
+                    &probs,
+                    &scan,
+                )?
+            }
+        };
 
         // §4: a keyframe (re)seeds the previous-frame buffer and the
         // Golden Frame. Carry the profile/version for the following
@@ -224,12 +277,19 @@ impl Vp6Decoder {
         &mut self,
         header: &Vp6FrameHeader,
         tail_bytes: &[u8],
+        partition2: Option<&[u8]>,
     ) -> Result<Frame, Error> {
         // Table 3 omits profile/version — inherit the most-recent
         // keyframe's. No keyframe yet ⇒ nothing to predict from.
         let profile = self.profile.ok_or(Error::NotImplemented)?;
         let version = self.version.ok_or(Error::NotImplemented)?;
         let refs = self.refs.as_ref().ok_or(Error::NotImplemented)?;
+
+        // Two-partition inter frames are sequenced in a follow-up (the
+        // per-MB prediction/coefficient split of Figures 3/4).
+        if partition2.is_some() {
+            return Err(Error::NotImplemented);
+        }
 
         let mut bc = BoolCoder::new(tail_bytes)?;
         let tail = Vp6HeaderTail::parse_with(&mut bc, false, profile, version)?;
@@ -613,6 +673,112 @@ mod tests {
             "ME P-frame luma PSNR {y:.2} dB below floor through decode_packet"
         );
         assert_eq!(pf_out.y.width(), 48);
+    }
+
+    /// A two-partition (`MultiStream == 1`) BoolCoder keyframe decodes
+    /// through `decode_packet` to pixels **bit-identical** to the
+    /// single-stream encoding at the same quantiser: the §6 partition
+    /// arrangement changes only the entropy transport.
+    #[test]
+    fn multistream_bool_keyframe_round_trips() {
+        use crate::intra_encode::encode_intra_frame_multistream;
+
+        let src = pattern_frame(4, 4);
+        let q = 48;
+
+        let ms_bytes = encode_intra_frame_multistream(&src, q, false).expect("encode ms");
+        let hdr = crate::frame_header::Vp6FrameHeader::parse(&ms_bytes).expect("header");
+        assert!(hdr.is_keyframe);
+        assert!(hdr.multi_stream);
+        let off = hdr.buff2_offset.expect("Buff2Offset present") as usize;
+        assert!(off > hdr.raw_prefix_len && off < ms_bytes.len());
+
+        let mut dec = Vp6Decoder::new();
+        let ms_out = dec.decode_packet(&ms_bytes).expect("decode ms");
+        assert!(dec.has_reference(), "multistream keyframe must seed refs");
+
+        let ss_bytes = encode_intra_frame(&src, q).expect("encode ss");
+        let mut dec2 = Vp6Decoder::new();
+        let ss_out = dec2.decode_packet(&ss_bytes).expect("decode ss");
+        assert_eq!(ms_out.y.samples(), ss_out.y.samples());
+        assert_eq!(ms_out.u.samples(), ss_out.u.samples());
+        assert_eq!(ms_out.v.samples(), ss_out.v.samples());
+    }
+
+    /// A two-partition **Huffman** keyframe (`UseHuffman == 1`) decodes
+    /// through `decode_packet` to the same pixels as the single-stream
+    /// arithmetic encoding — the §7.2/§13.2.2/§13.3.2 raw-bit coefficient
+    /// transport carries identical coefficients.
+    #[test]
+    fn multistream_huffman_keyframe_round_trips() {
+        use crate::intra_encode::encode_intra_frame_multistream;
+
+        let src = pattern_frame(4, 4);
+        let q = 48;
+
+        let huff_bytes = encode_intra_frame_multistream(&src, q, true).expect("encode huff");
+        let mut dec = Vp6Decoder::new();
+        let huff_out = dec.decode_packet(&huff_bytes).expect("decode huff");
+
+        let ss_bytes = encode_intra_frame(&src, q).expect("encode ss");
+        let mut dec2 = Vp6Decoder::new();
+        let ss_out = dec2.decode_packet(&ss_bytes).expect("decode ss");
+        assert_eq!(huff_out.y.samples(), ss_out.y.samples());
+        assert_eq!(huff_out.u.samples(), ss_out.u.samples());
+        assert_eq!(huff_out.v.samples(), ss_out.v.samples());
+    }
+
+    /// A multistream keyframe seeds the §4 refs + profile/version, so a
+    /// following single-stream P-frame decodes against it — the carried
+    /// state is partition-arrangement-agnostic.
+    #[test]
+    fn multistream_keyframe_then_pframe_gop() {
+        use crate::intra_encode::encode_intra_frame_multistream;
+
+        let src = pattern_frame(4, 4);
+        let q = 40;
+        let mut dec = Vp6Decoder::new();
+        let kf_out = dec
+            .decode_packet(&encode_intra_frame_multistream(&src, q, true).expect("encode I"))
+            .expect("decode I");
+
+        let probs = InterProbs::keyframe();
+        let filter = simple_inter_filter();
+        let pf_bytes =
+            encode_inter_frame_packet(&kf_out, &BorderedRef::new(&kf_out), q, &probs, &filter)
+                .expect("encode P");
+        let pf_out = dec.decode_packet(&pf_bytes).expect("decode P");
+        assert_eq!(pf_out.y.samples(), kf_out.y.samples());
+    }
+
+    /// A multistream keyframe whose Buff2Offset points outside the packet
+    /// (or into the raw prefix) surfaces `Truncated`, not a panic.
+    #[test]
+    fn multistream_bad_buff2offset_errors() {
+        use crate::intra_encode::encode_intra_frame_multistream;
+
+        let src = flat_frame(2, 2, 90);
+        let good = encode_intra_frame_multistream(&src, 32, false).expect("encode");
+
+        // Corrupt the 16-bit Buff2Offset (bytes 2..4 of the intra raw
+        // prefix) to point past the packet end.
+        let mut past_end = good.clone();
+        past_end[2] = 0xFF;
+        past_end[3] = 0xFF;
+        let mut dec = Vp6Decoder::new();
+        assert!(matches!(
+            dec.decode_packet(&past_end),
+            Err(Error::Truncated)
+        ));
+
+        // ...and to point inside the raw prefix itself.
+        let mut inside_prefix = good;
+        inside_prefix[2] = 0;
+        inside_prefix[3] = 2;
+        assert!(matches!(
+            dec.decode_packet(&inside_prefix),
+            Err(Error::Truncated)
+        ));
     }
 
     /// An inter frame before any keyframe has no reference / profile —

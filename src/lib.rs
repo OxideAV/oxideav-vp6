@@ -841,6 +841,7 @@ use oxideav_core::RuntimeContext;
 pub mod block_decode;
 pub mod bool_coder;
 pub mod coeff_prob_update;
+pub mod coeff_source;
 pub mod dc_pred;
 pub mod dct_decode;
 pub mod decode_frame;

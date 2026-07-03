@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 384, 2026-07-03)
 
+- **MultiStream (§6) two-partition keyframes — decode + encode, BoolCoder
+  and Huffman.** `coeff_source::CoeffSource` abstracts the three §5/§6
+  coefficient transports (single-stream partition-1 BoolCoder /
+  partition-2 BoolCoder at `Buff2Offset` / partition-2 §7.2 raw-bit
+  Huffman) behind one `decode_block`, and
+  `intra_frame::decode_intra_frame_from_source` is the §6-general form of
+  the keyframe driver (the §8 Figure-5 pass always rides partition 1 —
+  in the Huffman arrangement partition 2 is raw bits and cannot carry
+  BoolCoder-coded updates). `Vp6Decoder::decode_packet` now splits the
+  packet at `Buff2Offset` and dispatches on `MultiStream`/`UseHuffman`;
+  `intra_encode::encode_intra_frame_multistream` emits the two-partition
+  packet (partition 1: tail + no-update Figure 5; partition 2: arithmetic
+  tokens via the new tokenize/emit split, or `huff_coeff` raw-bit
+  tokens), with the intra encoder's walk refactored into a
+  coder-independent `tokenize_intra_frame` front half. Tests pin: the
+  MultiStream-BoolCoder and MultiStream-Huffman keyframes decode
+  bit-identical to the single-stream encoding at the same quantiser, a
+  Huffman keyframe seeds a GOP whose P-frame decodes against it, and a
+  corrupted `Buff2Offset` (past-end / inside-prefix) errors cleanly.
+
 - **`huff_coeff` — the §13 Huffman coefficient coder, decode + encode.**
   When `UseHuffman == 1` the second partition codes DCT tokens as raw
   bits (§7.2) over trees derived from the same §13 probability banks the

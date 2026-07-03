@@ -43,7 +43,8 @@
 //! clean-room errata at `docs/video/vp6/vp6-errata-and-clarifications.md`.
 //! No external library code was consulted.
 
-use crate::block_decode::{decode_block_coefficients, AcProbBank, ZeroRunProbBank, BLOCK_SIZE};
+use crate::block_decode::{AcProbBank, ZeroRunProbBank, BLOCK_SIZE};
+use crate::coeff_source::CoeffSource;
 use crate::dc_pred::{DcPredictionContext, Neighbour, ReferenceBucket};
 use crate::dequant::DequantContext;
 use crate::frame_assembly::Frame;
@@ -147,15 +148,16 @@ impl IntraProbs {
     }
 }
 
-/// Decode one block: entropy-decode its coefficients, apply §14 DC
-/// prediction, §15 dequantize, §16 IDCT, §17.1 reconstruct, returning
-/// the 8x8 pixel block plus the coded DC for the caller's grid update.
+/// Decode one block: entropy-decode its coefficients (from whichever
+/// §6 partition/coder `src` wraps), apply §14 DC prediction, §15
+/// dequantize, §16 IDCT, §17.1 reconstruct, returning the 8x8 pixel
+/// block plus the coded DC for the caller's grid update.
 ///
 /// Returns `(pixels, coded_dc)` where `coded_dc` is the reconstructed
 /// **coded** (pre-dequant) DC the §14/§13.2 neighbour grids store.
 #[allow(clippy::too_many_arguments)]
 fn decode_intra_block(
-    bc: &mut crate::bool_coder::BoolCoder<'_>,
+    src: &mut CoeffSource<'_, '_>,
     plane: AcPlane,
     probs: &IntraProbs,
     dequant: DequantContext,
@@ -170,12 +172,11 @@ fn decode_intra_block(
         left_dc.is_some_and(|d| d != 0),
         above_dc.is_some_and(|d| d != 0),
     );
-    let dc_node_probs = dc_context.select_row(&probs.dc_contexts[plane.index()]);
 
-    // Entropy decode: §13.2.1 DC delta + §13.3.1 AC loop. coeffs are in
-    // scan order; coeffs[0] is the DC *prediction error* (delta).
-    let block =
-        decode_block_coefficients(bc, plane, dc_node_probs, &probs.ac_probs, &probs.zrl_probs)?;
+    // Entropy decode: §13.2 DC delta + §13.3 AC loop (arithmetic or
+    // Huffman per the frame's §5/§6 shape). coeffs are in scan order;
+    // coeffs[0] is the DC *prediction error* (delta).
+    let block = src.decode_block(plane, dc_context, probs)?;
 
     // §14 DC prediction: reconstructed coded DC = predictor + delta.
     // All intra → every block's reference bucket is Intra.
@@ -238,6 +239,38 @@ pub fn decode_intra_frame(
     probs: &IntraProbs,
     scan_to_raster: &[u8; BLOCK_SIZE],
 ) -> Result<Frame, Error> {
+    let mut src = CoeffSource::Bool(bc);
+    decode_intra_frame_from_source(
+        &mut src,
+        h_fragments,
+        v_fragments,
+        dct_q_mask,
+        probs,
+        scan_to_raster,
+    )
+}
+
+/// Decode a full intra (I-)frame reading its §13 DCT tokens from an
+/// arbitrary [`CoeffSource`] — the §6-general form of
+/// [`decode_intra_frame`].
+///
+/// The three §5/§6 coefficient arrangements all reduce to this walk:
+/// single-stream (tokens in the partition-1 BoolCoder — what
+/// [`decode_intra_frame`] wraps), MultiStream BoolCoder (tokens in a
+/// second coder at `Buff2Offset`), and MultiStream Huffman (raw-bit
+/// tokens in partition 2). An I-frame's partition 1 carries nothing
+/// per-macroblock (no §10 modes, no §11 MVs), so the per-MB walk reads
+/// exclusively from `src`.
+///
+/// Parameters otherwise as [`decode_intra_frame`].
+pub fn decode_intra_frame_from_source(
+    src: &mut CoeffSource<'_, '_>,
+    h_fragments: usize,
+    v_fragments: usize,
+    dct_q_mask: u8,
+    probs: &IntraProbs,
+    scan_to_raster: &[u8; BLOCK_SIZE],
+) -> Result<Frame, Error> {
     let mut frame = Frame::new(h_fragments, v_fragments);
     let mb_cols = frame.mb_cols();
     let mb_rows = frame.mb_rows();
@@ -273,7 +306,7 @@ pub fn decode_intra_frame(
                 let left_dc = y_grid.left(br, bc_col);
                 let above_dc = y_grid.above(br, bc_col);
                 let (pixels, coded_dc) = decode_intra_block(
-                    bc,
+                    src,
                     AcPlane::Y,
                     probs,
                     dequant,
@@ -288,7 +321,7 @@ pub fn decode_intra_frame(
 
             // --- U chroma block ---
             let (u_pixels, u_coded_dc) = decode_intra_block(
-                bc,
+                src,
                 AcPlane::UV,
                 probs,
                 dequant,
@@ -301,7 +334,7 @@ pub fn decode_intra_frame(
 
             // --- V chroma block ---
             let (v_pixels, v_coded_dc) = decode_intra_block(
-                bc,
+                src,
                 AcPlane::UV,
                 probs,
                 dequant,
