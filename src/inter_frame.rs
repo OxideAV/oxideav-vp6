@@ -62,7 +62,8 @@
 //! clean-room errata at `docs/video/vp6/vp6-errata-and-clarifications.md`.
 //! No external library code was consulted.
 
-use crate::block_decode::{decode_block_coefficients, BLOCK_SIZE};
+use crate::block_decode::BLOCK_SIZE;
+use crate::coeff_source::CoeffSource;
 use crate::dc_pred::{DcPredictionContext, Neighbour, ReferenceBucket};
 use crate::dequant::DequantContext;
 use crate::frame_assembly::Frame;
@@ -407,7 +408,7 @@ struct DecodedBlock {
 /// final §17 recombination differs (caller's responsibility).
 #[allow(clippy::too_many_arguments)]
 fn decode_block(
-    bc: &mut crate::bool_coder::BoolCoder<'_>,
+    src: &mut CoeffSource<'_, '_>,
     plane: AcPlane,
     reference: ReferenceBucket,
     probs: &IntraProbs,
@@ -424,10 +425,8 @@ fn decode_block(
         left.is_some_and(|c| c.coded_dc != 0),
         above.is_some_and(|c| c.coded_dc != 0),
     );
-    let dc_node_probs = dc_context.select_row(&probs.dc_contexts[plane.index()]);
 
-    let block =
-        decode_block_coefficients(bc, plane, dc_node_probs, &probs.ac_probs, &probs.zrl_probs)?;
+    let block = src.decode_block(plane, dc_context, probs)?;
 
     // §14 DC prediction: reconstructed coded DC = predictor + delta. The
     // same-reference rule filters out neighbours whose bucket differs.
@@ -503,12 +502,7 @@ pub fn decode_inter_frame(
     let dequant = DequantContext::new(dct_q_mask);
 
     // §14 per-plane DC neighbour grids + prediction contexts.
-    let mut y_grid = PlaneDcGrid::new(h_fragments, v_fragments);
-    let mut u_grid = PlaneDcGrid::new(mb_cols, mb_rows);
-    let mut v_grid = PlaneDcGrid::new(mb_cols, mb_rows);
-    let mut y_dc_pred = DcPredictionContext::new();
-    let mut u_dc_pred = DcPredictionContext::new();
-    let mut v_dc_pred = DcPredictionContext::new();
+    let mut dc_state = DcState::new(h_fragments, v_fragments, mb_cols, mb_rows);
 
     // §10/§11 MV neighbour grid: one representative NeighbourMv per MB,
     // row-major. A FourMV MB stays `None` (DOCS-GAP, see module docs); an
@@ -516,164 +510,386 @@ pub fn decode_inter_frame(
     // inter neighbour and carries no MV).
     let mut mv_grid: Vec<Option<NeighbourMv>> = vec![None; mb_cols.saturating_mul(mb_rows)];
 
-    const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
-    const LUMA_CORNERS: [(i32, i32); 4] = [(0, 0), (0, 8), (8, 0), (8, 8)];
-
     let mut last_mode = CodingMode::InterNoMv;
 
     for mb_row in 0..mb_rows {
         for mb_col in 0..mb_cols {
             // --- Figure 6: mode, then motion (single-stream order) ---
-            let availability = {
-                // Resolve §10 availability from the MV grid built so far.
-                // A grid lookup returns the representative neighbour MV.
-                let res = resolve_near_mvs(
-                    mb_row as i32,
-                    mb_col as i32,
-                    // Availability is computed per the mode being decoded;
-                    // §10 resolves it against the *previous-frame* bucket
-                    // for the unconditional "is a neighbour present"
-                    // question used to index probXmitted. The walker
-                    // filters on this reference, matching the spec's
-                    // ProbabilitySituation derivation.
-                    ReferenceBucket::InterLast,
-                    |r, c| neighbour_lookup(&mv_grid, mb_cols, mb_rows, r, c),
-                );
-                res.availability
-            };
-            let mode = decode_one_mode(bc, &probs.mode_probs, availability, last_mode)?;
-            last_mode = mode;
-
-            // Resolve the MB's motion state and the representative
-            // neighbour MV it contributes.
-            let (mb_mv, four_mvs, representative) = resolve_motion(
+            let motion = decode_mb_prediction(
                 bc,
-                mode,
+                probs,
+                &mut mv_grid,
+                &mut last_mode,
                 mb_row,
                 mb_col,
-                &probs.mv_probs,
-                &mv_grid,
                 mb_cols,
                 mb_rows,
             )?;
-            mv_grid[mb_row * mb_cols + mb_col] = representative;
-
-            let reference = mode.reference_bucket();
 
             // --- Figure 7: six block coefficients + reconstruction ---
-            let mut luma_pixels = [[128u8; 64]; 4];
-            for (k, &(dr, dc)) in LUMA_OFFSETS.iter().enumerate() {
-                let br = mb_row * 2 + dr;
-                let bc_col = mb_col * 2 + dc;
-                if br >= v_fragments || bc_col >= h_fragments {
-                    continue;
-                }
-                let left = y_grid.left(br, bc_col);
-                let above = y_grid.above(br, bc_col);
-                let decoded = decode_block(
-                    bc,
-                    AcPlane::Y,
-                    reference,
-                    &probs.coeffs,
-                    &mut y_dc_pred,
-                    left,
-                    above,
-                )?;
-                y_grid.set(
-                    br,
-                    bc_col,
-                    DcCell {
-                        coded_dc: decoded.coded_dc,
-                        reference,
-                    },
-                );
-                let residual = residual_of(&decoded.scan_coeffs, scan_to_raster, dequant);
-                luma_pixels[k] = reconstruct_luma_block(
-                    mode,
-                    reference,
-                    mb_mv,
-                    four_mvs.as_ref().map(|m| m[k]),
-                    LUMA_CORNERS[k],
-                    mb_row,
-                    mb_col,
-                    &residual,
-                    filter,
-                    prev,
-                    golden,
-                );
-            }
-
-            // --- U then V chroma blocks ---
-            let chroma_mv = chroma_motion(mode, mb_mv, four_mvs.as_ref());
-            let u_decoded = decode_block(
-                bc,
-                AcPlane::UV,
-                reference,
+            // Single-stream: the tokens follow in the same partition-1
+            // coder, so wrap `bc` per-MB.
+            let mut src = CoeffSource::Bool(bc);
+            decode_mb_blocks(
+                &mut src,
+                &motion,
+                mb_row,
+                mb_col,
+                h_fragments,
+                v_fragments,
                 &probs.coeffs,
-                &mut u_dc_pred,
-                u_grid.left(mb_row, mb_col),
-                u_grid.above(mb_row, mb_col),
-            )?;
-            u_grid.set(
-                mb_row,
-                mb_col,
-                DcCell {
-                    coded_dc: u_decoded.coded_dc,
-                    reference,
-                },
-            );
-            let u_residual = residual_of(&u_decoded.scan_coeffs, scan_to_raster, dequant);
-            let u_pixels = reconstruct_chroma_block(
-                mode,
-                reference,
-                chroma_mv,
-                mb_row,
-                mb_col,
-                &u_residual,
+                scan_to_raster,
+                dequant,
                 filter,
                 prev,
                 golden,
-                ChromaPlane::U,
-            );
-
-            let v_decoded = decode_block(
-                bc,
-                AcPlane::UV,
-                reference,
-                &probs.coeffs,
-                &mut v_dc_pred,
-                v_grid.left(mb_row, mb_col),
-                v_grid.above(mb_row, mb_col),
+                &mut dc_state,
+                &mut frame,
             )?;
-            v_grid.set(
-                mb_row,
-                mb_col,
-                DcCell {
-                    coded_dc: v_decoded.coded_dc,
-                    reference,
-                },
-            );
-            let v_residual = residual_of(&v_decoded.scan_coeffs, scan_to_raster, dequant);
-            let v_pixels = reconstruct_chroma_block(
-                mode,
-                reference,
-                chroma_mv,
-                mb_row,
-                mb_col,
-                &v_residual,
-                filter,
-                prev,
-                golden,
-                ChromaPlane::V,
-            );
-
-            frame
-                .place_macroblock(mb_row, mb_col, &luma_pixels, &u_pixels, &v_pixels)
-                .map_err(|_| Error::Truncated)?;
         }
     }
 
     Ok(frame)
+}
+
+/// Decode a full inter (P-)frame in the **two-partition** (`MultiStream
+/// == 1`) arrangement — the Figure 3 / Figure 4 sequencing: partition 1
+/// carries the per-MB *prediction information* (§10 modes + §11 motion)
+/// for **every** macroblock first, then partition 2 carries every
+/// macroblock's §13 coefficients (BoolCoder or §7.2 Huffman per
+/// `UseHuffman` — whichever [`CoeffSource`] the caller built).
+///
+/// * `bc` — the partition-1 coder, positioned after the §9 tail and the
+///   §10/§11.2/Figure-5 probability-update sub-streams.
+/// * `src` — the partition-2 coefficient source (at `Buff2Offset`).
+///
+/// Other parameters as [`decode_inter_frame`]. The prediction pass
+/// threads the identical §10/§11 `mv_grid` / `last_mode` state the fused
+/// single-stream walk threads; the coefficient pass threads the
+/// identical §14 DC grids — only the *interleaving* differs.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_inter_frame_multistream(
+    bc: &mut crate::bool_coder::BoolCoder<'_>,
+    src: &mut CoeffSource<'_, '_>,
+    h_fragments: usize,
+    v_fragments: usize,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    scan_to_raster: &[u8; BLOCK_SIZE],
+    filter: &FilterConfig,
+    prev: &BorderedRef,
+    golden: &BorderedRef,
+) -> Result<Frame, Error> {
+    let mut frame = Frame::new(h_fragments, v_fragments);
+    let mb_cols = frame.mb_cols();
+    let mb_rows = frame.mb_rows();
+    let dequant = DequantContext::new(dct_q_mask);
+
+    // --- Pass 1 (Figure 3/4): every MB's prediction information ---
+    let mut mv_grid: Vec<Option<NeighbourMv>> = vec![None; mb_cols.saturating_mul(mb_rows)];
+    let mut last_mode = CodingMode::InterNoMv;
+    let mut motions: Vec<MbMotion> = Vec::with_capacity(mb_cols * mb_rows);
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            motions.push(decode_mb_prediction(
+                bc,
+                probs,
+                &mut mv_grid,
+                &mut last_mode,
+                mb_row,
+                mb_col,
+                mb_cols,
+                mb_rows,
+            )?);
+        }
+    }
+
+    // --- Pass 2 (Figure 3/4): every MB's coefficients + reconstruction ---
+    let mut dc_state = DcState::new(h_fragments, v_fragments, mb_cols, mb_rows);
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            decode_mb_blocks(
+                src,
+                &motions[mb_row * mb_cols + mb_col],
+                mb_row,
+                mb_col,
+                h_fragments,
+                v_fragments,
+                &probs.coeffs,
+                scan_to_raster,
+                dequant,
+                filter,
+                prev,
+                golden,
+                &mut dc_state,
+                &mut frame,
+            )?;
+        }
+    }
+
+    Ok(frame)
+}
+
+/// Decode a two-partition P-frame against a [`ReferenceFrames`] state
+/// holder — the MultiStream dual of [`decode_inter_frame_with_refs`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_inter_frame_multistream_with_refs(
+    bc: &mut crate::bool_coder::BoolCoder<'_>,
+    src: &mut CoeffSource<'_, '_>,
+    h_fragments: usize,
+    v_fragments: usize,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    scan_to_raster: &[u8; BLOCK_SIZE],
+    filter: &FilterConfig,
+    refs: &ReferenceFrames,
+) -> Result<Frame, Error> {
+    let (prev, golden) = refs.bordered();
+    decode_inter_frame_multistream(
+        bc,
+        src,
+        h_fragments,
+        v_fragments,
+        dct_q_mask,
+        probs,
+        scan_to_raster,
+        filter,
+        &prev,
+        &golden,
+    )
+}
+
+/// One macroblock's decoded §10/§11 prediction state — the Figure 6
+/// "Next Macroblock Prediction Information" unit.
+struct MbMotion {
+    mode: CodingMode,
+    mb_mv: MotionVector,
+    four_mvs: Option<[MotionVector; 4]>,
+}
+
+/// The §14 per-plane DC neighbour grids + prediction contexts the
+/// coefficient pass threads across macroblocks.
+struct DcState {
+    y_grid: PlaneDcGrid,
+    u_grid: PlaneDcGrid,
+    v_grid: PlaneDcGrid,
+    y_pred: DcPredictionContext,
+    u_pred: DcPredictionContext,
+    v_pred: DcPredictionContext,
+}
+
+impl DcState {
+    fn new(h_fragments: usize, v_fragments: usize, mb_cols: usize, mb_rows: usize) -> Self {
+        Self {
+            y_grid: PlaneDcGrid::new(h_fragments, v_fragments),
+            u_grid: PlaneDcGrid::new(mb_cols, mb_rows),
+            v_grid: PlaneDcGrid::new(mb_cols, mb_rows),
+            y_pred: DcPredictionContext::new(),
+            u_pred: DcPredictionContext::new(),
+            v_pred: DcPredictionContext::new(),
+        }
+    }
+}
+
+/// Decode one MB's §10 mode + §11 motion from the prediction stream,
+/// updating the shared `mv_grid` / `last_mode` walk state — the per-MB
+/// step both the fused single-stream driver and the MultiStream
+/// prediction pass share.
+#[allow(clippy::too_many_arguments)]
+fn decode_mb_prediction(
+    bc: &mut crate::bool_coder::BoolCoder<'_>,
+    probs: &InterProbs,
+    mv_grid: &mut [Option<NeighbourMv>],
+    last_mode: &mut CodingMode,
+    mb_row: usize,
+    mb_col: usize,
+    mb_cols: usize,
+    mb_rows: usize,
+) -> Result<MbMotion, Error> {
+    let availability = {
+        // Resolve §10 availability from the MV grid built so far.
+        // A grid lookup returns the representative neighbour MV.
+        let res = resolve_near_mvs(
+            mb_row as i32,
+            mb_col as i32,
+            // Availability is computed per the mode being decoded;
+            // §10 resolves it against the *previous-frame* bucket
+            // for the unconditional "is a neighbour present"
+            // question used to index probXmitted. The walker
+            // filters on this reference, matching the spec's
+            // ProbabilitySituation derivation.
+            ReferenceBucket::InterLast,
+            |r, c| neighbour_lookup(mv_grid, mb_cols, mb_rows, r, c),
+        );
+        res.availability
+    };
+    let mode = decode_one_mode(bc, &probs.mode_probs, availability, *last_mode)?;
+    *last_mode = mode;
+
+    // Resolve the MB's motion state and the representative neighbour MV
+    // it contributes.
+    let (mb_mv, four_mvs, representative) = resolve_motion(
+        bc,
+        mode,
+        mb_row,
+        mb_col,
+        &probs.mv_probs,
+        mv_grid,
+        mb_cols,
+        mb_rows,
+    )?;
+    mv_grid[mb_row * mb_cols + mb_col] = representative;
+
+    Ok(MbMotion {
+        mode,
+        mb_mv,
+        four_mvs,
+    })
+}
+
+/// Decode one MB's six §13 coefficient blocks from `src` and
+/// reconstruct + place its pixels — the Figure 7 unit both drivers
+/// share.
+#[allow(clippy::too_many_arguments)]
+fn decode_mb_blocks(
+    src: &mut CoeffSource<'_, '_>,
+    motion: &MbMotion,
+    mb_row: usize,
+    mb_col: usize,
+    h_fragments: usize,
+    v_fragments: usize,
+    coeff_probs: &IntraProbs,
+    scan_to_raster: &[u8; BLOCK_SIZE],
+    dequant: DequantContext,
+    filter: &FilterConfig,
+    prev: &BorderedRef,
+    golden: &BorderedRef,
+    dc_state: &mut DcState,
+    frame: &mut Frame,
+) -> Result<(), Error> {
+    const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
+    const LUMA_CORNERS: [(i32, i32); 4] = [(0, 0), (0, 8), (8, 0), (8, 8)];
+
+    let MbMotion {
+        mode,
+        mb_mv,
+        four_mvs,
+    } = motion;
+    let mode = *mode;
+    let mb_mv = *mb_mv;
+    let reference = mode.reference_bucket();
+
+    let mut luma_pixels = [[128u8; 64]; 4];
+    for (k, &(dr, dc)) in LUMA_OFFSETS.iter().enumerate() {
+        let br = mb_row * 2 + dr;
+        let bc_col = mb_col * 2 + dc;
+        if br >= v_fragments || bc_col >= h_fragments {
+            continue;
+        }
+        let left = dc_state.y_grid.left(br, bc_col);
+        let above = dc_state.y_grid.above(br, bc_col);
+        let decoded = decode_block(
+            src,
+            AcPlane::Y,
+            reference,
+            coeff_probs,
+            &mut dc_state.y_pred,
+            left,
+            above,
+        )?;
+        dc_state.y_grid.set(
+            br,
+            bc_col,
+            DcCell {
+                coded_dc: decoded.coded_dc,
+                reference,
+            },
+        );
+        let residual = residual_of(&decoded.scan_coeffs, scan_to_raster, dequant);
+        luma_pixels[k] = reconstruct_luma_block(
+            mode,
+            reference,
+            mb_mv,
+            four_mvs.as_ref().map(|m| m[k]),
+            LUMA_CORNERS[k],
+            mb_row,
+            mb_col,
+            &residual,
+            filter,
+            prev,
+            golden,
+        );
+    }
+
+    // --- U then V chroma blocks ---
+    let chroma_mv = chroma_motion(mode, mb_mv, four_mvs.as_ref());
+    let u_decoded = decode_block(
+        src,
+        AcPlane::UV,
+        reference,
+        coeff_probs,
+        &mut dc_state.u_pred,
+        dc_state.u_grid.left(mb_row, mb_col),
+        dc_state.u_grid.above(mb_row, mb_col),
+    )?;
+    dc_state.u_grid.set(
+        mb_row,
+        mb_col,
+        DcCell {
+            coded_dc: u_decoded.coded_dc,
+            reference,
+        },
+    );
+    let u_residual = residual_of(&u_decoded.scan_coeffs, scan_to_raster, dequant);
+    let u_pixels = reconstruct_chroma_block(
+        mode,
+        reference,
+        chroma_mv,
+        mb_row,
+        mb_col,
+        &u_residual,
+        filter,
+        prev,
+        golden,
+        ChromaPlane::U,
+    );
+
+    let v_decoded = decode_block(
+        src,
+        AcPlane::UV,
+        reference,
+        coeff_probs,
+        &mut dc_state.v_pred,
+        dc_state.v_grid.left(mb_row, mb_col),
+        dc_state.v_grid.above(mb_row, mb_col),
+    )?;
+    dc_state.v_grid.set(
+        mb_row,
+        mb_col,
+        DcCell {
+            coded_dc: v_decoded.coded_dc,
+            reference,
+        },
+    );
+    let v_residual = residual_of(&v_decoded.scan_coeffs, scan_to_raster, dequant);
+    let v_pixels = reconstruct_chroma_block(
+        mode,
+        reference,
+        chroma_mv,
+        mb_row,
+        mb_col,
+        &v_residual,
+        filter,
+        prev,
+        golden,
+        ChromaPlane::V,
+    );
+
+    frame
+        .place_macroblock(mb_row, mb_col, &luma_pixels, &u_pixels, &v_pixels)
+        .map_err(|_| Error::Truncated)?;
+
+    Ok(())
 }
 
 /// Decode a P-frame against a [`ReferenceFrames`] state holder, building

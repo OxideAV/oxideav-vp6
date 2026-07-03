@@ -285,16 +285,12 @@ impl Vp6Decoder {
         let version = self.version.ok_or(Error::NotImplemented)?;
         let refs = self.refs.as_ref().ok_or(Error::NotImplemented)?;
 
-        // Two-partition inter frames are sequenced in a follow-up (the
-        // per-MB prediction/coefficient split of Figures 3/4).
-        if partition2.is_some() {
-            return Err(Error::NotImplemented);
-        }
-
         let mut bc = BoolCoder::new(tail_bytes)?;
         let tail = Vp6HeaderTail::parse_with(&mut bc, false, profile, version)?;
 
-        if tail.use_huffman {
+        // §5/§6: the Huffman coder only exists as a second-partition
+        // transport; UseHuffman with a single partition is inconsistent.
+        if tail.use_huffman && partition2.is_none() {
             return Err(Error::NotImplemented);
         }
 
@@ -327,16 +323,52 @@ impl Vp6Decoder {
             coeffs: coeff_banks.to_intra_probs(),
         };
 
-        let frame = decode_inter_frame_with_refs(
-            &mut bc,
-            h_fragments,
-            v_fragments,
-            header.dct_q_mask,
-            &probs,
-            &scan,
-            &filter,
-            refs,
-        )?;
+        // §6 transport dispatch: single-stream runs the fused per-MB
+        // walk over partition 1; MultiStream runs the Figure 3/4
+        // two-pass walk (all prediction info from partition 1, then all
+        // coefficients from partition 2 — BoolCoder or §7.2 Huffman).
+        let frame = match partition2 {
+            None => decode_inter_frame_with_refs(
+                &mut bc,
+                h_fragments,
+                v_fragments,
+                header.dct_q_mask,
+                &probs,
+                &scan,
+                &filter,
+                refs,
+            )?,
+            Some(p2) if tail.use_huffman => {
+                let tables = HuffmanCoeffTables::from_banks(&coeff_banks);
+                let mut src = CoeffSource::huffman(p2, &tables);
+                crate::inter_frame::decode_inter_frame_multistream_with_refs(
+                    &mut bc,
+                    &mut src,
+                    h_fragments,
+                    v_fragments,
+                    header.dct_q_mask,
+                    &probs,
+                    &scan,
+                    &filter,
+                    refs,
+                )?
+            }
+            Some(p2) => {
+                let mut bc2 = BoolCoder::new(p2)?;
+                let mut src = CoeffSource::Bool(&mut bc2);
+                crate::inter_frame::decode_inter_frame_multistream_with_refs(
+                    &mut bc,
+                    &mut src,
+                    h_fragments,
+                    v_fragments,
+                    header.dct_q_mask,
+                    &probs,
+                    &scan,
+                    &filter,
+                    refs,
+                )?
+            }
+        };
 
         // §4 update: the decoded frame becomes the new previous-frame
         // buffer; it refreshes the Golden Frame iff RefreshGoldenFrame.
@@ -749,6 +781,128 @@ mod tests {
                 .expect("encode P");
         let pf_out = dec.decode_packet(&pf_bytes).expect("decode P");
         assert_eq!(pf_out.y.samples(), kf_out.y.samples());
+    }
+
+    /// A two-partition zero-MV P-frame (both BoolCoder and Huffman
+    /// coefficient transports) reproduces an unchanged frame exactly
+    /// through `decode_packet` — the Figure 3/4 two-pass walk matches the
+    /// fused single-stream reconstruction.
+    #[test]
+    fn multistream_pframe_round_trips_both_transports() {
+        use crate::inter_encode::encode_inter_frame_multistream_packet;
+
+        let src = pattern_frame(4, 4);
+        let q = 40;
+        let probs = InterProbs::keyframe();
+        let filter = simple_inter_filter();
+
+        for use_huffman in [false, true] {
+            let mut dec = Vp6Decoder::new();
+            let kf_out = dec
+                .decode_packet(&encode_intra_frame(&src, q).expect("encode I"))
+                .expect("decode I");
+
+            let pf_bytes = encode_inter_frame_multistream_packet(
+                &kf_out,
+                &BorderedRef::new(&kf_out),
+                q,
+                &probs,
+                &filter,
+                use_huffman,
+            )
+            .expect("encode ms P");
+            let hdr = crate::frame_header::Vp6FrameHeader::parse(&pf_bytes).expect("header");
+            assert!(!hdr.is_keyframe);
+            assert!(hdr.multi_stream);
+            assert!(hdr.buff2_offset.is_some());
+
+            let pf_out = dec.decode_packet(&pf_bytes).expect("decode ms P");
+            assert_eq!(
+                pf_out.y.samples(),
+                kf_out.y.samples(),
+                "use_huffman={use_huffman}"
+            );
+            assert_eq!(pf_out.u.samples(), kf_out.u.samples());
+            assert_eq!(pf_out.v.samples(), kf_out.v.samples());
+        }
+    }
+
+    /// A two-partition **motion-estimated** P-frame decodes to pixels
+    /// bit-identical to the single-stream ME packet at the same quantiser
+    /// (the §10/§11 decisions are transport-independent), for both
+    /// coefficient transports — real modes and MV deltas ride partition 1
+    /// while the tokens ride partition 2.
+    #[test]
+    fn multistream_me_pframe_matches_single_stream() {
+        use crate::inter_encode::{
+            encode_inter_frame_me_multistream_packet, encode_inter_frame_me_packet,
+        };
+
+        let src = pattern_frame(6, 6);
+        let q = 32;
+        let probs = InterProbs::keyframe();
+        let filter = simple_inter_filter();
+
+        // Reference decode chain: keyframe, then the single-stream ME
+        // P-frame of a translated source.
+        let mut dec_ss = Vp6Decoder::new();
+        let kf_out = dec_ss
+            .decode_packet(&encode_intra_frame(&src, q).expect("encode I"))
+            .expect("decode I");
+
+        let mut p_src = Frame::new(kf_out.h_fragments, kf_out.v_fragments);
+        let shift = 3i32;
+        for (sp, dp) in [
+            (&kf_out.y, &mut p_src.y),
+            (&kf_out.u, &mut p_src.u),
+            (&kf_out.v, &mut p_src.v),
+        ] {
+            let w = sp.width() as i32;
+            let h = sp.height() as i32;
+            let s = if sp.width() == kf_out.y.width() {
+                shift
+            } else {
+                shift / 2
+            };
+            for r in 0..h {
+                for c in 0..w {
+                    let sr = (r + s).clamp(0, h - 1);
+                    let sc = (c + s).clamp(0, w - 1);
+                    dp.samples_mut()[(r * w + c) as usize] = sp.samples()[(sr * w + sc) as usize];
+                }
+            }
+        }
+
+        let ss_bytes =
+            encode_inter_frame_me_packet(&p_src, &BorderedRef::new(&kf_out), q, &probs, &filter)
+                .expect("encode ss ME");
+        let ss_out = dec_ss.decode_packet(&ss_bytes).expect("decode ss ME");
+
+        for use_huffman in [false, true] {
+            let mut dec = Vp6Decoder::new();
+            let kf2 = dec
+                .decode_packet(&encode_intra_frame(&src, q).expect("encode I"))
+                .expect("decode I");
+            assert_eq!(kf2.y.samples(), kf_out.y.samples());
+
+            let ms_bytes = encode_inter_frame_me_multistream_packet(
+                &p_src,
+                &BorderedRef::new(&kf2),
+                q,
+                &probs,
+                &filter,
+                use_huffman,
+            )
+            .expect("encode ms ME");
+            let ms_out = dec.decode_packet(&ms_bytes).expect("decode ms ME");
+            assert_eq!(
+                ms_out.y.samples(),
+                ss_out.y.samples(),
+                "use_huffman={use_huffman}: ME multistream must match single-stream"
+            );
+            assert_eq!(ms_out.u.samples(), ss_out.u.samples());
+            assert_eq!(ms_out.v.samples(), ss_out.v.samples());
+        }
     }
 
     /// A multistream keyframe whose Buff2Offset points outside the packet

@@ -181,23 +181,20 @@ fn extract_block(samples: &[u8], plane_width: usize, top: usize, left: usize) ->
     out
 }
 
-/// Encode one `CODE_INTER_NO_MV` block: form the residual against the
-/// zero-MV prediction, forward-DCT, quantise, compute the §14 DC delta,
-/// and emit the §13 token stream. Returns the coded DC for the grid.
-#[allow(clippy::too_many_arguments)]
-fn encode_inter_block(
-    enc: &mut BoolEncoder,
-    plane: AcPlane,
+/// Tokenize one inter block: form the residual against the prediction,
+/// forward-DCT, quantise, compute the §14 DC delta. Returns `(scan,
+/// coded_dc)` — the scan-order token values (DC delta at position 0)
+/// plus the coded DC for the grid. Emission is separate so the §6
+/// MultiStream / Huffman shapes can route the tokens elsewhere.
+fn tokenize_inter_block(
     source: &[i32; 64],
     prediction: &[u8; 64],
     dequant: DequantContext,
-    dc_node_probs: &[u8; crate::tokens::NUM_TREE_NODES],
-    probs: &InterProbs,
     dc_pred: &mut DcPredictionContext,
     reference: ReferenceBucket,
     left: Option<(i32, ReferenceBucket)>,
     above: Option<(i32, ReferenceBucket)>,
-) -> i32 {
+) -> ([i32; 64], i32) {
     // Inter residual = source − prediction (the §17.2 recombination
     // inverse: the decoder forms `clip(prediction + residual)`).
     let mut residual = [0i32; 64];
@@ -226,6 +223,27 @@ fn encode_inter_block(
     dc_pred.set_last_dc(reference, coded_dc);
 
     scan[0] = dc_delta;
+    (scan, coded_dc)
+}
+
+/// Tokenize + arithmetic-emit one inter block into `enc` — the fused
+/// single-sink form the Golden-aware and FourMV bodies use.
+#[allow(clippy::too_many_arguments)]
+fn encode_inter_block(
+    enc: &mut BoolEncoder,
+    plane: AcPlane,
+    source: &[i32; 64],
+    prediction: &[u8; 64],
+    dequant: DequantContext,
+    dc_node_probs: &[u8; crate::tokens::NUM_TREE_NODES],
+    probs: &InterProbs,
+    dc_pred: &mut DcPredictionContext,
+    reference: ReferenceBucket,
+    left: Option<(i32, ReferenceBucket)>,
+    above: Option<(i32, ReferenceBucket)>,
+) -> i32 {
+    let (scan, coded_dc) =
+        tokenize_inter_block(source, prediction, dequant, dc_pred, reference, left, above);
     encode_block_coefficients(
         enc,
         plane,
@@ -234,7 +252,99 @@ fn encode_inter_block(
         &probs.coeffs.zrl_probs,
         &scan,
     );
+    coded_dc
+}
 
+/// Where a P-frame body's §13 coefficient tokens go — the encoder-side
+/// dual of [`crate::coeff_source::CoeffSource`] (§5/§6):
+///
+/// * [`CoeffSink::Shared`] — single-stream: tokens interleave with the
+///   mode/MV data in the same partition-1 coder.
+/// * [`CoeffSink::SeparateBool`] — MultiStream BoolCoder: tokens go to
+///   an independent partition-2 coder.
+/// * [`CoeffSink::Huffman`] — MultiStream Huffman: tokens are collected
+///   (in stream order, plane-tagged) for the §7.2 raw-bit emission via
+///   [`crate::huff_coeff::encode_frame_blocks_huffman`] (the frame-level
+///   view is required to size the §13.4 cross-block runs).
+pub(crate) enum CoeffSink {
+    /// Tokens ride the shared partition-1 coder.
+    Shared,
+    /// Tokens go to this separate partition-2 coder.
+    SeparateBool(BoolEncoder),
+    /// Tokens are collected for Huffman emission.
+    Huffman(Vec<(AcPlane, [i32; 64])>),
+}
+
+impl CoeffSink {
+    /// Route one tokenized block: arithmetic-emit into the shared or
+    /// separate coder, or collect for Huffman.
+    fn emit(
+        &mut self,
+        shared: &mut BoolEncoder,
+        plane: AcPlane,
+        dc_node_probs: &[u8; crate::tokens::NUM_TREE_NODES],
+        probs: &InterProbs,
+        scan: &[i32; 64],
+    ) {
+        match self {
+            CoeffSink::Shared => encode_block_coefficients(
+                shared,
+                plane,
+                dc_node_probs,
+                &probs.coeffs.ac_probs,
+                &probs.coeffs.zrl_probs,
+                scan,
+            ),
+            CoeffSink::SeparateBool(enc2) => encode_block_coefficients(
+                enc2,
+                plane,
+                dc_node_probs,
+                &probs.coeffs.ac_probs,
+                &probs.coeffs.zrl_probs,
+                scan,
+            ),
+            CoeffSink::Huffman(blocks) => blocks.push((plane, *scan)),
+        }
+    }
+
+    /// Finalize into the partition-2 bytes (`None` for the single-stream
+    /// shared sink). `banks` supplies the §13.1/§13.3.3.2 tree
+    /// derivation for the Huffman flavour — pass the same banks the
+    /// emitted probability-update prefix reconstructs at the decoder.
+    fn finish(self, banks: &crate::coeff_prob_update::CoeffProbBanks) -> Option<Vec<u8>> {
+        match self {
+            CoeffSink::Shared => None,
+            CoeffSink::SeparateBool(enc2) => Some(enc2.finish()),
+            CoeffSink::Huffman(blocks) => {
+                let tables = crate::huff_coeff::HuffmanCoeffTables::from_banks(banks);
+                let mut w = oxideav_core::bits::BitWriter::new();
+                crate::huff_coeff::encode_frame_blocks_huffman(&mut w, &tables, &blocks);
+                Some(w.finish())
+            }
+        }
+    }
+}
+
+/// Tokenize one inter block and route it through the frame's
+/// [`CoeffSink`]. Returns the coded DC for the grid.
+#[allow(clippy::too_many_arguments)]
+fn emit_inter_block(
+    shared: &mut BoolEncoder,
+    sink: &mut CoeffSink,
+    plane: AcPlane,
+    source: &[i32; 64],
+    prediction: &[u8; 64],
+    dequant: DequantContext,
+    dc_node_probs: &[u8; crate::tokens::NUM_TREE_NODES],
+    probs: &InterProbs,
+    dc_pred: &mut DcPredictionContext,
+    reference: ReferenceBucket,
+    left: Option<(i32, ReferenceBucket)>,
+    above: Option<(i32, ReferenceBucket)>,
+) -> i32 {
+    let (scan, coded_dc) =
+        tokenize_inter_block(source, prediction, dequant, dc_pred, reference, left, above);
+    sink.emit(shared, plane, dc_node_probs, probs, &scan);
     coded_dc
 }
 
@@ -331,7 +441,15 @@ pub fn encode_inter_frame(
     filter: &FilterConfig,
 ) -> Result<Vec<u8>, Error> {
     // Bare data partition: no header-tail prelude on the coder.
-    encode_inter_frame_body(source, prev, dct_q_mask, probs, filter, |_| {})
+    encode_inter_frame_body(
+        source,
+        prev,
+        dct_q_mask,
+        probs,
+        filter,
+        |_| {},
+        &mut CoeffSink::Shared,
+    )
 }
 
 /// Shared P-frame body: open a [`BoolEncoder`], run `prelude` against it
@@ -345,6 +463,7 @@ fn encode_inter_frame_body(
     probs: &InterProbs,
     filter: &FilterConfig,
     prelude: impl FnOnce(&mut BoolEncoder),
+    sink: &mut CoeffSink,
 ) -> Result<Vec<u8>, Error> {
     let h_fragments = source.h_fragments;
     let v_fragments = source.v_fragments;
@@ -421,8 +540,9 @@ fn encode_inter_frame_body(
                     y_grid.above(br, bc_col).is_some_and(|(d, _)| d != 0),
                 )
                 .select_row(&probs.coeffs.dc_contexts[AcPlane::Y.index()]);
-                let coded_dc = encode_inter_block(
+                let coded_dc = emit_inter_block(
                     &mut enc,
+                    sink,
                     AcPlane::Y,
                     &source_pixels,
                     &prediction,
@@ -445,8 +565,9 @@ fn encode_inter_frame_body(
                 u_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
             )
             .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
-            let u_coded_dc = encode_inter_block(
+            let u_coded_dc = emit_inter_block(
                 &mut enc,
+                sink,
                 AcPlane::UV,
                 &u_source,
                 &u_pred,
@@ -468,8 +589,9 @@ fn encode_inter_frame_body(
                 v_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
             )
             .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
-            let v_coded_dc = encode_inter_block(
+            let v_coded_dc = emit_inter_block(
                 &mut enc,
+                sink,
                 AcPlane::UV,
                 &v_source,
                 &v_pred,
@@ -926,7 +1048,15 @@ pub fn encode_inter_frame_me(
     probs: &InterProbs,
     filter: &FilterConfig,
 ) -> Result<Vec<u8>, Error> {
-    encode_inter_frame_me_body(source, prev, dct_q_mask, probs, filter, |_| {})
+    encode_inter_frame_me_body(
+        source,
+        prev,
+        dct_q_mask,
+        probs,
+        filter,
+        |_| {},
+        &mut CoeffSink::Shared,
+    )
 }
 
 /// Shared motion-estimated P-frame body: open a [`BoolEncoder`], run
@@ -940,6 +1070,7 @@ fn encode_inter_frame_me_body(
     probs: &InterProbs,
     filter: &FilterConfig,
     prelude: impl FnOnce(&mut BoolEncoder),
+    sink: &mut CoeffSink,
 ) -> Result<Vec<u8>, Error> {
     let h_fragments = source.h_fragments;
     let v_fragments = source.v_fragments;
@@ -1072,8 +1203,9 @@ fn encode_inter_frame_me_body(
                     y_grid.above(br, bc_col).is_some_and(|(d, _)| d != 0),
                 )
                 .select_row(&probs.coeffs.dc_contexts[AcPlane::Y.index()]);
-                let coded_dc = encode_inter_block(
+                let coded_dc = emit_inter_block(
                     &mut enc,
+                    sink,
                     AcPlane::Y,
                     &source_pixels,
                     &prediction,
@@ -1096,8 +1228,9 @@ fn encode_inter_frame_me_body(
                 u_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
             )
             .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
-            let u_coded_dc = encode_inter_block(
+            let u_coded_dc = emit_inter_block(
                 &mut enc,
+                sink,
                 AcPlane::UV,
                 &u_source,
                 &u_pred,
@@ -1119,8 +1252,9 @@ fn encode_inter_frame_me_body(
                 v_grid.above(mb_row, mb_col).is_some_and(|(d, _)| d != 0),
             )
             .select_row(&probs.coeffs.dc_contexts[AcPlane::UV.index()]);
-            let v_coded_dc = encode_inter_block(
+            let v_coded_dc = emit_inter_block(
                 &mut enc,
+                sink,
                 AcPlane::UV,
                 &v_source,
                 &v_pred,
@@ -1931,11 +2065,19 @@ pub fn encode_inter_frame_packet(
     // tail bits are emitted as a prelude on the data partition's coder:
     // RefreshGoldenFrame b(1) = 0, then (Simple/VP6.0: no loop/pred-filter
     // fields) UseHuffman b(1) = 0, immediately followed by the per-MB data.
-    let data = encode_inter_frame_body(source, prev, dct_q_mask, probs, filter, |enc| {
-        enc.encode_b1(0); // RefreshGoldenFrame = 0
-        enc.encode_b1(0); // UseHuffman = 0
-        emit_inter_pre_data_substreams(enc);
-    })?;
+    let data = encode_inter_frame_body(
+        source,
+        prev,
+        dct_q_mask,
+        probs,
+        filter,
+        |enc| {
+            enc.encode_b1(0); // RefreshGoldenFrame = 0
+            enc.encode_b1(0); // UseHuffman = 0
+            emit_inter_pre_data_substreams(enc);
+        },
+        &mut CoeffSink::Shared,
+    )?;
 
     let mut out = raw_prefix;
     out.extend_from_slice(&data);
@@ -1979,11 +2121,19 @@ pub fn encode_inter_frame_me_packet(
     let raw_prefix = header.finish();
 
     // --- §9 BoolCoder-coded InterHeader tail (Table 3) + ME data ---
-    let data = encode_inter_frame_me_body(source, prev, dct_q_mask, probs, filter, |enc| {
-        enc.encode_b1(0); // RefreshGoldenFrame = 0
-        enc.encode_b1(0); // UseHuffman = 0
-        emit_inter_pre_data_substreams(enc);
-    })?;
+    let data = encode_inter_frame_me_body(
+        source,
+        prev,
+        dct_q_mask,
+        probs,
+        filter,
+        |enc| {
+            enc.encode_b1(0); // RefreshGoldenFrame = 0
+            enc.encode_b1(0); // UseHuffman = 0
+            emit_inter_pre_data_substreams(enc);
+        },
+        &mut CoeffSink::Shared,
+    )?;
 
     let mut out = raw_prefix;
     out.extend_from_slice(&data);
@@ -2075,6 +2225,124 @@ pub fn encode_inter_frame_me_golden_packet_refresh(
     let mut out = raw_prefix;
     out.extend_from_slice(&data);
     Ok(out)
+}
+
+/// Assemble a two-partition (`MultiStream == 1`) P-frame packet from its
+/// pieces: the Table 1 raw prefix + `Buff2Offset R(16)` (pointing at
+/// partition 2, measured from the start of the packet), partition 1,
+/// partition 2.
+fn assemble_multistream_inter_packet(
+    dct_q_mask: u8,
+    p1: Vec<u8>,
+    p2: Vec<u8>,
+) -> Result<Vec<u8>, Error> {
+    // Inter raw prefix: Table 1 byte + the 16-bit Buff2Offset = 3 bytes.
+    let buff2_offset = u16::try_from(3usize + p1.len()).map_err(|_| Error::NotImplemented)?;
+    let mut header = oxideav_core::bits::BitWriter::with_capacity(4);
+    header.write_u32(1, 1); // FrameType = 1 (inter)
+    header.write_u32(dct_q_mask as u32, 6);
+    header.write_u32(1, 1); // MultiStream = 1
+    header.write_u32(buff2_offset as u32, 16); // Buff2Offset
+    let mut out = header.finish();
+    out.extend_from_slice(&p1);
+    out.extend_from_slice(&p2);
+    Ok(out)
+}
+
+/// Encode a zero-MV (`CODE_INTER_NO_MV`) P-frame as a **two-partition**
+/// (`MultiStream == 1`) packet (§6): partition 1 carries the §9 Table 3
+/// tail + the §8 pre-data sub-streams + every MB's §10 mode; partition 2
+/// carries every block's §13 tokens — BoolCoder-coded when `use_huffman`
+/// is `false`, §7.2 raw-bit Huffman-coded when `true` (the Figure 3 /
+/// Figure 4 arrangements respectively).
+///
+/// `probs` must be the keyframe-baseline banks ([`InterProbs::keyframe`])
+/// — the emitted probability-update prefix is the no-update form, so the
+/// decoder reconstructs exactly those banks (and, for the Huffman
+/// flavour, derives its trees from them). Decoded pixels are
+/// bit-identical to [`encode_inter_frame_packet`]'s at the same
+/// quantiser.
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] for an over-large frame geometry or a
+/// partition-1 length overflowing the 16-bit `Buff2Offset`.
+pub fn encode_inter_frame_multistream_packet(
+    source: &Frame,
+    prev: &BorderedRef,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    filter: &FilterConfig,
+    use_huffman: bool,
+) -> Result<Vec<u8>, Error> {
+    let dct_q_mask = dct_q_mask & 0x3F;
+    let mut sink = if use_huffman {
+        CoeffSink::Huffman(Vec::new())
+    } else {
+        CoeffSink::SeparateBool(BoolEncoder::new())
+    };
+    let p1 = encode_inter_frame_body(
+        source,
+        prev,
+        dct_q_mask,
+        probs,
+        filter,
+        |enc| {
+            enc.encode_b1(0); // RefreshGoldenFrame = 0
+            enc.encode_b1(u8::from(use_huffman)); // UseHuffman
+            emit_inter_pre_data_substreams(enc);
+        },
+        &mut sink,
+    )?;
+    let p2 = sink
+        .finish(&crate::coeff_prob_update::CoeffProbBanks::keyframe())
+        .expect("multistream sink always yields a partition 2");
+    assemble_multistream_inter_packet(dct_q_mask, p1, p2)
+}
+
+/// Encode a **motion-estimated** P-frame as a two-partition
+/// (`MultiStream == 1`) packet — the ME dual of
+/// [`encode_inter_frame_multistream_packet`]: partition 1 carries the
+/// tail + sub-streams + every MB's §10 mode and §11.1 MV delta,
+/// partition 2 the §13 tokens (BoolCoder or Huffman per `use_huffman`).
+/// The per-MB mode decisions are transport-independent, so the decoded
+/// pixels are bit-identical to [`encode_inter_frame_me_packet`]'s.
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] for an over-large frame geometry or a
+/// partition-1 length overflowing the 16-bit `Buff2Offset`.
+pub fn encode_inter_frame_me_multistream_packet(
+    source: &Frame,
+    prev: &BorderedRef,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    filter: &FilterConfig,
+    use_huffman: bool,
+) -> Result<Vec<u8>, Error> {
+    let dct_q_mask = dct_q_mask & 0x3F;
+    let mut sink = if use_huffman {
+        CoeffSink::Huffman(Vec::new())
+    } else {
+        CoeffSink::SeparateBool(BoolEncoder::new())
+    };
+    let p1 = encode_inter_frame_me_body(
+        source,
+        prev,
+        dct_q_mask,
+        probs,
+        filter,
+        |enc| {
+            enc.encode_b1(0); // RefreshGoldenFrame = 0
+            enc.encode_b1(u8::from(use_huffman)); // UseHuffman
+            emit_inter_pre_data_substreams(enc);
+        },
+        &mut sink,
+    )?;
+    let p2 = sink
+        .finish(&crate::coeff_prob_update::CoeffProbBanks::keyframe())
+        .expect("multistream sink always yields a partition 2");
+    assemble_multistream_inter_packet(dct_q_mask, p1, p2)
 }
 
 #[cfg(test)]

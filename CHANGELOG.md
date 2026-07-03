@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 384, 2026-07-03)
 
+- **MultiStream (§6) two-partition inter frames — decode + encode, zero-MV
+  and motion-estimated, BoolCoder and Huffman.** The Figure 3 / Figure 4
+  arrangement splits a P-frame's per-MB data: partition 1 carries **every**
+  macroblock's §10 mode + §11 motion first, then partition 2 carries every
+  block's §13 tokens. `inter_frame::decode_inter_frame_multistream[_with_refs]`
+  is the two-pass driver (the fused single-stream walk is refactored onto
+  the same shared per-MB steps: `decode_mb_prediction` threading
+  `mv_grid`/`last_mode`, `decode_mb_blocks` threading the §14 `DcState` and
+  reading from a `CoeffSource`); `Vp6Decoder::decode_packet` dispatches
+  inter frames on `MultiStream`/`UseHuffman` exactly as keyframes. On the
+  encoder, `tokenize_inter_block` splits tokenisation from emission and a
+  `CoeffSink` (shared partition-1 coder / separate partition-2 coder /
+  Huffman block collector) routes the zero-MV and ME bodies' tokens, so
+  `encode_inter_frame_multistream_packet` and
+  `encode_inter_frame_me_multistream_packet` emit both flavours without
+  reordering the per-MB walk. Tests pin: an unchanged frame reproduces
+  exactly through both transports, and a translated-source **ME**
+  multistream P-frame decodes bit-identical to the single-stream ME packet
+  (the §10/§11 decisions are transport-independent).
+
 - **MultiStream (§6) two-partition keyframes — decode + encode, BoolCoder
   and Huffman.** `coeff_source::CoeffSource` abstracts the three §5/§6
   coefficient transports (single-stream partition-1 BoolCoder /
