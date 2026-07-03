@@ -124,7 +124,10 @@ impl Vp6Decoder {
     /// Figure 5), so a frame carrying real coefficient / mode / MV
     /// probability updates decodes correctly.
     pub fn decode_packet(&mut self, bytes: &[u8]) -> Result<Frame, Error> {
-        let header = Vp6FrameHeader::parse(bytes)?;
+        // Thread the profile carried from the most recent I-frame so an
+        // Inter frame's Table 3 `Buff2Offset` presence gate
+        // (`MultiStream || SIMPLE_PROFILE`) is evaluated correctly.
+        let header = Vp6FrameHeader::parse_with_profile(bytes, self.profile)?;
 
         // The §9 BoolCoder tail + the data partition begin immediately
         // after the byte-aligned raw prefix (MultiStream == 0; the

@@ -158,7 +158,8 @@ pub struct Vp6FrameHeader {
     /// The raw prefix is always byte-aligned: Table 1 occupies one full
     /// byte (`1 + 6 + 1`), the IntraHeader raw fields occupy a second
     /// full byte (`5 + 2 + 1`), and `Buff2Offset` is a whole 16-bit
-    /// (2-byte) field. So this is 1 byte for an Inter frame, 2 bytes for
+    /// (2-byte) field. So this is 1 byte for an Inter frame without
+    /// `Buff2Offset`, 3 bytes for an Inter frame with it, 2 bytes for
     /// an Intra frame without `Buff2Offset`, and 4 bytes for an Intra
     /// frame with it.
     pub raw_prefix_len: usize,
@@ -186,10 +187,33 @@ impl Vp6FrameHeader {
     ///   transmits Buff2Offset). Because that profile isn't in the
     ///   InterHeader's wire format, this parser cannot determine
     ///   Inter-frame `Buff2Offset` from a single packet — callers
-    ///   that need it must thread the profile in. For round 1 we
-    ///   surface `buff2_offset = None` on Inter frames and document
-    ///   the cross-frame dependency.
+    ///   that need it must thread the profile in via
+    ///   [`Self::parse_with_profile`]. This single-packet entry point
+    ///   surfaces `buff2_offset = None` on Inter frames unless the
+    ///   packet itself signals `MultiStream == 1` (the other half of
+    ///   the Table 3 presence gate, which needs no carried state).
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse_with_profile(bytes, None)
+    }
+
+    /// Parse the raw-bit prefix, threading in the cross-frame coding
+    /// profile carried from the most recent I-frame.
+    ///
+    /// Table 3 (InterHeader) opens with `Buff2Offset R(16)`, present
+    /// "If (MultiStream == 1) || (SIMPLE_PROFILE == 1)" — the same gate
+    /// as the IntraHeader's, but on a P-frame `VpProfile` is not in the
+    /// wire format (Table 3 omits it), so only a caller that carries the
+    /// most-recent keyframe's profile can evaluate the `SIMPLE_PROFILE`
+    /// half of the condition. `carried_profile` is that state (`None`
+    /// when no keyframe has been seen; the gate then falls back to the
+    /// packet's own `MultiStream` flag alone).
+    ///
+    /// On an Intra frame `carried_profile` is ignored — the profile is
+    /// transmitted in-band (Table 2) and governs the gate directly.
+    pub fn parse_with_profile(
+        bytes: &[u8],
+        carried_profile: Option<CodingProfile>,
+    ) -> Result<Self, Error> {
         let mut br = BitReader::new(bytes);
 
         // Table 1, byte 0:
@@ -204,13 +228,17 @@ impl Vp6FrameHeader {
         let multi_stream = multi_stream_raw == 1;
 
         if !is_keyframe {
-            // Inter frames have no further R(n) prefix: Table 3
-            // starts with `Buff2Offset R(16)` only when the
-            // (MultiStream || SIMPLE_PROFILE) gate fires — and
-            // SIMPLE_PROFILE is established by the most recent
-            // I-frame, not the current packet. Punt to None and let
-            // a higher layer thread the state in once the BoolCoder
-            // gap is resolved.
+            // Table 3 (InterHeader) opens with `Buff2Offset R(16)`,
+            // gated on `(MultiStream == 1) || (SIMPLE_PROFILE == 1)`.
+            // The MultiStream half comes from this packet's Table 1;
+            // the SIMPLE_PROFILE half is the profile carried from the
+            // most recent I-frame (Table 3 doesn't re-transmit it).
+            let simple = carried_profile.is_some_and(CodingProfile::is_simple);
+            let buff2_offset = if multi_stream || simple {
+                Some(br.read_u32(16).map_err(|_| Error::Truncated)? as u16)
+            } else {
+                None
+            };
             return Ok(Self {
                 is_keyframe,
                 dct_q_mask,
@@ -218,7 +246,7 @@ impl Vp6FrameHeader {
                 version: None,
                 profile: None,
                 reserved_bit: None,
-                buff2_offset: None,
+                buff2_offset,
                 raw_prefix_len: br.byte_position(),
             });
         }
@@ -798,15 +826,16 @@ mod tests {
         assert_eq!(hdr.buff2_offset, Some(0xBEEF));
     }
 
-    /// Inter frame: only Table 1 is parsed in round 1 since the
-    /// InterHeader's Buff2Offset gate depends on the profile of the
-    /// most recent I-frame, which this single-frame API doesn't have.
+    /// Inter frame with `MultiStream = 1`: the Table 3 Buff2Offset gate
+    /// fires on the packet's own MultiStream flag (no carried profile
+    /// needed), so the 16-bit offset is read.
     ///
     /// Byte 0: 1 111111 1 -> 0xFF (FrameType=1, DctQMask=63,
     ///          MultiStream=1)
+    /// Bytes 1..3: Buff2Offset = 0x0102
     #[test]
-    fn parses_inter_table_one_only() {
-        let bytes = [0xFF, 0x00, 0x00];
+    fn parses_inter_multistream_reads_buff2offset() {
+        let bytes = [0xFF, 0x01, 0x02];
         let hdr = Vp6FrameHeader::parse(&bytes).unwrap();
         assert!(!hdr.is_keyframe);
         assert_eq!(hdr.dct_q_mask, 63);
@@ -815,7 +844,68 @@ mod tests {
         assert!(hdr.version.is_none());
         assert!(hdr.profile.is_none());
         assert!(hdr.reserved_bit.is_none());
+        assert_eq!(hdr.buff2_offset, Some(0x0102));
+        assert_eq!(hdr.raw_prefix_len, 3);
+    }
+
+    /// Inter frame, `MultiStream = 0`, no carried profile: the gate
+    /// cannot fire, so only Table 1 is consumed.
+    ///
+    /// Byte 0: 1 111111 0 -> 0xFE
+    #[test]
+    fn parses_inter_single_stream_no_profile_stops_after_table_one() {
+        let bytes = [0xFE, 0x00, 0x00];
+        let hdr = Vp6FrameHeader::parse(&bytes).unwrap();
+        assert!(!hdr.is_keyframe);
+        assert!(!hdr.multi_stream);
         assert!(hdr.buff2_offset.is_none());
+        assert_eq!(hdr.raw_prefix_len, 1);
+    }
+
+    /// Inter frame, `MultiStream = 0`, carried Simple profile: Table 3's
+    /// `(MultiStream == 1) || (SIMPLE_PROFILE == 1)` gate fires on the
+    /// profile half, so Buff2Offset is read.
+    #[test]
+    fn parses_inter_simple_profile_reads_buff2offset() {
+        let bytes = [0xFE, 0xAB, 0xCD];
+        let hdr = Vp6FrameHeader::parse_with_profile(&bytes, Some(CodingProfile::Simple)).unwrap();
+        assert!(!hdr.is_keyframe);
+        assert!(!hdr.multi_stream);
+        assert_eq!(hdr.buff2_offset, Some(0xABCD));
+        assert_eq!(hdr.raw_prefix_len, 3);
+    }
+
+    /// Inter frame, `MultiStream = 0`, carried Advanced profile: neither
+    /// half of the gate fires — no Buff2Offset.
+    #[test]
+    fn parses_inter_advanced_profile_no_buff2offset() {
+        let bytes = [0xFE, 0xAB, 0xCD];
+        let hdr =
+            Vp6FrameHeader::parse_with_profile(&bytes, Some(CodingProfile::Advanced)).unwrap();
+        assert!(hdr.buff2_offset.is_none());
+        assert_eq!(hdr.raw_prefix_len, 1);
+    }
+
+    /// A carried profile is ignored on an Intra frame — the in-band
+    /// Table 2 profile governs the gate (here Advanced + MultiStream=0:
+    /// no Buff2Offset despite the carried Simple).
+    #[test]
+    fn carried_profile_ignored_on_intra() {
+        let bytes = [0x54, 0x36, 0x00];
+        let hdr = Vp6FrameHeader::parse_with_profile(&bytes, Some(CodingProfile::Simple)).unwrap();
+        assert!(hdr.is_keyframe);
+        assert_eq!(hdr.profile, Some(CodingProfile::Advanced));
+        assert!(hdr.buff2_offset.is_none());
+    }
+
+    /// Truncated during an Inter frame's Buff2Offset read.
+    #[test]
+    fn truncated_during_inter_buff2offset_returns_error() {
+        let bytes = [0xFF, 0x01]; // MultiStream=1, one byte of offset
+        assert!(matches!(
+            Vp6FrameHeader::parse(&bytes),
+            Err(Error::Truncated)
+        ));
     }
 
     /// Reserved VpProfile encodings (1 or 2) round-trip through the
@@ -870,10 +960,14 @@ mod tests {
     /// tail begins, for each prefix shape.
     #[test]
     fn raw_prefix_len_per_shape() {
-        // Inter: only Table 1 (1 byte).
-        let inter = Vp6FrameHeader::parse(&[0xFF, 0x00, 0x00]).unwrap();
+        // Inter, MultiStream=0, no carried profile: only Table 1 (1 byte).
+        let inter = Vp6FrameHeader::parse(&[0xFE, 0x00, 0x00]).unwrap();
         assert_eq!(inter.raw_prefix_len, 1);
         assert_eq!(inter.raw_prefix_len(), 1);
+
+        // Inter, MultiStream=1: Table 1 + Buff2Offset (3 bytes).
+        let inter_ms = Vp6FrameHeader::parse(&[0xFF, 0x00, 0x00]).unwrap();
+        assert_eq!(inter_ms.raw_prefix_len, 3);
 
         // Intra, Advanced, no MultiStream -> no Buff2Offset (2 bytes).
         let intra_adv = Vp6FrameHeader::parse(&[0x54, 0x36, 0x00]).unwrap();

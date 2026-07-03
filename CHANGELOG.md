@@ -6,6 +6,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 384, 2026-07-03)
+
+- **Inter-frame `Buff2Offset` conformance (§9 Table 3).** The InterHeader
+  opens with `Buff2Offset R(16)`, present "If (MultiStream == 1) ||
+  (SIMPLE_PROFILE == 1)" — but the profile half of the gate needs the
+  `VpProfile` carried from the most recent I-frame (Table 3 omits it).
+  `Vp6FrameHeader::parse_with_profile` threads that cross-frame state in
+  (the packet-local `MultiStream` half needs no state and now works
+  through plain `parse` too); `Vp6Decoder::decode_packet` supplies its
+  carried profile. All four inter packet emitters now write the field
+  (0 with a single partition), matching the intra encoder's
+  Simple-profile shape — previously a Simple-profile P-frame packet
+  omitted a field the spec marks always-present for that profile.
+
 ### Added (clean-room round 377, 2026-06-28)
 
 - **`coeff_prob_update` — §8 Figure 5 coefficient-probability-update

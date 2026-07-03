@@ -1826,6 +1826,9 @@ pub fn encode_inter_frame_me_fourmv_packet(
     header.write_u32(1, 1); // FrameType = 1 (inter)
     header.write_u32(dct_q_mask as u32, 6);
     header.write_u32(0, 1); // MultiStream = 0
+                            // Table 3 Buff2Offset R(16): present because the carried profile is
+                            // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
+    header.write_u32(0, 16);
     let raw_prefix = header.finish();
 
     let data = encode_inter_frame_me_fourmv_body(source, prev, dct_q_mask, probs, filter, |enc| {
@@ -1884,8 +1887,10 @@ fn grid_lookup(
 /// encoder's Simple/VP6.0 profile:
 ///
 /// * **Table 1 raw prefix** — `FrameType = 1` (inter), `DctQMask`,
-///   `MultiStream = 0`. No `Buff2Offset` (the inter-frame header parse
-///   stops after Table 1 for the single-partition arrangement).
+///   `MultiStream = 0`, then `Buff2Offset R(16) = 0` — the Table 3 gate
+///   `(MultiStream == 1) || (SIMPLE_PROFILE == 1)` fires on the Simple
+///   profile carried from the keyframe, so the field is always present
+///   on this encoder's P-frames (0: no second partition).
 /// * **InterHeader tail (Table 3)** — `RefreshGoldenFrame b(1) = 0`,
 ///   then `UseHuffman b(1) = 0`. Simple profile carries no loop-filter
 ///   fields; VP6.0 (not VP6.2) carries no prediction-filter fields or
@@ -1915,6 +1920,9 @@ pub fn encode_inter_frame_packet(
     header.write_u32(1, 1); // FrameType = 1 (inter)
     header.write_u32(dct_q_mask as u32, 6);
     header.write_u32(0, 1); // MultiStream = 0
+                            // Table 3 Buff2Offset R(16): present because the carried profile is
+                            // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
+    header.write_u32(0, 16);
     let raw_prefix = header.finish();
 
     // --- §9 BoolCoder-coded InterHeader tail (Table 3) + data ---
@@ -1965,6 +1973,9 @@ pub fn encode_inter_frame_me_packet(
     header.write_u32(1, 1); // FrameType = 1 (inter)
     header.write_u32(dct_q_mask as u32, 6);
     header.write_u32(0, 1); // MultiStream = 0
+                            // Table 3 Buff2Offset R(16): present because the carried profile is
+                            // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
+    header.write_u32(0, 16);
     let raw_prefix = header.finish();
 
     // --- §9 BoolCoder-coded InterHeader tail (Table 3) + ME data ---
@@ -2041,6 +2052,9 @@ pub fn encode_inter_frame_me_golden_packet_refresh(
     header.write_u32(1, 1); // FrameType = 1 (inter)
     header.write_u32(dct_q_mask as u32, 6);
     header.write_u32(0, 1); // MultiStream = 0
+                            // Table 3 Buff2Offset R(16): present because the carried profile is
+                            // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
+    header.write_u32(0, 16);
     let raw_prefix = header.finish();
 
     // --- §9 BoolCoder-coded InterHeader tail (Table 3) + Golden-aware data ---
