@@ -1,5 +1,7 @@
 # oxideav-vp6
 
+[![CI](https://github.com/OxideAV/oxideav-vp6/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-vp6/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-vp6.svg)](https://crates.io/crates/oxideav-vp6) [![docs.rs](https://docs.rs/oxideav-vp6/badge.svg)](https://docs.rs/oxideav-vp6) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust On2 VP6 (`vp6f` / `VP60` / `VP61` / `VP62`) video codec for
 the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
