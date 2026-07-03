@@ -8,6 +8,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added (clean-room round 384, 2026-07-03)
 
+- **FourMV neighbour representative — DOCS-GAP closed (errata #155).**
+  The staged errata now disambiguates which vector a `CODE_INTER_FOURMV`
+  macroblock contributes to a later MB's §10 Nearest/Near scan and §11
+  differential reference: the **§10 chroma-derived average** of its four
+  Y-block vectors (rounded away from zero) — the only MB-level vector the
+  spec defines for a FourMV MB. The decoder's `resolve_motion` now records
+  `fmb.chroma_mv` in the neighbour grid (previously `None`, deferring the
+  choice) and the FourMV encoder mirrors it, so a FourMV MB can seed a
+  following MB's implicit-MV modes. A lockstep test drives a FourMV MB
+  whose average vector the surrounding MBs' motion matches, so their
+  mode/MV coding runs against the representative on both sides.
+
 - **MultiStream (§6) two-partition inter frames — decode + encode, zero-MV
   and motion-estimated, BoolCoder and Huffman.** The Figure 3 / Figure 4
   arrangement splits a P-frame's per-MB data: partition 1 carries **every**

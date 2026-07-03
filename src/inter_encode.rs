@@ -1598,7 +1598,8 @@ pub const FOURMV_SAD_MARGIN: u64 = 256;
 /// §10-averaged chroma MV. Otherwise the MB falls back to the single-vector
 /// decision.
 ///
-/// A FourMV MB contributes **`None`** to the §10/§11 neighbour grid — exactly
+/// A FourMV MB contributes its §10 chroma-derived **average** vector to the
+/// §10/§11 neighbour grid (errata #155) — exactly
 /// as the decoder records it (the FourMV MB-representative-MV is a documented
 /// §10 DOCS-GAP) — so the encoder and decoder neighbour contexts stay
 /// identical and the frame round-trips.
@@ -1764,8 +1765,13 @@ fn encode_inter_frame_me_fourmv_body(
                     &probs.mv_probs,
                     |r, c| grid_lookup(&mv_grid, mb_cols, mb_rows, r, c),
                 )?;
-                // FourMV contributes None to the neighbour grid (DOCS-GAP).
-                mv_grid[mb_row * mb_cols + mb_col] = None;
+                // Errata #155: a FourMV MB's representative MV for later
+                // MBs' §10 Nearest/Near scans (and the §11 differential
+                // reference) is its §10 chroma-derived average — the same
+                // four-luma-vector average, rounded away from zero, its own
+                // chroma blocks use. Record it exactly as the decoder does.
+                mv_grid[mb_row * mb_cols + mb_col] =
+                    Some(NeighbourMv::new(fmb.chroma_mv, ReferenceBucket::InterLast));
 
                 // Per-block luma residual against each reconstructed block MV.
                 for (k, &(dr, dc)) in LUMA_OFFSETS.iter().enumerate() {
@@ -3455,5 +3461,69 @@ mod tests {
         let p_recon = dec.decode_packet(&packet).expect("FourMV P-decode");
         let y = psnr(source.y.samples(), p_recon.y.samples());
         assert!(y >= 22.0, "FourMV packet luma PSNR {y:.2} dB below floor");
+    }
+
+    /// Errata #155 lockstep: a FourMV MB's chroma-derived average vector
+    /// is its representative in later MBs' §10 Nearest/Near scans and §11
+    /// differential references — on **both** sides. MB(0,0)'s four luma
+    /// quadrants move divergently (average (2,2) luma px, forcing FourMV
+    /// with a non-zero representative) while every other MB translates by
+    /// exactly that average, so the following MBs' mode/MV coding runs
+    /// against the FourMV MB's grid entry. Any encoder/decoder
+    /// disagreement about the representative desynchronises the
+    /// arithmetic stream and collapses the reconstruction, so the PSNR
+    /// floor is a real lockstep check.
+    #[test]
+    fn fourmv_representative_seeds_following_mbs() {
+        use crate::decode_frame::Vp6Decoder;
+
+        let q = 20u8;
+        let key = gradient(6, 4);
+        let probs = keyframe_inter_probs();
+        let filter = bilinear_filter();
+
+        let key_packet = crate::intra_encode::encode_intra_frame(&key, q).expect("I-encode");
+        let mut dec = Vp6Decoder::new();
+        let key_recon = dec.decode_packet(&key_packet).expect("I-decode");
+        let prev_b = BorderedRef::new(&key_recon);
+
+        // MB(0,0): quadrant shifts (4,4)/(4,0)/(0,4)/(0,0) — average
+        // (2,2). Everything else: uniform (2,2) translation.
+        let mut source = key_recon.clone();
+        let yw = source.y.width();
+        let yh = source.y.height();
+        for r in 0..yh {
+            for c in 0..yw {
+                let (dy, dx) = if r < 16 && c < 16 {
+                    let qr = if r < 8 { 4 } else { 0 };
+                    let qc = if c < 8 { 4 } else { 0 };
+                    (qr, qc)
+                } else {
+                    (2, 2)
+                };
+                let pr = (r as i32 + dy).clamp(0, yh as i32 - 1) as usize;
+                let pc = (c as i32 + dx).clamp(0, yw as i32 - 1) as usize;
+                source.y.samples_mut()[r * yw + c] = key_recon.y.samples()[pr * yw + pc];
+            }
+        }
+        let uw = source.u.width();
+        let uh = source.u.height();
+        for r in 0..uh {
+            for c in 0..uw {
+                let pr = (r + 1).min(uh - 1);
+                let pc = (c + 1).min(uw - 1);
+                source.u.samples_mut()[r * uw + c] = key_recon.u.samples()[pr * uw + pc];
+                source.v.samples_mut()[r * uw + c] = key_recon.v.samples()[pr * uw + pc];
+            }
+        }
+
+        let packet = encode_inter_frame_me_fourmv_packet(&source, &prev_b, q, &probs, &filter)
+            .expect("FourMV packet encode");
+        let p_recon = dec.decode_packet(&packet).expect("FourMV P-decode");
+        let y = psnr(source.y.samples(), p_recon.y.samples());
+        assert!(
+            y >= 24.0,
+            "luma PSNR {y:.2} dB below floor — FourMV representative desync"
+        );
     }
 }

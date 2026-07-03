@@ -42,20 +42,19 @@
 //! MB walk; every block's motion-compensated fetch reads from the bordered
 //! buffer, so unrestricted motion vectors stay well-defined.
 //!
-//! ## DOCS-GAP — FourMV macroblock neighbour representative
+//! ## FourMV macroblock neighbour representative (errata #155)
 //!
 //! §10 resolves Nearest/Near over "decoded macroblock neighbors", one MV
-//! per neighbour MB, but never states which of a `CODE_INTER_FOURMV` MB's
-//! four per-block luma vectors (or what combination) represents it in a
-//! *later* MB's `NearMacroBlocks` list, nor which it contributes as the
-//! §11 differential reference for an immediately-right/below `New` MB. The
-//! driver reconstructs a FourMV MB's pixels correctly (each luma block
-//! uses its own vector) but records the MB as contributing **no**
-//! representative neighbour MV (the grid cell stays `None`), deferring the
-//! choice rather than guessing. A stream that never places a Nearest/Near
-//! or New MB spatially after a FourMV MB decodes identically regardless of
-//! the resolution; the gap only affects that specific neighbour
-//! interaction.
+//! per neighbour MB, but never states in so many words which of a
+//! `CODE_INTER_FOURMV` MB's four per-block luma vectors represents it in
+//! a *later* MB's `NearMacroBlocks` list. The staged errata (#155)
+//! disambiguates: the representative is the **§10 chroma-derived
+//! average** of the four Y-block vectors, rounded away from zero — the
+//! only MB-level vector the spec defines for a FourMV MB (the
+//! MB-granular `NearMacroBlocks` traversal reads one MV per MB, and the
+//! chroma average is that single well-defined quantity). The driver
+//! records exactly that vector in the neighbour grid, so a FourMV MB can
+//! seed a later MB's Nearest/Near modes and §11 differential reference.
 //!
 //! All material here is sequenced from `docs/video/vp6/vp6_format.pdf`
 //! (On2 Technologies, document version 1.02, August 2006) and the
@@ -505,9 +504,9 @@ pub fn decode_inter_frame(
     let mut dc_state = DcState::new(h_fragments, v_fragments, mb_cols, mb_rows);
 
     // §10/§11 MV neighbour grid: one representative NeighbourMv per MB,
-    // row-major. A FourMV MB stays `None` (DOCS-GAP, see module docs); an
-    // intra MB also stays `None` (it never qualifies as a same-reference
-    // inter neighbour and carries no MV).
+    // row-major. A FourMV MB contributes its §10 chroma-derived average
+    // vector (errata #155); an intra MB stays `None` (it never qualifies
+    // as a same-reference inter neighbour and carries no MV).
     let mut mv_grid: Vec<Option<NeighbourMv>> = vec![None; mb_cols.saturating_mul(mb_rows)];
 
     let mut last_mode = CodingMode::InterNoMv;
@@ -970,10 +969,13 @@ fn resolve_motion(
                 mv_probs,
                 |r, c| neighbour_lookup(mv_grid, mb_cols, mb_rows, r, c),
             )?;
-            // DOCS-GAP: no defined MB-representative for a FourMV MB; it
-            // contributes `None` to the neighbour grid. Its own chroma MV
-            // is still used for the two chroma blocks of *this* MB.
-            Ok((fmb.chroma_mv, Some(fmb.luma_mvs), None))
+            // Errata #155: the FourMV MB's representative MV for later
+            // MBs' Nearest/Near scans (and the §11 differential
+            // reference) is the §10 chroma-derived average of its four
+            // Y-block vectors (rounded away from zero) — the same single
+            // MB-level vector its own chroma blocks use.
+            let representative = Some(NeighbourMv::new(fmb.chroma_mv, mode.reference_bucket()));
+            Ok((fmb.chroma_mv, Some(fmb.luma_mvs), representative))
         }
         _ => {
             let mb = reconstruct_macroblock_mv(
