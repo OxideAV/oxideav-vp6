@@ -14,6 +14,25 @@ Specification" (document version 1.02, August 2006), staged at
 `docs/video/vp6/vp6-errata-and-clarifications.md`. No third-party VP6
 source has been consulted at any stage.
 
+**Round 390 — first third-party conformance fixture.** A conformant
+external vp6f stream (Huffman/MultiStream, 854x480, I+P+P, black-box
+decode-oracle YUV) now lives at
+`tests/fixtures/vp6f-huffman-i-then-p-854x480/` with five CI gates
+(`tests/conformance_vp6f.rs`). It arbitrated four printed-spec errata,
+all fixed and pinned: §9 Table 2 geometry is transmitted in
+**macroblock units** (not the printed 8x8-block units); partition 1's
+BoolCoder legitimately reads past `Buff2Offset` (tight partition
+sizing + 32-bit look-ahead); the §13.2.2 DC Huffman trees fold node
+0's left branch wholly into `ZERO_TOKEN` (EOB is forbidden in DC); and
+the §16 IDCT descales round **toward zero**, not the printed `>>`
+shifts. The keyframe's real Huffman coefficient partition now decodes
+pixel-exactly through its leading macroblocks against the oracle
+(gated in CI). Full three-frame conformance is the open goal: past the
+first §13.4 run-refresh boundary the printed §13.2.2/§13.3.2/§13.4
+text under-specifies the cross-block run/refresh grammar and the parse
+desyncs; see the changelog and the conformance test's module docs for
+the precise state.
+
 Almost every decode primitive is implemented and unit-tested. The crate
 exposes a **full intra-frame (I-frame) decoder** (`decode_intra_frame`)
 **and** a **full inter-frame (P-frame) decoder** (`decode_inter_frame` /
