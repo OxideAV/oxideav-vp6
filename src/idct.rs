@@ -46,6 +46,20 @@
 //! normalisation. This matches a standard separable IDCT: no descale
 //! between the passes, a single `>> 4` after the second.
 //!
+//! ## Descale rounding — fixture-arbitrated (toward zero, not `>>`)
+//!
+//! The §16 pseudocode prints every descale as a right shift (`>> 16`
+//! after each constant multiply, `>> 4` on the column-pass outputs).
+//! For negative intermediates an arithmetic right shift rounds toward
+//! **-inf**; the real On2 decoder rounds toward **zero** (truncating
+//! division). The conformant third-party vp6f fixture
+//! (`tests/fixtures/vp6f-huffman-i-then-p-854x480/`) arbitrates this:
+//! its keyframe's flat black region reconstructs from a DC of -299 at
+//! `DctQMask == 60` (DC factor 12), and only the toward-zero descale
+//! chain produces the decode oracle's luma value 16 (`>>` lands on
+//! 15). This module therefore descales with `/ 65536` and `/ 16`,
+//! which differ from the printed shifts exactly on negative values.
+//!
 //! ## Spec note: a column-pass OCR artefact
 //!
 //! In the §16 column-pass pseudocode the `_Bd` line is rendered as
@@ -99,7 +113,12 @@ fn butterfly(ip: [i32; 8]) -> [i32; 8] {
     // products widen.
     #[inline]
     fn m(c: i32, v: i32) -> i32 {
-        ((c as i64 * v as i64) >> 16) as i32
+        // Truncating division, NOT an arithmetic right shift: see the
+        // module-level "descale rounding" note. `/ 65536` rounds
+        // toward zero for negative products where `>> 16` would round
+        // toward -inf; the conformant third-party vp6f fixture pins
+        // the toward-zero behaviour.
+        ((c as i64 * v as i64) / 65536) as i32
     }
     let a = m(XC1S7, ip[1]) + m(XC7S1, ip[7]);
     let b = m(XC7S1, ip[1]) - m(XC1S7, ip[7]);
@@ -189,7 +208,9 @@ pub fn idct_block(block: &mut [i32; 64]) {
         ];
         let op = butterfly(ip);
         for k in 0..8 {
-            block[col + k * 8] = op[k] >> 4;
+            // Truncating descale (toward zero), not `>> 4`: see the
+            // module-level "descale rounding" note.
+            block[col + k * 8] = op[k] / 16;
         }
     }
 }
@@ -249,8 +270,10 @@ mod tests {
     }
 
     /// A negative DC coefficient yields a uniformly negative (or zero,
-    /// per descaling) flat block — sign is preserved through the
-    /// transform's arithmetic-shift descales.
+    /// per descaling) flat block — sign is preserved, and every descale
+    /// rounds **toward zero** (the fixture-arbitrated truncating
+    /// division, not the printed arithmetic shifts; see the module
+    /// docs).
     #[test]
     fn negative_dc_is_flat_and_signed() {
         let dc: i32 = -512;
@@ -258,8 +281,8 @@ mod tests {
         block[0] = dc;
         idct_block(&mut block);
 
-        let e_pass1 = (XC4S4 * dc) >> 16;
-        let expected = ((XC4S4 * e_pass1) >> 16) >> 4;
+        let e_pass1 = (XC4S4 * dc) / 65536;
+        let expected = ((XC4S4 * e_pass1) / 65536) / 16;
         assert!(expected < 0, "negative DC should descale negative");
         for &v in block.iter() {
             assert_eq!(v, expected);
