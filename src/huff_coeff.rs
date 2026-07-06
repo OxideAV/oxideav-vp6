@@ -202,12 +202,17 @@ impl HuffmanCoeffTables {
         zrl_probs: &ZeroRunProbBank,
     ) -> Self {
         // §13.2.2: DcHuffTree[plane] from the raw per-plane DC bank via
-        // the §13.1 conversion.
+        // the DC variant of the §13.1 conversion (node-0 left branch
+        // folded wholly into ZERO_TOKEN — §13.2.1: EOB is forbidden in
+        // the DC position, so the DC BoolCoder tree skips the EOB/0
+        // decision and the conversion credits `NodeProb[0]` to ZERO;
+        // fixture-arbitrated, see
+        // `dct_token_bool_tree_to_huff_probs_dc`).
         let dc = [
-            HuffTable::build(&crate::tokens::dct_token_bool_tree_to_huff_probs(
+            HuffTable::build(&crate::tokens::dct_token_bool_tree_to_huff_probs_dc(
                 &dc_probs[0],
             )),
-            HuffTable::build(&crate::tokens::dct_token_bool_tree_to_huff_probs(
+            HuffTable::build(&crate::tokens::dct_token_bool_tree_to_huff_probs_dc(
                 &dc_probs[1],
             )),
         ];
@@ -389,7 +394,15 @@ pub fn decode_block_coefficients_huffman(
         match token {
             DctToken::Zero => {
                 // §13.4 DC zero run, inclusive of this block
-                // (disambiguation note #3).
+                // (disambiguation note #3). NOTE: §13.2.2's prose
+                // ("the number of additional blocks") and its listing
+                // (`CurrentDcRunLen[Plane] = DC Run Length`, stored
+                // unmodified) both read as run-EXclusive of this
+                // block; the third-party fixture has not yet
+                // arbitrated between the two (both parses desync
+                // further downstream for an unrelated reason), so the
+                // r384 inclusive reading — which the in-tree encoder
+                // mirrors — is retained for now.
                 let run = decode_eob_or_dc0_run(r)?;
                 state.dc_run[p] = run - 1;
             }

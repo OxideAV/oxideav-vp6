@@ -905,6 +905,37 @@ pub fn dct_token_bool_tree_to_huff_probs(node_prob: &[u8; NUM_TREE_NODES]) -> [u
     out
 }
 
+/// The §13.2.2 **DC** variant of [`dct_token_bool_tree_to_huff_probs`]:
+/// identical except that the node-0 left branch is credited wholly to
+/// `ZERO_TOKEN` and `DCT_EOB_TOKEN` gets probability 0.
+///
+/// §13.2.1 closes with: "*The EOB token is explicitly forbidden from
+/// occurring in the DC position so there is no need to encode the
+/// decision that differentiates between EOB and 0, the token may
+/// immediately be assumed to be the ZERO_TOKEN*" — i.e. the effective
+/// DC BoolCoder tree never traverses node 1, its node-0 left branch
+/// *is* the ZERO token. §13.2.2 derives the DC Huffman tree "*directly
+/// from the BoolCoder tree*", so the conversion of that branch is
+/// `HuffProb[ZERO_TOKEN] = NodeProb[0]` with no `NodeProb[1]` split
+/// (the generic §13.1 listing, which splits node 0's left branch
+/// between EOB and ZERO, describes the alphabet where EOB is legal —
+/// the AC trees).
+///
+/// Fixture-arbitrated: on the conformant third-party vp6f Huffman
+/// stream the chroma DC tree is built from the untouched all-128
+/// keyframe bank; the §13.1 split would hand EOB the shortest codeword
+/// (`(128*128)>>8 = 64` vs ZERO's `63`) and the real stream's zero-DC
+/// chroma runs then decode as the forbidden EOB-in-DC. With the fold,
+/// ZERO takes the whole `128` and the stream decodes.
+pub fn dct_token_bool_tree_to_huff_probs_dc(
+    node_prob: &[u8; NUM_TREE_NODES],
+) -> [u8; NUM_DCT_TOKENS] {
+    let mut out = dct_token_bool_tree_to_huff_probs(node_prob);
+    out[DctToken::EndOfBlock.index()] = 0;
+    out[DctToken::Zero.index()] = node_prob[0];
+    out
+}
+
 /// VP6 AC band index (spec §13.3 Table 30).
 ///
 /// The §13.3.1 arithmetic AC decoder selects a per-band node-probability
