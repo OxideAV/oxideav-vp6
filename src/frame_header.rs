@@ -477,17 +477,30 @@ pub enum LoopFilter {
 /// * `UseHuffman` is the final `b(1)` and is always present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Vp6HeaderTail {
-    /// `VFragments` b(8) — rows of 8×8 blocks in the un-scaled coded
-    /// image (`None` on an Inter frame, which carries no geometry).
+    /// `VFragments` b(8) — rows of **16-px macroblocks** in the
+    /// un-scaled coded image (`None` on an Inter frame, which carries
+    /// no geometry).
+    ///
+    /// Fixture-arbitrated erratum: the printed §9 Table 2 describes
+    /// this field as 8x8-block units ("If image is 240 pixels high,
+    /// VFragments will be 30"), but the conformant third-party vp6f
+    /// stream (`tests/fixtures/vp6f-huffman-i-then-p-854x480/`, coded
+    /// 864x480) transmits `VFragments = 30` / `HFragments = 54` —
+    /// macroblock counts. Real bitstreams are therefore always
+    /// MB-aligned; sub-MB display sizes travel out-of-band as a
+    /// container crop (e.g. the FLV VP6 dimension-adjust byte).
     pub v_fragments: Option<u8>,
-    /// `HFragments` b(8) — cols of 8×8 blocks in the un-scaled coded
-    /// image (`None` on an Inter frame).
+    /// `HFragments` b(8) — cols of 16-px macroblocks in the un-scaled
+    /// coded image (`None` on an Inter frame). See [`Self::v_fragments`]
+    /// for the macroblock-unit erratum.
     pub h_fragments: Option<u8>,
-    /// `OutputVFragments` b(8) — rows of 8×8 blocks in the scaled
-    /// output image (`None` on an Inter frame).
+    /// `OutputVFragments` b(8) — rows of 16-px macroblocks in the
+    /// scaled output image (`None` on an Inter frame). Same units as
+    /// [`Self::v_fragments`].
     pub output_v_fragments: Option<u8>,
-    /// `OutputHFragments` b(8) — cols of 8×8 blocks in the scaled
-    /// output image (`None` on an Inter frame).
+    /// `OutputHFragments` b(8) — cols of 16-px macroblocks in the
+    /// scaled output image (`None` on an Inter frame). Same units as
+    /// [`Self::h_fragments`].
     pub output_h_fragments: Option<u8>,
     /// `ScalingMode` b(2) — how the coded frame is mapped to the output
     /// resolution (`None` on an Inter frame).

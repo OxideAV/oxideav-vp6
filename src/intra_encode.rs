@@ -391,7 +391,14 @@ pub fn encode_intra_frame_with_banks(
 ) -> Result<Vec<u8>, Error> {
     let h_fragments = frame.h_fragments;
     let v_fragments = frame.v_fragments;
-    if h_fragments > u8::MAX as usize || v_fragments > u8::MAX as usize {
+    // §9 Table 2 transmits the geometry in 16-px MACROBLOCK units
+    // (fixture-arbitrated erratum — see `Vp6HeaderTail`), so the coded
+    // frame must be MB-aligned and each axis caps at 255 macroblocks.
+    if h_fragments % 2 != 0 || v_fragments % 2 != 0 {
+        return Err(Error::NotImplemented);
+    }
+    let (mb_cols, mb_rows) = (h_fragments / 2, v_fragments / 2);
+    if mb_cols > u8::MAX as usize || mb_rows > u8::MAX as usize {
         return Err(Error::NotImplemented);
     }
 
@@ -429,10 +436,10 @@ pub fn encode_intra_frame_with_banks(
     // PredictionFilterAlpha (VP6.0). Then UseHuffman b(1) = 0
     // (BoolCoder second-half, matching the single-partition arithmetic
     // coefficient stream).
-    enc.encode_b(v_fragments as u32, 8);
-    enc.encode_b(h_fragments as u32, 8);
-    enc.encode_b(v_fragments as u32, 8); // OutputVFragments = coded
-    enc.encode_b(h_fragments as u32, 8); // OutputHFragments = coded
+    enc.encode_b(mb_rows as u32, 8);
+    enc.encode_b(mb_cols as u32, 8);
+    enc.encode_b(mb_rows as u32, 8); // OutputVFragments = coded
+    enc.encode_b(mb_cols as u32, 8); // OutputHFragments = coded
     enc.encode_b(0, 2); // ScalingMode = MAINTAIN_ASPECT_RATIO
     enc.encode_b1(0); // UseHuffman = 0
 
@@ -485,7 +492,12 @@ pub fn encode_intra_frame_multistream(
 ) -> Result<Vec<u8>, Error> {
     let h_fragments = frame.h_fragments;
     let v_fragments = frame.v_fragments;
-    if h_fragments > u8::MAX as usize || v_fragments > u8::MAX as usize {
+    // §9 geometry is in macroblock units (see `encode_intra_frame_with_banks`).
+    if h_fragments % 2 != 0 || v_fragments % 2 != 0 {
+        return Err(Error::NotImplemented);
+    }
+    let (mb_cols, mb_rows) = (h_fragments / 2, v_fragments / 2);
+    if mb_cols > u8::MAX as usize || mb_rows > u8::MAX as usize {
         return Err(Error::NotImplemented);
     }
 
@@ -496,10 +508,10 @@ pub fn encode_intra_frame_multistream(
 
     // --- Partition 1: §9 tail + §8 Figure-5 (no-update) pass ---
     let mut p1 = BoolEncoder::new();
-    p1.encode_b(v_fragments as u32, 8);
-    p1.encode_b(h_fragments as u32, 8);
-    p1.encode_b(v_fragments as u32, 8); // OutputVFragments = coded
-    p1.encode_b(h_fragments as u32, 8); // OutputHFragments = coded
+    p1.encode_b(mb_rows as u32, 8);
+    p1.encode_b(mb_cols as u32, 8);
+    p1.encode_b(mb_rows as u32, 8); // OutputVFragments = coded
+    p1.encode_b(mb_cols as u32, 8); // OutputHFragments = coded
     p1.encode_b(0, 2); // ScalingMode = MAINTAIN_ASPECT_RATIO
     p1.encode_b1(u8::from(use_huffman)); // UseHuffman
     crate::coeff_prob_update::encode_coefficient_prob_updates(&mut p1);
@@ -587,8 +599,10 @@ mod tests {
         let tail =
             Vp6HeaderTail::parse_with(&mut bc, true, hdr.profile.unwrap(), hdr.version.unwrap())
                 .expect("tail");
-        assert_eq!(tail.h_fragments, Some(frame.h_fragments as u8));
-        assert_eq!(tail.v_fragments, Some(frame.v_fragments as u8));
+        // §9 geometry travels in macroblock units (fixture-arbitrated
+        // erratum) — half the 8x8 luma block-grid dimensions.
+        assert_eq!(tail.h_fragments, Some((frame.h_fragments / 2) as u8));
+        assert_eq!(tail.v_fragments, Some((frame.v_fragments / 2) as u8));
         assert!(!tail.use_huffman);
 
         // The encoder now emits the §8 Figure 5 coefficient-prob-update

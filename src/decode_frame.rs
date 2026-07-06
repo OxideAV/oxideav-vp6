@@ -231,8 +231,16 @@ impl Vp6Decoder {
             return Err(Error::NotImplemented);
         }
 
-        let h_fragments = tail.h_fragments.ok_or(Error::Truncated)? as usize;
-        let v_fragments = tail.v_fragments.ok_or(Error::Truncated)? as usize;
+        // Fixture-arbitrated erratum: the printed §9 Table 2 describes
+        // `VFragments` / `HFragments` as 8x8-block counts ("If image is
+        // 240 pixels high, VFragments will be 30"), but the conformant
+        // third-party vp6f stream (864x480 coded) transmits 54x30 — i.e.
+        // real bitstreams carry the dimensions in **16-px macroblock
+        // units**. The coded frame is therefore always MB-aligned (any
+        // sub-MB display size is signalled out-of-band by the container
+        // crop). Convert to this crate's 8x8 luma block-grid units here.
+        let h_fragments = 2 * tail.h_fragments.ok_or(Error::Truncated)? as usize;
+        let v_fragments = 2 * tail.v_fragments.ok_or(Error::Truncated)? as usize;
 
         // §8 Figure 5 coefficient-probability-update sub-stream. On a
         // keyframe the per-MB info (Figure 2) opens directly with this
