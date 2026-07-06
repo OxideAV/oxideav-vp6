@@ -161,22 +161,25 @@ impl Vp6Decoder {
         // `Buff2Offset` (a byte offset from the start of the compressed
         // frame buffer); with a single partition everything follows in
         // partition 1 and any transmitted `Buff2Offset` is inert.
-        let (tail_bytes, partition2) = if header.multi_stream {
+        //
+        // Partition 1's BoolCoder deliberately spans the **whole**
+        // remaining frame buffer, not `..Buff2Offset`: the §7.3
+        // pseudo-code advances `Pos` through "the bitstream" with no
+        // end-of-partition check, and the conformant third-party vp6f
+        // fixture proves the real encoder sizes partition 1 tightly —
+        // the final BoolCoder decodes of partition 1 renormalize into
+        // the byte(s) at `Buff2Offset` (the coder's 32-bit `Value`
+        // register always holds 4 look-ahead bytes). `Buff2Offset` only
+        // fixes where the *second* reader starts.
+        let tail_bytes = bytes.get(header.raw_prefix_len..).ok_or(Error::Truncated)?;
+        let partition2 = if header.multi_stream {
             let off = header.buff2_offset.ok_or(Error::Truncated)? as usize;
             if off <= header.raw_prefix_len || off > bytes.len() {
                 return Err(Error::Truncated);
             }
-            (
-                bytes
-                    .get(header.raw_prefix_len..off)
-                    .ok_or(Error::Truncated)?,
-                Some(bytes.get(off..).ok_or(Error::Truncated)?),
-            )
+            Some(bytes.get(off..).ok_or(Error::Truncated)?)
         } else {
-            (
-                bytes.get(header.raw_prefix_len..).ok_or(Error::Truncated)?,
-                None,
-            )
+            None
         };
 
         if header.is_keyframe {
