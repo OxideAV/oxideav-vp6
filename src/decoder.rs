@@ -12,14 +12,11 @@
 //!
 //! ## Coverage
 //!
-//! The driver decodes the frame shape the in-tree encoders produce
-//! (Simple/VP6.0, single-partition, BoolCoder coefficients, no
-//! probability-update sub-streams). Frames signalling `MultiStream`,
-//! `UseHuffman`, or in-header probability updates surface as
-//! [`oxideav_core::Error`]`::invalid` until a conformant `.vp6` fixture
-//! pins the Figure-5 update-substream ordering (see the `decode_frame`
-//! module docs). An inter frame fed before any keyframe is likewise a
-//! stream-mis-feed error, not a missing feature.
+//! The driver decodes single-partition and `MultiStream` frames with
+//! BoolCoder or Huffman (`UseHuffman`) second partitions, including the
+//! §8 Figure-1/Figure-5 probability-update sub-streams (see the
+//! `decode_frame` module docs). An inter frame fed before any keyframe
+//! is a stream-mis-feed error, not a missing feature.
 //!
 //! ## Provenance
 //!

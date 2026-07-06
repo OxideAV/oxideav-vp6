@@ -12,6 +12,9 @@ readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-vp6"
 keywords = ["multimedia", "video", "vp6", "codec", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::video"]
+# The conformance fixture (tests/fixtures/, ~1.9 MB) and the tests that
+# consume it stay in git but out of the published package.
+exclude = ["tests/"]
 
 [dependencies]
 oxideav-core = "0.1"

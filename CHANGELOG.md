@@ -6,6 +6,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 390, 2026-07-06)
+
+- **First third-party conformance fixture + gates.** A conformant
+  external vp6f stream (Huffman/MultiStream, 854x480 display / 864x480
+  coded, 1 I + 2 P frames, black-box decode-oracle YUV) is pinned at
+  `tests/fixtures/vp6f-huffman-i-then-p-854x480/` with five CI gates
+  (`tests/conformance_vp6f.rs`): FLV framing, §9 geometry, Figure-5
+  update-substream parse across the partition boundary, and
+  leading-macroblock pixel-exact decode of the keyframe's Huffman
+  coefficient partition against the oracle.
+
+### Fixed (fixture-arbitrated spec errata, round 390)
+
+- **§9 Table 2 geometry is transmitted in macroblock units.** The
+  printed spec calls `VFragments`/`HFragments` "8x8 block units" with
+  worked examples (240 px → 30), but the conformant stream transmits
+  54x30 for its 864x480 coded frame — 16-px macroblock counts. The
+  decoder now sizes frames as `2 * transmitted` luma blocks per axis
+  and the keyframe encoders emit macroblock counts (and reject
+  non-MB-aligned block grids, which the wire format cannot express).
+- **Partition 1's BoolCoder spans past `Buff2Offset`.** The §7.3
+  pseudo-code advances `Pos` with no end-of-partition check; the real
+  encoder sizes partition 1 tightly and the coder's 32-bit look-ahead
+  legitimately renormalizes into the first partition-2 byte (the
+  fixture's Figure-5 pass ends exactly one byte past the boundary).
+  `Buff2Offset` only positions the second reader.
+- **§13.2.2 DC Huffman trees fold node 0's left branch into
+  `ZERO_TOKEN`.** EOB is forbidden in the DC position (§13.2.1), so the
+  DC BoolCoder tree skips the EOB/0 decision and the Huffman conversion
+  credits the whole `NodeProb[0]` to ZERO (the generic §13.1 split
+  describes the AC alphabet). Without the fold the fixture's chroma
+  zero-DC runs decode as the forbidden EOB-in-DC. Corroborated by the
+  §13.2 `DcNodeEqs` "UNUSED DUMMY" row that pins the EOB node at
+  probability 1.
+- **§16 IDCT descales round toward zero.** The printed `>> 16` / `>> 4`
+  descales round toward -inf on negative intermediates; the oracle's
+  flat region (DC -299 at `DctQMask` 60) reconstructs to luma 16 only
+  with truncating division (`>>` lands on 15). Both descales now use
+  `/`.
+
 ### Added (clean-room round 384, 2026-07-03)
 
 - **Golden-aware + FourMV MultiStream packets.** The `CoeffSink` routing
