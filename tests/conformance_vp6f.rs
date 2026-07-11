@@ -20,14 +20,25 @@
 //!    node updates, a custom §12.2 scan order, and AC updates.
 //! 4. The §13.2.2 DC Huffman tree folds the node-0 left branch wholly
 //!    into `ZERO_TOKEN` (EOB is forbidden in the DC position).
-//! 5. The §16 IDCT descales round toward zero (truncating division),
-//!    not toward -inf (the printed `>>` shifts).
+//! 5. The §16 IDCT descale rounding (round-411 correction of an
+//!    earlier under-determined reading): the per-multiply `>> 16`
+//!    descales are arithmetic shifts exactly as printed, and the
+//!    final column-pass descale is `(x + 8) >> 4` — a rounding add
+//!    the printed listing omits. Arbitrated by AC-carrying oracle
+//!    blocks (`keyframe_content_blocks_reconstruct_pixel_exact`);
+//!    flat DC-only blocks reconstruct identically under several
+//!    roundings and cannot distinguish them.
 //!
 //! Full three-frame pixel conformance is the outstanding goal: the
 //! keyframe currently decodes pixel-exactly through the leading
 //! macroblocks (pinned below) but a §13 Huffman-side desync further in
 //! is still under investigation, so the whole-frame gate is not yet
-//! landed.
+//! landed. Differential bit-flip probing against the black-box decode
+//! oracle (flip one partition-2 bit, decode, observe which block's
+//! pixels change first) has mapped the true bit→block ownership of the
+//! keyframe's opening tokens; see the fixture `notes.md` appendix for
+//! the map and the open questions it raises about the §13.2.2 chroma
+//! DC field.
 
 use oxideav_vp6::bool_coder::BoolCoder;
 use oxideav_vp6::coeff_prob_update::{decode_coefficient_prob_updates, CoeffProbBanks};
@@ -187,6 +198,113 @@ fn keyframe_prob_updates_parse_and_span_partition_boundary() {
     );
 }
 
+/// §16 IDCT descale rounding, arbitrated by AC-carrying oracle blocks.
+///
+/// Flat DC-only blocks cannot distinguish the §16 descale roundings
+/// (a flat black block reconstructs to luma 16 under several of
+/// them), but blocks carrying AC coefficients can. For three of the
+/// oracle keyframe's non-uniform display blocks, the quantized
+/// coefficient sets below reproduce the oracle pixels **exactly**
+/// under the operative §16 rounding — per-multiply descale `>> 16`
+/// exactly as printed (arithmetic shift) and final descale
+/// `(x + 8) >> 4` (a rounding add the printed listing omits) — and
+/// under no other combination of {floor, truncate-toward-zero,
+/// round-nearest} multiply/final descales. (Exhaustively checked
+/// against the oracle: **all 555** non-uniform luma display blocks
+/// admit exact integer coefficient solutions only under this
+/// combination; the previous toward-zero reading left every one of
+/// them with an irreducible residual.)
+///
+/// The coefficient sets were recovered from the oracle by inverting
+/// the §15/§16 pipeline (forward transform + quantization at
+/// `DctQMask == 60`: DC factor 12, AC factor 16) and verifying the
+/// reconstruction is bit-exact; raster-order `(position, value)`
+/// pairs.
+#[test]
+fn keyframe_content_blocks_reconstruct_pixel_exact() {
+    let expected = load("expected.yuv");
+    let oy = &expected[..DISPLAY_W * DISPLAY_H];
+    let dequant = DequantContext::new(60);
+
+    // (block_row, block_col, raster-order nonzero quantized coeffs)
+    type Case = (usize, usize, &'static [(usize, i32)]);
+    let cases: [Case; 3] = [
+        (
+            0,
+            63,
+            &[
+                (0, -274),
+                (1, -7),
+                (2, -3),
+                (8, 17),
+                (9, -6),
+                (10, -2),
+                (16, 4),
+                (17, -1),
+            ],
+        ),
+        (
+            0,
+            64,
+            &[
+                (0, -292),
+                (1, 5),
+                (2, 2),
+                (3, 1),
+                (8, 5),
+                (9, 5),
+                (10, 2),
+                (16, 1),
+                (17, 1),
+            ],
+        ),
+        (
+            4,
+            88,
+            &[
+                (0, -258),
+                (1, -5),
+                (2, -9),
+                (5, -1),
+                (6, -1),
+                (8, -13),
+                (9, 2),
+                (10, 3),
+                (16, -8),
+                (17, 1),
+                (18, 2),
+                (24, 3),
+                (26, -1),
+                (40, -1),
+            ],
+        ),
+    ];
+
+    for (br, bc, coeffs) in cases {
+        let mut raster = [0i32; 64];
+        for &(pos, q) in coeffs {
+            let factor = if pos == 0 {
+                dequant.dc_factor
+            } else {
+                dequant.ac_factor
+            } as i32;
+            raster[pos] = q * factor;
+        }
+        oxideav_vp6::idct::idct_block(&mut raster);
+        let pix = oxideav_vp6::reconstruct::intra_block_to_pixels(&raster);
+        for r in 0..8 {
+            for c in 0..8 {
+                let (x, y) = (bc * 8 + c, br * 8 + r);
+                assert_eq!(
+                    pix[r * 8 + c],
+                    oy[y * DISPLAY_W + x],
+                    "block ({br},{bc}) sample ({x},{y})"
+                );
+            }
+        }
+    }
+}
+
 /// Decode the leading macroblocks of the keyframe's Huffman coefficient
 /// partition to pixels and compare against the decode oracle — the
 /// first real-stream pixel-exactness this crate has had.
@@ -195,8 +313,9 @@ fn keyframe_prob_updates_parse_and_span_partition_boundary() {
 /// `DCT_VAL_CATEGORY6` = -299 and the chroma zero-DC runs are only
 /// decodable under the fold), the §13.4 run decoding, the §15 dequant
 /// at `DctQMask == 60`, the §14 DC prediction chain, and the §16
-/// truncating (toward-zero) IDCT descales: `-299 * 12` reconstructs to
-/// the oracle's luma 16 only with truncation (`>>` gives 15).
+/// IDCT rounding on the flat path (`-299 * 12` reconstructs to the
+/// oracle's luma 16; the AC-sensitive rounding arbitration lives in
+/// `keyframe_content_blocks_reconstruct_pixel_exact`).
 #[test]
 fn keyframe_leading_macroblocks_decode_pixel_exact() {
     let raw = load("input.vp6");

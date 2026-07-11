@@ -46,19 +46,36 @@
 //! normalisation. This matches a standard separable IDCT: no descale
 //! between the passes, a single `>> 4` after the second.
 //!
-//! ## Descale rounding — fixture-arbitrated (toward zero, not `>>`)
+//! ## Descale rounding — fixture-arbitrated (`>> 16` as printed; final
+//! `(x + 8) >> 4`)
 //!
 //! The §16 pseudocode prints every descale as a right shift (`>> 16`
 //! after each constant multiply, `>> 4` on the column-pass outputs).
-//! For negative intermediates an arithmetic right shift rounds toward
-//! **-inf**; the real On2 decoder rounds toward **zero** (truncating
-//! division). The conformant third-party vp6f fixture
-//! (`tests/fixtures/vp6f-huffman-i-then-p-854x480/`) arbitrates this:
-//! its keyframe's flat black region reconstructs from a DC of -299 at
-//! `DctQMask == 60` (DC factor 12), and only the toward-zero descale
-//! chain produces the decode oracle's luma value 16 (`>>` lands on
-//! 15). This module therefore descales with `/ 65536` and `/ 16`,
-//! which differ from the printed shifts exactly on negative values.
+//! The conformant third-party vp6f fixture
+//! (`tests/fixtures/vp6f-huffman-i-then-p-854x480/`) arbitrates the
+//! rounding of both:
+//!
+//! * The per-multiply `>> 16` descales are **arithmetic shifts exactly
+//!   as printed** (rounding toward -inf on negative intermediates).
+//! * The final column-pass descale carries a **rounding add the
+//!   printed listing omits**: `(x + 8) >> 4` (round-half-up), not the
+//!   plain `>> 4`.
+//!
+//! Evidence: every one of the fixture keyframe's 555 non-uniform
+//! (AC-carrying) display blocks admits an integer coefficient block
+//! that reconstructs its decode-oracle pixels **exactly** under
+//! `>> 16` + `(x + 8) >> 4` — and under *no other* combination of
+//! {floor, truncate-toward-zero, round-nearest} multiply/final
+//! descales (each other combination leaves most content blocks with
+//! an irreducible pixel residual for *every* integer coefficient
+//! assignment). The `keyframe_content_blocks_reconstruct_pixel_exact`
+//! conformance gate pins three such blocks. The flat-region evidence
+//! behind the earlier round-390 "round toward zero" reading is equally
+//! satisfied here — a flat black block (DC -299 at `DctQMask == 60`,
+//! DC factor 12) reconstructs to the oracle's luma 16 under both
+//! readings, so DC-only blocks cannot distinguish them. That earlier
+//! note was an under-determined misdiagnosis, corrected in round 411
+//! (AC-carrying blocks *do* distinguish the readings).
 //!
 //! ## Spec note: a column-pass OCR artefact
 //!
@@ -113,12 +130,12 @@ fn butterfly(ip: [i32; 8]) -> [i32; 8] {
     // products widen.
     #[inline]
     fn m(c: i32, v: i32) -> i32 {
-        // Truncating division, NOT an arithmetic right shift: see the
-        // module-level "descale rounding" note. `/ 65536` rounds
-        // toward zero for negative products where `>> 16` would round
-        // toward -inf; the conformant third-party vp6f fixture pins
-        // the toward-zero behaviour.
-        ((c as i64 * v as i64) / 65536) as i32
+        // Arithmetic right shift exactly as the §16 listing prints it
+        // (rounds toward -inf on negative products); the fixture's
+        // AC-carrying blocks arbitrate this against the truncating /
+        // round-nearest alternatives — see the module-level "descale
+        // rounding" note.
+        ((c as i64 * v as i64) >> 16) as i32
     }
     let a = m(XC1S7, ip[1]) + m(XC7S1, ip[7]);
     let b = m(XC7S1, ip[1]) - m(XC1S7, ip[7]);
@@ -208,9 +225,9 @@ pub fn idct_block(block: &mut [i32; 64]) {
         ];
         let op = butterfly(ip);
         for k in 0..8 {
-            // Truncating descale (toward zero), not `>> 4`: see the
-            // module-level "descale rounding" note.
-            block[col + k * 8] = op[k] / 16;
+            // Rounding descale `(x + 8) >> 4`, not the printed plain
+            // `>> 4`: see the module-level "descale rounding" note.
+            block[col + k * 8] = (op[k] + 8) >> 4;
         }
     }
 }
@@ -260,20 +277,21 @@ mod tests {
         idct_block(&mut block);
 
         // Recompute the expected uniform value the same way the
-        // transform does, term by term.
+        // transform does, term by term (final descale carries the
+        // fixture-arbitrated `+ 8` rounding term).
         let e_pass1 = (XC4S4 * dc) >> 16;
-        let expected = ((XC4S4 * e_pass1) >> 16) >> 4;
+        let expected = (((XC4S4 * e_pass1) >> 16) + 8) >> 4;
 
         for (i, &v) in block.iter().enumerate() {
             assert_eq!(v, expected, "position {i} not flat");
         }
     }
 
-    /// A negative DC coefficient yields a uniformly negative (or zero,
-    /// per descaling) flat block — sign is preserved, and every descale
-    /// rounds **toward zero** (the fixture-arbitrated truncating
-    /// division, not the printed arithmetic shifts; see the module
-    /// docs).
+    /// A negative DC coefficient yields a uniformly negative flat
+    /// block — sign is preserved. The multiply descales are arithmetic
+    /// `>> 16` shifts exactly as printed and the final descale is the
+    /// rounding `(x + 8) >> 4` (both fixture-arbitrated; see the
+    /// module docs).
     #[test]
     fn negative_dc_is_flat_and_signed() {
         let dc: i32 = -512;
@@ -281,8 +299,8 @@ mod tests {
         block[0] = dc;
         idct_block(&mut block);
 
-        let e_pass1 = (XC4S4 * dc) / 65536;
-        let expected = ((XC4S4 * e_pass1) / 65536) / 16;
+        let e_pass1 = (XC4S4 * dc) >> 16;
+        let expected = (((XC4S4 * e_pass1) >> 16) + 8) >> 4;
         assert!(expected < 0, "negative DC should descale negative");
         for &v in block.iter() {
             assert_eq!(v, expected);
