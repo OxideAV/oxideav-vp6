@@ -14,24 +14,36 @@ Specification" (document version 1.02, August 2006), staged at
 `docs/video/vp6/vp6-errata-and-clarifications.md`. No third-party VP6
 source has been consulted at any stage.
 
+**Round 411 — §16 IDCT rounding corrected + chroma DC coding cracked
+via bit-flip probing.** The round-390 "toward zero" IDCT reading was an
+under-determined misdiagnosis: AC-carrying oracle blocks arbitrate the
+true §16 descales as `>> 16` **exactly as printed** plus a final
+`(x + 8) >> 4` rounding add the listing omits — all 555 non-uniform
+oracle luma blocks reconstruct pixel-exactly under this combination
+and under no other (new CI gate). Differential bit-flip probing
+against the black-box decode oracle then mapped the keyframe's true
+bit→block token ownership and pinned two §13.2.2/§14 findings: the
+chroma DC Huffman tree derives from the **luma** probability bank, and
+the chroma §14 frame-start DC seed is **+128**, not zero. With both
+applied experimentally the keyframe's whole 31-MB uniform prefix and
+the first content block's DC parse pixel-exactly; the remaining
+divergence is isolated to the §13.3.2 AC Huffman trees. Driver wiring
+is deferred behind a newly-diagnosed pre-existing arithmetic-path
+encoder fidelity bug (see the changelog and the fixture `notes.md`
+appendix for the full investigation record).
+
 **Round 390 — first third-party conformance fixture.** A conformant
 external vp6f stream (Huffman/MultiStream, 854x480, I+P+P, black-box
-decode-oracle YUV) now lives at
-`tests/fixtures/vp6f-huffman-i-then-p-854x480/` with five CI gates
-(`tests/conformance_vp6f.rs`). It arbitrated four printed-spec errata,
-all fixed and pinned: §9 Table 2 geometry is transmitted in
-**macroblock units** (not the printed 8x8-block units); partition 1's
-BoolCoder legitimately reads past `Buff2Offset` (tight partition
-sizing + 32-bit look-ahead); the §13.2.2 DC Huffman trees fold node
-0's left branch wholly into `ZERO_TOKEN` (EOB is forbidden in DC); and
-the §16 IDCT descales round **toward zero**, not the printed `>>`
-shifts. The keyframe's real Huffman coefficient partition now decodes
-pixel-exactly through its leading macroblocks against the oracle
-(gated in CI). Full three-frame conformance is the open goal: past the
-first §13.4 run-refresh boundary the printed §13.2.2/§13.3.2/§13.4
-text under-specifies the cross-block run/refresh grammar and the parse
-desyncs; see the changelog and the conformance test's module docs for
-the precise state.
+decode-oracle YUV) lives at
+`tests/fixtures/vp6f-huffman-i-then-p-854x480/` with CI gates
+(`tests/conformance_vp6f.rs`). It arbitrated printed-spec errata, fixed
+and pinned: §9 Table 2 geometry is transmitted in **macroblock units**
+(not the printed 8x8-block units); partition 1's BoolCoder legitimately
+reads past `Buff2Offset` (tight partition sizing + 32-bit look-ahead);
+and the §13.2.2 DC Huffman trees fold node 0's left branch wholly into
+`ZERO_TOKEN` (EOB is forbidden in DC). The keyframe's real Huffman
+coefficient partition decodes pixel-exactly through its leading
+macroblocks against the oracle (gated in CI).
 
 Almost every decode primitive is implemented and unit-tested. The crate
 exposes a **full intra-frame (I-frame) decoder** (`decode_intra_frame`)

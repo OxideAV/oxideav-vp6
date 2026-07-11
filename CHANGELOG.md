@@ -6,6 +6,45 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed (fixture-arbitrated spec errata, round 411, 2026-07-11)
+
+- **§16 IDCT descale rounding — corrects the round-390 "toward zero"
+  note, which was an under-determined misdiagnosis.** The operative
+  descales are: per-multiply `>> 16` **exactly as printed** (arithmetic
+  shift, toward -inf on negatives) and a final column-pass
+  `(x + 8) >> 4` — a rounding add the printed listing omits. Arbitrated
+  by AC-carrying oracle blocks: every one of the fixture keyframe's 555
+  non-uniform luma display blocks admits an integer coefficient block
+  reconstructing its oracle pixels exactly under this combination, and
+  under **no other** {floor, toward-zero, round-nearest} multiply/final
+  pairing (each leaves most content blocks with an irreducible residual
+  for every integer coefficient assignment). Flat DC-only blocks — the
+  only evidence round 390 had — reconstruct identically under several
+  roundings and cannot distinguish them. New CI gate:
+  `keyframe_content_blocks_reconstruct_pixel_exact` pins three oracle
+  blocks' exact reconstruction.
+
+### Added (clean-room round 411, 2026-07-11)
+
+- **Differential bit-flip conformance probing + chroma DC findings.**
+  Single-bit corruptions of the fixture keyframe's second partition,
+  decoded through the black-box oracle, map the true bit→block
+  ownership of the opening tokens (recorded in the fixture `notes.md`
+  appendix). Two §13.2.2/§14 findings validated in an experimental
+  decode walk (whole 31-MB uniform prefix + the first content block's
+  DC now parse pixel-exactly): the chroma DC Huffman tree is built from
+  the **luma** node-probability bank, and the §14 frame-start "last
+  decoded DC" seed for the chroma planes is **+128** (quantized-DC
+  domain), not the zero §14's prose states.
+  `DcPredictionContext::new_chroma` + `CHROMA_DC_PREDICTION_SEED` land
+  the seed API; wiring both findings into the shared drivers is
+  deferred until a pre-existing arithmetic-path encoder fidelity bug
+  (worst-case sample errors ~189 hiding under loose PSNR floors) is
+  fixed, so the encoder⇄decoder round-trips stay exact. The remaining
+  Huffman-path divergence is isolated to the §13.3.2 AC Huffman trees
+  (first mismatch: true CATEGORY2 read as FIVE at the first content
+  block's AC 1).
+
 ### Added (clean-room round 390, 2026-07-06)
 
 - **First third-party conformance fixture + gates.** A conformant

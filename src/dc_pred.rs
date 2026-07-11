@@ -204,6 +204,11 @@ pub struct Neighbour {
     pub reference: ReferenceBucket,
 }
 
+/// The §14 frame-start "last decoded DC" seed for the chroma (U/V)
+/// planes, in the quantized-DC domain — fixture-arbitrated at `128`
+/// (see [`DcPredictionContext::new_chroma`]). Luma seeds at `0`.
+pub const CHROMA_DC_PREDICTION_SEED: i32 = 128;
+
 /// Per-plane DC prediction state for §14.
 ///
 /// Holds the per-reference-bucket "last decoded DC value" the spec
@@ -240,6 +245,29 @@ impl DcPredictionContext {
     pub fn new() -> Self {
         Self {
             last_dc: [0; ReferenceBucket::COUNT],
+        }
+    }
+
+    /// A freshly-seeded context for a **chroma** plane (U or V):
+    /// every bucket's last-DC value starts at
+    /// [`CHROMA_DC_PREDICTION_SEED`] (`128`), not zero.
+    ///
+    /// Fixture-arbitrated (round 411): on the conformant third-party
+    /// vp6f keyframe the first U and V blocks — which reconstruct to
+    /// exactly 128 (a coded DC of 0) — each carry a coded
+    /// `DCT_VAL_CATEGORY6` DC *delta* of `-128`, so the §14
+    /// no-neighbour fallback predictor for the first chroma block of
+    /// the frame must be `+128` in the quantized-DC domain, not the
+    /// zero §14's prose states ("this last decoded DC value is set to
+    /// zero for each prediction frame type" — contradicted for chroma
+    /// by the stream). Differential bit-flip probing against the
+    /// black-box decode oracle confirms the `-128` field bit-exactly
+    /// (see the fixture notes.md appendix). Luma keeps the zero seed
+    /// (the keyframe's first luma DC decodes as a plain `-299` against
+    /// a zero predictor).
+    pub fn new_chroma() -> Self {
+        Self {
+            last_dc: [CHROMA_DC_PREDICTION_SEED; ReferenceBucket::COUNT],
         }
     }
 
@@ -331,6 +359,27 @@ impl DcPredictionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `new_chroma` seeds every reference bucket's last-DC at the
+    /// fixture-arbitrated `CHROMA_DC_PREDICTION_SEED` (128), while
+    /// `new` keeps the §14 zero seed.
+    #[test]
+    fn chroma_context_seeds_at_128() {
+        let c = DcPredictionContext::new_chroma();
+        for bucket in [
+            ReferenceBucket::Intra,
+            ReferenceBucket::InterLast,
+            ReferenceBucket::InterGolden,
+        ] {
+            assert_eq!(c.last_dc(bucket), CHROMA_DC_PREDICTION_SEED);
+            assert_eq!(DcPredictionContext::new().last_dc(bucket), 0);
+        }
+        // No-neighbour prediction returns the seed.
+        let mut c = DcPredictionContext::new_chroma();
+        assert_eq!(c.predict(ReferenceBucket::Intra, None, None), 128);
+        c.set_last_dc(ReferenceBucket::Intra, 0);
+        assert_eq!(c.predict(ReferenceBucket::Intra, None, None), 0);
+    }
 
     #[test]
     fn sign_matches_spec_three_branches() {

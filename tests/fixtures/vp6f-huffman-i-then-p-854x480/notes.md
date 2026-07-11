@@ -140,3 +140,116 @@ expected.yuv  3e24da31aa790e085c265dd596223af3d2f66862843ec7e77072a00d8f079cbb
 - §13.4 Decoding Huffman EOB and DC-0 Runs.
 </content>
 </invoke>
+
+---
+
+## Round-411 investigation appendix — whole-frame Huffman conformance
+
+All findings below were derived from this fixture only: the staged spec
+(`docs/video/vp6/vp6_format.pdf`), the oracle `expected.yuv`, and
+**differential bit-flip probing** of the black-box decode oracle (flip a
+single bit of the keyframe's second partition inside `input.flv`, decode
+with the oracle binary, diff the YUV output — the first block whose
+pixels change identifies which block owns that bit). The oracle pairing
+was re-verified this round: a fresh `ffmpeg -i input.flv -f rawvideo
+-pix_fmt yuv420p` decode is byte-identical to `expected.yuv`.
+
+### 1. §16 IDCT descale rounding (LANDED — corrects the r390 note)
+
+Every §16 rounding combination was tested by searching, per non-uniform
+oracle display block, for an integer quantized-coefficient block that
+reconstructs the oracle pixels exactly (dequant at `DctQMask == 60`:
+DC 12 / AC 16, then §16 IDCT, then §17.1 `+128` + clamp):
+
+| multiply descale | final descale | luma blocks solving exactly |
+|---|---|---|
+| `>> 16` (floor, as printed) | `(x + 8) >> 4` | **555 / 555** |
+| any other {floor, toward-zero, nearest} combination | | 0–33 / 555 |
+
+The r390 "round toward zero" reading was under-determined: flat DC-only
+blocks (the only evidence r390 had) reconstruct to 16 under several
+roundings. Gated by `keyframe_content_blocks_reconstruct_pixel_exact`.
+
+### 2. Bit→block ownership map of the keyframe's opening (bit-flip probe)
+
+Bit positions are relative to the start of partition 2 (byte 225 of
+`input.vp6`). "structural" = a flipped bit makes the oracle decoder
+refuse/short the frame (token codewords, run fields).
+
+| bits | owner |
+|---|---|
+| 0..3 | Y(0,0) DC codeword (`1100`, CATEGORY6 in the retrained luma DC tree) |
+| 4..14 | Y(0,0) DC `R(11)` magnitude = 232 (DC −299) |
+| 15 | Y(0,0) DC sign |
+| 16..18 | Y(0,0) AC-EOB codeword (`111`, prec-2 band-0) |
+| 19..27 | §13.4 EOB run = 74 |
+| 28..29 | Y(0,1) DC ZERO codeword (`00`) |
+| 30..38 | §13.4 DC-zero run = 74 |
+| 39..42 | **U(0,0) DC codeword `1100` = CATEGORY6 in the *luma* tree shape** |
+| 43..53 | U(0,0) DC `R(11)` magnitude = 61 (value −(67+61) = **−128**) |
+| 54 | U(0,0) DC sign (flip ⇒ +96 px on U(0,0) = 2×128 DC quanta — confirms \|DC\| = 128) |
+| 55..58 | U(0,0) AC-EOB codeword |
+| 59..67 | §13.4 EOB run = 74 |
+| 68..71 | **V(0,0) DC codeword `1100`** |
+| 72..83 | V(0,0) DC magnitude/sign — identical −128 field |
+| 84..115 | structural (V AC-EOB + run, further §13.4 runs covering the uniform prefix) |
+| 116..121 | Y(0,62) DC ONE token (+1 — a "hidden" DC delta rendering identically to 16) |
+| 121..128 | Y(0,63) DC = CATEGORY4, magnitude bits 5, `+24` delta — decodes exactly against predictor −298 |
+| 129.. | Y(0,63) AC tokens (still misdecoding under our derived AC trees — open) |
+
+Per-bit flip differentials on U(0,0) read out an exact binary-weighted
+magnitude ladder (256/128/64/32/16/8/4/2/1 DC quanta at 0.375 px per
+quantum), pinning the CATEGORY6 `R(11)` field layout.
+
+### 3. Chroma DC findings (validated in an experimental decode walk)
+
+* **Chroma DC Huffman tree = the luma-bank tree.** The chroma DC reads
+  use codewords matching the tree built from the *retrained plane-0
+  (luma)* DC node probabilities — not the untouched all-128 chroma bank
+  (this stream's Figure-5 pass updates only the luma DC nodes). The
+  §13.2.2 `DcHuffTree[2]` derivation for the chroma plane therefore
+  does not consume `DCProbs[1]` the way its prose suggests. Open: the
+  precise mechanism (shared tree vs a different Table 25 indexing vs
+  chroma-bank update semantics).
+* **Chroma DC prediction seeds at +128.** U(0,0)/V(0,0) each carry a
+  coded DC delta of −128 yet reconstruct to exactly 128 (coded DC 0):
+  the §14 "last decoded DC" frame-start seed for the chroma planes is
+  `+128` in the quantized-DC domain, not the zero §14's prose states.
+  (`DcPredictionContext::new_chroma` / `CHROMA_DC_PREDICTION_SEED`
+  landed; not yet wired into the shared drivers — see below.)
+* With both applied experimentally, the whole uniform prefix of the
+  keyframe (the first 31 macroblocks, including a hidden `+1` DC at
+  Y(0,62)) parses and reconstructs pixel-exactly, and the first content
+  block's DC token decodes exactly (`+24` at bits 121..128). The parse
+  then diverges at Y(0,63)'s **AC** tokens: the §13.3.2 AC Huffman
+  trees our §13.1 conversion derives do not match the stream (first
+  mismatch: true CATEGORY2(−7) read as FIVE under
+  `AcHuffTree[Y][prec2][band0]`). Known-plaintext solving of the AC
+  codewords is the next step.
+
+### 4. Why the driver wiring is deferred
+
+Wiring `new_chroma` + the luma-bank chroma tree into the shared
+decode/encode drivers currently breaks three arithmetic-path round-trip
+tests — investigation shows those failures expose a **pre-existing**
+encoder/decoder fidelity bug on the arithmetic path (a fully-reverted
+tree round-trips a 32×32 gradient with worst-case sample errors of ~189
+while still clearing the suite's PSNR floors). That bug must be fixed
+first so the seed change can land with the round-trips staying exact.
+
+### Reproduction (bit-flip probe)
+
+```
+# flip bit N of partition 2 inside the keyframe tag of input.flv,
+# decode frame 0, diff against expected.yuv frame 0
+python3 - <<PY
+flv = bytearray(open('input.flv','rb').read())
+vp6 = open('input.vp6','rb').read()
+off = bytes(flv).find(vp6) + 225   # partition 2
+N = 43                             # bit to flip
+flv[off + N//8] ^= 1 << (7 - N%8)
+open('mut.flv','wb').write(flv)
+PY
+ffmpeg -y -i mut.flv -frames:v 1 -f rawvideo -pix_fmt yuv420p mut.yuv
+cmp mut.yuv expected.yuv
+```
