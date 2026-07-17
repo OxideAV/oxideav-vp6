@@ -838,94 +838,221 @@
 
 use oxideav_core::RuntimeContext;
 
-pub mod block_decode;
-pub mod bool_coder;
-pub mod coeff_prob_update;
-pub mod coeff_source;
-pub mod dc_pred;
-pub mod dct_decode;
+// Stable surface: the registered decode/encode drivers plus the frame/error
+// types they hand back. `decode_frame`, `decoder`, `encoder` stay fully
+// visible; `frame_assembly` and `inter_frame` are mixed (stable types +
+// internal plumbing) and are hidden item-by-item inside their files.
 pub mod decode_frame;
 pub mod decoder;
-pub mod dequant;
 pub mod encoder;
-pub mod forward_dct;
-pub mod fourmv;
 pub mod frame_assembly;
-pub mod frame_header;
-pub mod huff_coeff;
-pub mod huffman;
-pub mod idct;
-pub mod inter;
-pub mod inter_encode;
 pub mod inter_frame;
+
+// Everything below is codec plumbing (BoolCoder / DCT / MV / reconstruction /
+// entropy tables) exposed only so tests, benches and fuzz targets can reach
+// it. It is not part of the stable API; `#[doc(hidden)]` keeps
+// cargo-semver-checks from treating its constant churn as public surface.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod block_decode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod bool_coder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod coeff_prob_update;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod coeff_source;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod dc_pred;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod dct_decode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod dequant;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod forward_dct;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod fourmv;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod frame_header;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod huff_coeff;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod huffman;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod idct;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod inter;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod inter_encode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod interp;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod intra_encode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod intra_frame;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod loopfilter;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mode_decode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mode_encode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mode_prob_update;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod modes;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mv_decode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mv_diff;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mv_encode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mv_prob_update;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod near_mv;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod prob_update;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod rate_control;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod raw_bits;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod reconstruct;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod scaling;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod scan;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod scan_update;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod token_encode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod tokens;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod umv;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod zrl;
 
+// ---- Stable re-exports: frame + reference types in visible driver signatures.
+// `frame_assembly` and `inter_frame` stay visible modules; only the stable
+// types are re-exported here without `#[doc(hidden)]`. `Frame`/`Plane`/
+// `AssemblyError` appear in `Vp6Decoder::decode_packet` and the `Plane` API;
+// `ReferenceFrames`/`BorderedRef` appear in `Vp6Decoder::references` /
+// `ReferenceFrames::bordered`.
+pub use frame_assembly::{AssemblyError, Frame, Plane};
+pub use inter_frame::{BorderedRef, ReferenceFrames};
+
+// ---- Internal re-exports — codec plumbing exposed only for tests/fuzz; not
+// part of the stable API. Each is `#[doc(hidden)]` so cargo-semver-checks and
+// rustdoc treat it as private. The remaining `frame_assembly`/`inter_frame`
+// items below are the internal half of those two mixed modules.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use block_decode::{
     decode_block_coefficients, decode_block_coefficients_ctx, decode_block_to_raster,
     dequantize_to_raster, AcProbBank, BlockCoeffs, DequantizedBlock, ZeroRunProbBank, BLOCK_SIZE,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use bool_coder::{BoolCoder, BoolEncoder};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use coeff_prob_update::{
     decode_coefficient_prob_updates, encode_coefficient_prob_updates,
     encode_coefficient_prob_updates_full, encode_coefficient_prob_updates_with_scan,
     node_prob_update_representable, CoeffProbBanks,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use dc_pred::{
     average_both_neighbours, sign as dc_sign, DcPredictionContext, Neighbour, ReferenceBucket,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use dct_decode::{
     decode_ac_coefficient, decode_ac_token, decode_ac_zero_run, decode_dc, decode_dc_token,
     decode_token_value, AcOutcome,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use forward_dct::fdct_block;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use fourmv::{
     average_four_away_from_zero, decode_fourmv_block_mode, decode_fourmv_block_modes,
     derive_fourmv_chroma_mv, reconstruct_fourmv_macroblock, FourMvMacroblock, FOURMV_BLOCK_MODES,
     NUM_FOURMV_BLOCK_MODES, NUM_LUMA_BLOCKS_PER_MB,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use frame_assembly::{
-    mb_cols_for, mb_rows_for, AssemblyError, Frame, Plane, BLOCK_DIM, MB_LUMA_BLOCKS,
-    MB_LUMA_BLOCK_OFFSETS, MB_LUMA_DIM,
+    mb_cols_for, mb_rows_for, BLOCK_DIM, MB_LUMA_BLOCKS, MB_LUMA_BLOCK_OFFSETS, MB_LUMA_DIM,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use frame_header::{
     CodingProfile, FrameType, LoopFilter, PredictionFilter, Vp3Version, Vp6FrameHeader,
     Vp6HeaderTail,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use huffman::{
     codeword_for, create_huffman_tree, decode_symbol, tree_depth, HuffNode, HuffmanError,
     INTERNAL_SYMBOL, NO_CHILD,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use idct::idct_block;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use inter::{
     chroma_frac, fetch_prediction_block, fetch_prediction_block_clamped, inter_block_to_pixels,
     luma_frac, predict_inter_block_subpel, reconstruct_inter_block, reconstruct_inter_macroblock,
     whole_sample_aligned, FilterFamily, MvShift, PredictionFilterPolicy, ReconstructedMacroblock,
     RefPlane,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use inter_encode::{
     encode_inter_frame, encode_inter_frame_me, encode_inter_frame_me_fourmv,
     encode_inter_frame_me_fourmv_packet, encode_inter_frame_me_golden,
@@ -933,75 +1060,118 @@ pub use inter_encode::{
     encode_inter_frame_me_packet, encode_inter_frame_packet, FOURMV_SAD_MARGIN,
     GOLDEN_SWITCH_PENALTY, ME_LAMBDA_SAD,
 };
-pub use inter_frame::{
-    decode_inter_frame, decode_inter_frame_with_refs, BorderedRef, FilterConfig, InterProbs,
-    ReferenceFrames,
-};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub use inter_frame::{decode_inter_frame, decode_inter_frame_with_refs, FilterConfig, InterProbs};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use interp::{
     bicubic_block, bicubic_point, bilinear_block, bilinear_point, var_16_point, BICUBIC_FILTER_SET,
     BICUBIC_VP61_INDEX, BILINEAR_CHROMA_FILTERS, BILINEAR_LUMA_FILTERS,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use intra_encode::{encode_intra_frame, encode_intra_frame_with_banks};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use intra_frame::{decode_intra_frame, IntraProbs};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use loopfilter::{
     bound, boundary_whole_pixel, boundary_x, boundary_y, filter_horizontal_boundary,
     filter_vertical_boundary, prediction_loop_filter_function, PREDICTION_LOOP_FILTER_LIMIT_VALUES,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use mode_decode::{decode_mode, decode_mode_from_probs, descend_mode_tree};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use mode_encode::{encode_mode, encode_mode_descend, encode_mode_from_probs};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use mode_prob_update::{
     apply_prob_difference, decode_mode_prob_difference, decode_mode_prob_update_value,
     update_mode_probs, update_mode_probs_for_situation, FIGURE9_NODE_PROBS, LONG_DIFFERENCE_BITS,
     SET_NEW_BASELINE_PROBS_FLAG, SIGN_PROB, UPDATE_FLAG_PROB, VECTOR_UPDATES_PRESENT_FLAG,
     WHICH_VECTOR_BITS,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use modes::{
     build_mode_decision_tree, build_probability_mode_same, mode_decision_tree_node_probability,
     probability_mode_same, CodingMode, ModeAvailability, ModeDecisionTree, ModeDecisionTreeRow,
     NEAR_MACROBLOCKS, NUM_CODING_MODES, NUM_MODE_DECISION_NODES, NUM_MODE_VQ_VECTORS,
     NUM_PROBABILITY_SITUATIONS, PROB_XMITTED_ROW_LEN, VP6_BASELINE_XMITTED_PROBS, VP6_MODE_VQ,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use mv_decode::{
     decode_long_mv_magnitude, decode_mv_component, decode_mv_pair, decode_short_mv_magnitude,
     MvProbs, IS_MV_SHORT_PROBS_DEFAULTS, MV_AXIS_X, MV_AXIS_Y, MV_SIGN_PROBS_DEFAULTS,
     MV_SIZE_PROBS_DEFAULTS, NUM_MV_AXES, NUM_MV_SIZE_NODES, NUM_SHORT_MV_NODES,
     SHORT_MV_PROBS_DEFAULTS,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use mv_diff::{
     reconstruct_diff_mv, reconstruct_new_mv, reconstruct_new_mv_from_grid,
     select_diff_reference_mv, select_diff_reference_mv_from_grid, DIFF_REFERENCE_OFFSETS,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use mv_encode::{encode_mv_component, encode_mv_pair, MAX_MV_MAGNITUDE};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use mv_prob_update::{
     update_mv_probs, LONG_VECTOR_BIT_ORDER, UPDATE_IS_MV_SHORT_PROBABILITIES,
     UPDATE_LONG_VECTOR_BIT_PROBABILITIES, UPDATE_MV_SIGN_PROBABILITIES,
     UPDATE_SHORT_VECTOR_NODE_PROBABILITIES,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use near_mv::{
     resolve_near_mvs, resolve_near_mvs_from_grid, MotionVector, NearMvResolution, NeighbourMv,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use prob_update::{
     decode_new_node_prob, update_ac_probs, update_dc_probs, update_zero_run_probs,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use rate_control::{
     select_quantiser_for_budget, select_quantiser_for_target_size, QuantiserChoice, MAX_Q, MIN_Q,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use raw_bits::{RawBitError, RawBitReader};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use scaling::{FrameGeometry, OutputScaling, ScalingMode, FRAGMENT_DIM};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use scan::{
     raster_to_zigzag_block, zigzag_to_raster_block, DEFAULT_SCAN_ORDER,
     DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use scan_update::{
     build_custom_scan_order, custom_scan_order_to_raster, decode_coeff_band_updates,
     decode_scan_order_update, BandAssignment, COEFF_BAND_UPDATE_FLAG_PROBS,
     CUSTOM_SCAN_BAND_RANGES, DEFAULT_BAND_ASSIGNMENT, NUM_AC_POSITIONS, NUM_SCAN_BANDS,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use token_encode::{
     encode_ac_token, encode_ac_zero_run, encode_dc, encode_dc_token, encode_token_value,
     token_for_magnitude,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use tokens::{
     baseline_ac_probs, baseline_dc_probs, dc_probs_to_node_contexts,
     dct_token_bool_tree_to_huff_probs, AcBand, AcPlane, AcPrecContext, DcContext,
@@ -1009,10 +1179,14 @@ pub use tokens::{
     NUM_AC_PREC_CONTEXTS, NUM_DCT_TOKENS, NUM_DC_CONTEXTS, NUM_DC_NODE_EQS, NUM_PLANES,
     NUM_TREE_NODES, VP6_DC_UPDATE_PROBS,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use umv::{
     build_extended_buffer, extend_border, extended_height, extended_stride, origin_offset,
     UMV_BORDER_SIZE,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use zrl::{
     build_zrl_huffman_tree, zrl_bool_tree_to_huff_probs, ZrlBand, ZrlNode, NUM_ZRL_BANDS,
     NUM_ZRL_HUFF_PROBS, NUM_ZRL_NODES, ZERO_RUN_PROB_DEFAULTS, ZRL_UPDATE_PROBS,

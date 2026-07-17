@@ -6,6 +6,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Marked the crate's internal plumbing (`#[doc(hidden)]`): the BoolCoder,
+  DCT/IDCT, MV, entropy-table and reconstruction modules are exposed only
+  for tests/fuzz, so they are hidden from the public API. The stable
+  surface is the registered decode/encode drivers (`Vp6Decoder`,
+  `decoder`/`encoder` registration, `make_decoder`/`make_encoder`,
+  `register`) plus the frame/error types in their signatures (`Frame`,
+  `Plane`, `AssemblyError`, `ReferenceFrames`, `BorderedRef`, `Error`).
+  This stops cargo-semver-checks from treating internal churn as public
+  API. No behavioural or signature change.
+
 ### Fixed (fixture-arbitrated spec errata, round 411, 2026-07-11)
 
 - **§16 IDCT descale rounding — corrects the round-390 "toward zero"

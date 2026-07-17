@@ -239,6 +239,8 @@ impl ReferenceFrames {
 /// §13 coefficient-probability updates from the frame header before
 /// constructing this struct.
 #[derive(Debug, Clone)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct InterProbs {
     /// The §10 `probXmitted[3][20]` mode-decode bank (post-§10 update).
     pub mode_probs: [[u8; PROB_XMITTED_ROW_LEN]; NUM_PROBABILITY_SITUATIONS],
@@ -274,6 +276,8 @@ impl InterProbs {
 
 /// The §11.3 / §11.4 prediction-filter configuration for a frame.
 #[derive(Debug, Clone, Copy)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct FilterConfig {
     /// The §11.4 prediction-filter family policy (fixed or auto-select).
     pub policy: PredictionFilterPolicy,
@@ -484,6 +488,8 @@ fn residual_of(
 ///
 /// [`Error::Truncated`] if the partition runs out mid-MB.
 #[allow(clippy::too_many_arguments)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_inter_frame(
     bc: &mut crate::bool_coder::BoolCoder<'_>,
     h_fragments: usize,
@@ -567,6 +573,8 @@ pub fn decode_inter_frame(
 /// single-stream walk threads; the coefficient pass threads the
 /// identical §14 DC grids — only the *interleaving* differs.
 #[allow(clippy::too_many_arguments)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_inter_frame_multistream(
     bc: &mut crate::bool_coder::BoolCoder<'_>,
     src: &mut CoeffSource<'_, '_>,
@@ -632,6 +640,8 @@ pub fn decode_inter_frame_multistream(
 /// Decode a two-partition P-frame against a [`ReferenceFrames`] state
 /// holder — the MultiStream dual of [`decode_inter_frame_with_refs`].
 #[allow(clippy::too_many_arguments)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_inter_frame_multistream_with_refs(
     bc: &mut crate::bool_coder::BoolCoder<'_>,
     src: &mut CoeffSource<'_, '_>,
@@ -901,6 +911,8 @@ fn decode_mb_blocks(
 /// caller still applies the §4 reference update afterward via
 /// [`ReferenceFrames::update_after_decode`].
 #[allow(clippy::too_many_arguments)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_inter_frame_with_refs(
     bc: &mut crate::bool_coder::BoolCoder<'_>,
     h_fragments: usize,

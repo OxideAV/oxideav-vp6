@@ -84,14 +84,20 @@
 /// The side length, in pixels, of one DCT block (spec §16: "*8x8 DCT
 /// transform*", §2). Each reconstructed block is `BLOCK_DIM x
 /// BLOCK_DIM`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const BLOCK_DIM: usize = 8;
 
 /// The side length, in pixels, of a macroblock's luma region (spec §2:
 /// "*MB is 16x16 luma*").
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const MB_LUMA_DIM: usize = 16;
 
 /// The number of 8x8 luma blocks per macroblock (the 2x2 luma
 /// sub-grid: `16 / 8 = 2` per side).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const MB_LUMA_BLOCKS: usize = 4;
 
 /// The (block-row, block-col) offsets of the four luma blocks within a
@@ -102,6 +108,8 @@ pub const MB_LUMA_BLOCKS: usize = 4;
 /// 0  1
 /// 2  3
 /// ```
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const MB_LUMA_BLOCK_OFFSETS: [(usize, usize); MB_LUMA_BLOCKS] =
     [(0, 0), (0, 1), (1, 0), (1, 1)];
 
@@ -358,12 +366,16 @@ impl Frame {
 /// Number of macroblock columns for a luma block-grid width of
 /// `h_fragments` blocks: `ceil(h_fragments / 2)` (each MB spans two
 /// luma blocks horizontally).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const fn mb_cols_for(h_fragments: usize) -> usize {
     h_fragments.div_ceil(2)
 }
 
 /// Number of macroblock rows for a luma block-grid height of
 /// `v_fragments` blocks: `ceil(v_fragments / 2)`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const fn mb_rows_for(v_fragments: usize) -> usize {
     v_fragments.div_ceil(2)
 }
