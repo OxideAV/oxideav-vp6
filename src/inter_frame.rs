@@ -693,9 +693,11 @@ impl DcState {
             y_grid: PlaneDcGrid::new(h_fragments, v_fragments),
             u_grid: PlaneDcGrid::new(mb_cols, mb_rows),
             v_grid: PlaneDcGrid::new(mb_cols, mb_rows),
+            // §14 frame-start seeds: 0 for luma, +128 (quantized-DC
+            // domain) for chroma — errata #277 part 2.
             y_pred: DcPredictionContext::new(),
-            u_pred: DcPredictionContext::new(),
-            v_pred: DcPredictionContext::new(),
+            u_pred: DcPredictionContext::new_chroma(),
+            v_pred: DcPredictionContext::new_chroma(),
         }
     }
 }

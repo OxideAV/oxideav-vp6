@@ -905,37 +905,6 @@ pub fn dct_token_bool_tree_to_huff_probs(node_prob: &[u8; NUM_TREE_NODES]) -> [u
     out
 }
 
-/// The §13.2.2 **DC** variant of [`dct_token_bool_tree_to_huff_probs`]:
-/// identical except that the node-0 left branch is credited wholly to
-/// `ZERO_TOKEN` and `DCT_EOB_TOKEN` gets probability 0.
-///
-/// §13.2.1 closes with: "*The EOB token is explicitly forbidden from
-/// occurring in the DC position so there is no need to encode the
-/// decision that differentiates between EOB and 0, the token may
-/// immediately be assumed to be the ZERO_TOKEN*" — i.e. the effective
-/// DC BoolCoder tree never traverses node 1, its node-0 left branch
-/// *is* the ZERO token. §13.2.2 derives the DC Huffman tree "*directly
-/// from the BoolCoder tree*", so the conversion of that branch is
-/// `HuffProb[ZERO_TOKEN] = NodeProb[0]` with no `NodeProb[1]` split
-/// (the generic §13.1 listing, which splits node 0's left branch
-/// between EOB and ZERO, describes the alphabet where EOB is legal —
-/// the AC trees).
-///
-/// Fixture-arbitrated: on the conformant third-party vp6f Huffman
-/// stream the chroma DC tree is built from the untouched all-128
-/// keyframe bank; the §13.1 split would hand EOB the shortest codeword
-/// (`(128*128)>>8 = 64` vs ZERO's `63`) and the real stream's zero-DC
-/// chroma runs then decode as the forbidden EOB-in-DC. With the fold,
-/// ZERO takes the whole `128` and the stream decodes.
-pub fn dct_token_bool_tree_to_huff_probs_dc(
-    node_prob: &[u8; NUM_TREE_NODES],
-) -> [u8; NUM_DCT_TOKENS] {
-    let mut out = dct_token_bool_tree_to_huff_probs(node_prob);
-    out[DctToken::EndOfBlock.index()] = 0;
-    out[DctToken::Zero.index()] = node_prob[0];
-    out
-}
-
 /// VP6 AC band index (spec §13.3 Table 30).
 ///
 /// The §13.3.1 arithmetic AC decoder selects a per-band node-probability
@@ -1140,22 +1109,29 @@ impl AcPrecContext {
     }
 
     /// Seed the §13.3.1 `Prec` context from a freshly-decoded DC
-    /// coefficient of the same block:
+    /// coefficient of the same block — on the DC **magnitude**:
     ///
     /// ```text
-    /// if (dc == 0)        Prec = 0
-    /// else if (dc == 1)   Prec = 1
-    /// else                Prec = 2
+    /// if (|dc| == 0)       Prec = 0
+    /// else if (|dc| == 1)  Prec = 1
+    /// else                 Prec = 2
     /// ```
     ///
-    /// Note the spec's signed-value test treats DC of 1 as
-    /// distinguished from DC of −1 (magnitude 1 with negative sign):
-    /// only `dc == 1` literally seeds `WasOne`. The §13.3.1 listing
-    /// reads `dc == 1` not `|dc| == 1`, so this routine mirrors that
-    /// exact comparison.
+    /// The §13.3.1 listing prints the test as the signed `dc == 1`,
+    /// under which a DC of −1 would seed `Prec = 2`. That is a spec
+    /// defect: the precision context classifies the *magnitude* of the
+    /// preceding coefficient (the staged extraction record —
+    /// `docs/video/vp6/provenance/03-extractor-binary-huffman.md` —
+    /// pins the mid-block form as `1 + (previous magnitude > 1)`), and
+    /// the conformant fixture arbitrates the seed the same way: the
+    /// block immediately after the `tables/03` datum block carries a
+    /// DC delta of −1 followed by an AC1 `DCT_EOB_TOKEN` that only
+    /// decodes under the `Prec = 1` tree; the signed reading selects
+    /// the `Prec = 2` tree and misparses it as a value token
+    /// (whole-keyframe pixel-exact gate in `tests/conformance_vp6f.rs`).
     #[inline]
     pub const fn seed_from_dc(dc: i32) -> Self {
-        match dc {
+        match dc.unsigned_abs() {
             0 => Self::WasZero,
             1 => Self::WasOne,
             _ => Self::WasGreaterThanOne,
@@ -1777,11 +1753,10 @@ mod tests {
     fn ac_prec_context_seed_from_dc_partitions_signed_dc() {
         assert_eq!(AcPrecContext::seed_from_dc(0), AcPrecContext::WasZero);
         assert_eq!(AcPrecContext::seed_from_dc(1), AcPrecContext::WasOne);
-        // Spec uses signed `dc == 1`; -1 is not the same as 1.
-        assert_eq!(
-            AcPrecContext::seed_from_dc(-1),
-            AcPrecContext::WasGreaterThanOne,
-        );
+        // Magnitude-based: -1 seeds the same context as +1 (the
+        // printed signed `dc == 1` reading is a spec defect,
+        // fixture-arbitrated — see `seed_from_dc`'s docs).
+        assert_eq!(AcPrecContext::seed_from_dc(-1), AcPrecContext::WasOne);
         assert_eq!(
             AcPrecContext::seed_from_dc(2),
             AcPrecContext::WasGreaterThanOne,

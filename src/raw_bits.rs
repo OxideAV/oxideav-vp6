@@ -523,19 +523,20 @@ mod tests {
     #[test]
     fn read_huffman_symbol_two_symbol_tree() {
         // Two symbols → tree has a root with two leaves, codewords
-        // are 1 bit each. The §7.2.1 build places symbol 0 as the
-        // root's left child and symbol 1 as the right (stable sort
-        // preserves insertion order against equal probabilities).
+        // are 1 bit each. The equal-probability tie-break (errata
+        // #277 part 3) puts the later-inserted symbol 1 ahead of its
+        // equal, so symbol 1 is the root's left / bit-0 child and
+        // symbol 0 the right / bit-1 child.
         let tree = flat_tree(2);
-        // bits = 0,1,1,0,1 → expect symbols 0,1,1,0,1.
+        // bits = 0,1,1,0,1 → expect symbols 1,0,0,1,0.
         // Pack MSB-first: 0b01101000 = 0x68 (only the high 5 bits
         // matter; low 3 are padding zeros).
         let mut br = RawBitReader::new(&[0x68]);
-        assert_eq!(br.read_huffman_symbol(&tree).unwrap(), 0);
-        assert_eq!(br.read_huffman_symbol(&tree).unwrap(), 1);
         assert_eq!(br.read_huffman_symbol(&tree).unwrap(), 1);
         assert_eq!(br.read_huffman_symbol(&tree).unwrap(), 0);
+        assert_eq!(br.read_huffman_symbol(&tree).unwrap(), 0);
         assert_eq!(br.read_huffman_symbol(&tree).unwrap(), 1);
+        assert_eq!(br.read_huffman_symbol(&tree).unwrap(), 0);
     }
 
     #[test]

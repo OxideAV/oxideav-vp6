@@ -455,9 +455,11 @@ fn encode_inter_frame_body(
     let mut y_grid = PlaneDcGrid::new(h_fragments, v_fragments);
     let mut u_grid = PlaneDcGrid::new(mb_cols, mb_rows);
     let mut v_grid = PlaneDcGrid::new(mb_cols, mb_rows);
+    // §14 frame-start seeds mirroring the decoder: 0 for luma, +128
+    // (quantized-DC domain) for chroma — errata #277 part 2.
     let mut y_dc_pred = DcPredictionContext::new();
-    let mut u_dc_pred = DcPredictionContext::new();
-    let mut v_dc_pred = DcPredictionContext::new();
+    let mut u_dc_pred = DcPredictionContext::new_chroma();
+    let mut v_dc_pred = DcPredictionContext::new_chroma();
 
     const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
     const LUMA_CORNERS: [(i32, i32); 4] = [(0, 0), (0, 8), (8, 0), (8, 8)];
@@ -1060,9 +1062,11 @@ fn encode_inter_frame_me_body(
     let mut y_grid = PlaneDcGrid::new(h_fragments, v_fragments);
     let mut u_grid = PlaneDcGrid::new(mb_cols, mb_rows);
     let mut v_grid = PlaneDcGrid::new(mb_cols, mb_rows);
+    // §14 frame-start seeds mirroring the decoder: 0 for luma, +128
+    // (quantized-DC domain) for chroma — errata #277 part 2.
     let mut y_dc_pred = DcPredictionContext::new();
-    let mut u_dc_pred = DcPredictionContext::new();
-    let mut v_dc_pred = DcPredictionContext::new();
+    let mut u_dc_pred = DcPredictionContext::new_chroma();
+    let mut v_dc_pred = DcPredictionContext::new_chroma();
 
     // §10/§11 MV neighbour grid, threaded exactly as the decoder builds it:
     // one representative `NeighbourMv` per MB, row-major. Drives both the §10
@@ -1399,9 +1403,11 @@ fn encode_inter_frame_me_golden_body(
     let mut y_grid = PlaneDcGrid::new(h_fragments, v_fragments);
     let mut u_grid = PlaneDcGrid::new(mb_cols, mb_rows);
     let mut v_grid = PlaneDcGrid::new(mb_cols, mb_rows);
+    // §14 frame-start seeds mirroring the decoder: 0 for luma, +128
+    // (quantized-DC domain) for chroma — errata #277 part 2.
     let mut y_dc_pred = DcPredictionContext::new();
-    let mut u_dc_pred = DcPredictionContext::new();
-    let mut v_dc_pred = DcPredictionContext::new();
+    let mut u_dc_pred = DcPredictionContext::new_chroma();
+    let mut v_dc_pred = DcPredictionContext::new_chroma();
 
     let mut mv_grid: Vec<Option<NeighbourMv>> = vec![None; mb_cols.saturating_mul(mb_rows)];
 
@@ -1642,9 +1648,11 @@ fn encode_inter_frame_me_fourmv_body(
     let mut y_grid = PlaneDcGrid::new(h_fragments, v_fragments);
     let mut u_grid = PlaneDcGrid::new(mb_cols, mb_rows);
     let mut v_grid = PlaneDcGrid::new(mb_cols, mb_rows);
+    // §14 frame-start seeds mirroring the decoder: 0 for luma, +128
+    // (quantized-DC domain) for chroma — errata #277 part 2.
     let mut y_dc_pred = DcPredictionContext::new();
-    let mut u_dc_pred = DcPredictionContext::new();
-    let mut v_dc_pred = DcPredictionContext::new();
+    let mut u_dc_pred = DcPredictionContext::new_chroma();
+    let mut v_dc_pred = DcPredictionContext::new_chroma();
 
     let mut mv_grid: Vec<Option<NeighbourMv>> = vec![None; mb_cols.saturating_mul(mb_rows)];
 
@@ -2795,13 +2803,19 @@ mod tests {
         let _tail =
             Vp6HeaderTail::parse_with(&mut bc, true, hdr.profile.unwrap(), hdr.version.unwrap())
                 .expect("tail");
+        // Consume the §8 Figure-5 pass the keyframe encoder emits
+        // between the header tail and the coefficient tokens.
+        let mut banks = crate::coeff_prob_update::CoeffProbBanks::keyframe();
+        let scan =
+            crate::coeff_prob_update::decode_coefficient_prob_updates_keyframe(&mut bc, &mut banks)
+                .expect("Figure-5 pass");
         let key_recon = decode_intra_frame(
             &mut bc,
             key_source.h_fragments,
             key_source.v_fragments,
             hdr.dct_q_mask,
-            &IntraProbs::keyframe(),
-            &DEFAULT_SCAN_ORDER,
+            &banks.to_intra_probs(),
+            &scan,
         )
         .expect("I-decode");
 
@@ -2933,13 +2947,20 @@ mod tests {
         );
         assert_eq!(filter.loop_filter_qi, None);
 
+        // Consume the §8 Figure-5 pass the keyframe encoder emits
+        // between the header tail and the coefficient tokens (a
+        // no-update pass — the banks stay at the keyframe baseline).
+        let mut banks = crate::coeff_prob_update::CoeffProbBanks::keyframe();
+        let scan =
+            crate::coeff_prob_update::decode_coefficient_prob_updates_keyframe(&mut bc, &mut banks)
+                .expect("Figure-5 pass");
         let key_recon = decode_intra_frame(
             &mut bc,
             key_source.h_fragments,
             key_source.v_fragments,
             hdr.dct_q_mask,
-            &IntraProbs::keyframe(),
-            &DEFAULT_SCAN_ORDER,
+            &banks.to_intra_probs(),
+            &scan,
         )
         .expect("I-decode");
 
@@ -3081,13 +3102,19 @@ mod tests {
         let _tail =
             Vp6HeaderTail::parse_with(&mut bc, true, hdr.profile.unwrap(), hdr.version.unwrap())
                 .expect("tail");
+        // Consume the §8 Figure-5 pass the keyframe encoder emits
+        // between the header tail and the coefficient tokens.
+        let mut banks = crate::coeff_prob_update::CoeffProbBanks::keyframe();
+        let scan =
+            crate::coeff_prob_update::decode_coefficient_prob_updates_keyframe(&mut bc, &mut banks)
+                .expect("Figure-5 pass");
         let key_recon = decode_intra_frame(
             &mut bc,
             key_source.h_fragments,
             key_source.v_fragments,
             hdr.dct_q_mask,
-            &IntraProbs::keyframe(),
-            &DEFAULT_SCAN_ORDER,
+            &banks.to_intra_probs(),
+            &scan,
         )
         .expect("I-decode");
 

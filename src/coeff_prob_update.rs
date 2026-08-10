@@ -38,16 +38,23 @@
 //! re-train probabilities produces the minimal conformant Figure-5 prefix
 //! and the round-trip is exact.
 //!
-//! ## Persistence (§13.2 / §13.3 / §13.3.3 / §11.2)
+//! ## Persistence (§13.2 / §13.3 / §13.3.3 / §11.2) and the keyframe
+//! carry-forward
 //!
 //! VP6 probability banks **persist** keyframe→interframe and are mutated
 //! by these updates. At a keyframe every bank is first reset to its
 //! baseline (DC/AC to the §13 defaults, ZRL to `ZeroRunProbDefaults`, the
 //! scan order to the default zig-zag band assignment) and *then* the
-//! Figure-5 updates apply on top. This module operates on whatever
-//! [`IntraProbs`] the caller threads in, so the caller controls the
-//! keyframe reset (it passes [`IntraProbs::keyframe`]) versus the
-//! inter-frame carry (it passes the previous frame's mutated bank).
+//! Figure-5 updates apply — under the **keyframe carry-forward rule**
+//! (staged errata `#277 part 7`): a clear DC/AC update flag does not
+//! leave the entry at its default, it writes the current value of a
+//! shared 11-slot running vector (see
+//! [`crate::prob_update::KeyframeNodeCarry`]). Keyframe callers use
+//! [`decode_coefficient_prob_updates_keyframe`] /
+//! [`encode_coefficient_prob_updates_full`]; inter-frame callers use
+//! [`decode_coefficient_prob_updates`] /
+//! [`encode_coefficient_prob_updates_from`], where a clear flag leaves
+//! the carried entry untouched (the §13 persistence).
 //!
 //! Because [`IntraProbs`] stores the DC bank in its *expanded*
 //! `DcNodeContexts[plane][context][node]` form (§13.2 Table 26) rather
@@ -66,7 +73,10 @@
 
 use crate::bool_coder::{BoolCoder, BoolEncoder};
 use crate::intra_frame::IntraProbs;
-use crate::prob_update::{update_ac_probs, update_dc_probs, update_zero_run_probs};
+use crate::prob_update::{
+    update_ac_probs, update_ac_probs_keyframe, update_dc_probs, update_dc_probs_keyframe,
+    update_zero_run_probs, KeyframeNodeCarry,
+};
 use crate::scan::DEFAULT_SCAN_ORDER;
 use crate::scan_update::{
     build_custom_scan_order, custom_scan_order_to_raster, decode_scan_order_update, BandAssignment,
@@ -180,6 +190,49 @@ pub fn decode_coefficient_prob_updates(
 
     // 4. §13.3 AC node probability updates.
     update_ac_probs(bc, &mut banks.ac_probs, &AC_UPDATE_PROBS)?;
+
+    Ok(banks.raster_scan_order())
+}
+
+/// Decode the §8 Figure 5 sub-stream on a **key frame**, applying the
+/// errata `#277 (part 7)` carry-forward rule (see
+/// [`KeyframeNodeCarry`]): a single 11-slot running vector, seeded to
+/// 128 once at the start of the block and shared — unreset — between
+/// the DC and AC walks, supplies the value every **clear** update flag
+/// writes into its bank entry. So on a key frame *every* `DcProbs` and
+/// `AcProbs` entry is written; the §13.2 / §13.3 "set to 128 at each
+/// key frame" is the seed of the vector, not a per-entry default that
+/// survives into the frame. The ZRL walk and the §12.2 scan update are
+/// unaffected (literal semantics, over the keyframe-reset defaults).
+///
+/// `banks` should be [`CoeffProbBanks::keyframe`] on entry (the §13
+/// keyframe reset); the pass overwrites the DC/AC banks entirely.
+/// Returns the active raster scan order, exactly like
+/// [`decode_coefficient_prob_updates`] (which remains the
+/// **inter-frame** pass — clear flags leave entries untouched there).
+pub fn decode_coefficient_prob_updates_keyframe(
+    bc: &mut BoolCoder<'_>,
+    banks: &mut CoeffProbBanks,
+) -> Result<[u8; 64], Error> {
+    let mut carry = KeyframeNodeCarry::new();
+
+    // 1. §13.2 DC node probability updates, carry-forward applied.
+    update_dc_probs_keyframe(bc, &mut banks.dc_probs, &VP6_DC_UPDATE_PROBS, &mut carry)?;
+
+    // 2. §12.2 scan-update bit + (if set) the 63-coefficient updates.
+    decode_scan_order_update(
+        bc,
+        &COEFF_BAND_UPDATE_FLAG_PROBS,
+        &mut banks.band_assignment,
+    )?;
+
+    // 3. §13.3.3 zero-run-length probability updates (no carry: the
+    //    ZRL walk writes only on a set flag, over the keyframe-reset
+    //    defaults — errata #277 part 7 records the distinction).
+    update_zero_run_probs(bc, &mut banks.zrl_probs, &ZRL_UPDATE_PROBS)?;
+
+    // 4. §13.3 AC node updates — same carry vector, not reset.
+    update_ac_probs_keyframe(bc, &mut banks.ac_probs, &AC_UPDATE_PROBS, &mut carry)?;
 
     Ok(banks.raster_scan_order())
 }
@@ -353,33 +406,103 @@ fn encode_node_prob_update(enc: &mut BoolEncoder, flag_prob: u8, current: u8, ta
     enc.encode_b(value, 7);
 }
 
-/// Emit a §8 Figure 5 sub-stream that transforms the keyframe-baseline
-/// banks into `target` — emitting a real `NewNodeProbValue` for every
-/// DC / ZRL / AC node that differs from baseline, the §12.2 scan-update
-/// for the band assignment, in the exact Figure-5 order.
+/// Emit a **keyframe** §8 Figure 5 sub-stream that produces `target`
+/// under the keyframe decode rule
+/// ([`decode_coefficient_prob_updates_keyframe`]) — the errata
+/// `#277 (part 7)` carry-forward mirrored on the encode side.
 ///
-/// This is the general inverse of [`decode_coefficient_prob_updates`]
-/// against a [`CoeffProbBanks::keyframe`] starting point: decoding the
-/// emitted sub-stream over fresh keyframe banks reproduces `target`
-/// exactly. Every node probability in `target` must be representable by
-/// the §13 update mechanism ([`node_prob_update_representable`]) — i.e.
-/// `1` or even; the DC/AC/ZRL baselines are all `128` (even) and the
-/// decode rule only ever writes representable values, so any bank
-/// obtained by decoding is round-trippable.
+/// For every DC / AC node position (in bitstream-visit order) the
+/// emitter compares the target value against the shared running
+/// vector: equal ⇒ a cleared flag (the decoder's carry write produces
+/// the target); different ⇒ a set flag + `NewNodeProbValue`, recorded
+/// into the vector. ZRL nodes compare against the keyframe defaults
+/// (no carry there) and the §12.2 scan-update covers the band
+/// assignment. Decoding the emitted sub-stream over fresh
+/// [`CoeffProbBanks::keyframe`] banks with the keyframe pass
+/// reproduces `target` exactly.
+///
+/// Every *transmitted* node probability must be representable by the
+/// §13 update mechanism ([`node_prob_update_representable`]) — `1` or
+/// even. (A target equal to the carry value needs no transmission and
+/// may be any inherited value.)
 ///
 /// # Panics
 ///
-/// Debug-panics if any target node probability is an unrepresentable odd
-/// value `> 1`.
+/// Debug-panics if a transmitted target node probability is an
+/// unrepresentable odd value `> 1`.
 // Index loops keep the per-node `*_UPDATE_PROBS[..]` flag lookups aligned
 // with the §13.2 / §13.3.3 / §13.3 Tables traversal the decoder reads.
+#[allow(clippy::needless_range_loop)]
 pub fn encode_coefficient_prob_updates_full(enc: &mut BoolEncoder, target: &CoeffProbBanks) {
-    encode_coefficient_prob_updates_from(enc, &CoeffProbBanks::keyframe(), target);
+    let mut carry = KeyframeNodeCarry::new();
+
+    // 1. §13.2 DC node updates under the carry rule.
+    for plane in 0..NUM_PLANES {
+        for node in 0..NUM_TREE_NODES {
+            let t = target.dc_probs[plane][node];
+            if t == carry.current(node) {
+                enc.encode_bool(0, VP6_DC_UPDATE_PROBS[plane][node]);
+            } else {
+                encode_node_prob_update(
+                    enc,
+                    VP6_DC_UPDATE_PROBS[plane][node],
+                    carry.current(node),
+                    t,
+                );
+                carry.record(node, t);
+            }
+        }
+    }
+
+    // 2. §12.2 scan-update bit + (if custom) the band updates relative
+    //    to the keyframe default assignment.
+    if target.band_assignment == DEFAULT_BAND_ASSIGNMENT {
+        enc.encode_b1(0);
+    } else {
+        enc.encode_b1(1);
+        encode_coeff_band_updates(enc, &target.band_assignment);
+    }
+
+    // 3. §13.3.3 ZRL node updates — literal semantics against the
+    //    keyframe defaults (no carry).
+    for band in 0..crate::zrl::NUM_ZRL_BANDS {
+        for node in 0..crate::zrl::NUM_ZRL_NODES {
+            encode_node_prob_update(
+                enc,
+                ZRL_UPDATE_PROBS[band][node],
+                crate::zrl::ZERO_RUN_PROB_DEFAULTS[band][node],
+                target.zrl_probs[band][node],
+            );
+        }
+    }
+
+    // 4. §13.3 AC node updates — same carry vector, not reset.
+    for prec in 0..crate::tokens::NUM_AC_PREC_CONTEXTS {
+        for plane in 0..NUM_PLANES {
+            for band in 0..crate::tokens::NUM_AC_BANDS {
+                for node in 0..NUM_TREE_NODES {
+                    let t = target.ac_probs[plane][prec][band][node];
+                    if t == carry.current(node) {
+                        enc.encode_bool(0, AC_UPDATE_PROBS[prec][plane][band][node]);
+                    } else {
+                        encode_node_prob_update(
+                            enc,
+                            AC_UPDATE_PROBS[prec][plane][band][node],
+                            carry.current(node),
+                            t,
+                        );
+                        carry.record(node, t);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Emit a §8 Figure 5 sub-stream that transforms `current` into
-/// `target` — the general **inter-frame** form of
-/// [`encode_coefficient_prob_updates_full`], exercising the §13
+/// `target` under the **inter-frame** decode rule
+/// ([`decode_coefficient_prob_updates`]; clear flags leave entries
+/// untouched — no keyframe carry-forward), exercising the §13
 /// cross-frame persistence: a P-frame's update pass starts from the
 /// banks the previous frame left behind, so the emitted
 /// `NewNodeProbValue` records cover exactly the nodes that differ
@@ -584,9 +707,10 @@ mod tests {
         assert_eq!(node_prob_update_value(254), Some(127));
     }
 
-    /// A full-update Figure-5 sub-stream transforms the keyframe baseline
-    /// into an arbitrary representable target bank, round-tripping every
-    /// DC / ZRL / AC node probability and the custom scan exactly.
+    /// A full-update keyframe Figure-5 sub-stream transforms the
+    /// keyframe baseline into an arbitrary representable target bank
+    /// under the carry-forward decode rule, round-tripping every DC /
+    /// ZRL / AC node probability and the custom scan exactly.
     #[test]
     fn full_update_substream_round_trips_target() {
         // Build a target with representable (even / 1) node-prob deltas
@@ -606,7 +730,7 @@ mod tests {
         let mut bc = BoolCoder::new(&bytes).expect("bc");
 
         let mut banks = CoeffProbBanks::keyframe();
-        let scan = decode_coefficient_prob_updates(&mut bc, &mut banks).expect("decode");
+        let scan = decode_coefficient_prob_updates_keyframe(&mut bc, &mut banks).expect("decode");
 
         assert_eq!(
             banks, target,
@@ -631,8 +755,57 @@ mod tests {
         let bytes = roundtrip(|enc| encode_coefficient_prob_updates_full(enc, &target));
         let mut bc = BoolCoder::new(&bytes).expect("bc");
         let mut banks = CoeffProbBanks::keyframe();
-        let scan = decode_coefficient_prob_updates(&mut bc, &mut banks).expect("decode");
+        let scan = decode_coefficient_prob_updates_keyframe(&mut bc, &mut banks).expect("decode");
         assert_eq!(banks, target);
         assert_eq!(scan, DEFAULT_SCAN_ORDER);
+    }
+
+    /// The keyframe carry-forward (errata #277 part 7): a value set in
+    /// the DC plane-0 walk is inherited — via cleared flags, spending
+    /// no value bits — by the same node index in DC plane 1 and in
+    /// every AC context, until a later set flag overwrites the running
+    /// vector. The keyframe emitter recognises carry-reachable targets
+    /// and emits cleared flags for them.
+    #[test]
+    fn keyframe_carry_forward_inherits_across_banks() {
+        // Target: node 2 becomes 40 everywhere (one transmitted value,
+        // then pure inheritance); node 5 becomes 76 from the AC
+        // prec-1 walk onwards only.
+        let mut target = CoeffProbBanks::keyframe();
+        for plane in 0..NUM_PLANES {
+            target.dc_probs[plane][2] = 40;
+            for prec in 0..crate::tokens::NUM_AC_PREC_CONTEXTS {
+                for band in 0..crate::tokens::NUM_AC_BANDS {
+                    target.ac_probs[plane][prec][band][2] = 40;
+                }
+            }
+        }
+        for prec in 1..crate::tokens::NUM_AC_PREC_CONTEXTS {
+            for plane in 0..NUM_PLANES {
+                for band in 0..crate::tokens::NUM_AC_BANDS {
+                    target.ac_probs[plane][prec][band][5] = 76;
+                }
+            }
+        }
+
+        let bytes = roundtrip(|enc| encode_coefficient_prob_updates_full(enc, &target));
+        let mut bc = BoolCoder::new(&bytes).expect("bc");
+        let mut banks = CoeffProbBanks::keyframe();
+        decode_coefficient_prob_updates_keyframe(&mut bc, &mut banks).expect("decode");
+        assert_eq!(banks, target, "carry-forward inheritance round-trips");
+
+        // The same stream under the INTER decode rule leaves every
+        // clear-flagged entry untouched — only the first (transmitted)
+        // occurrence of each new value lands, which demonstrates the
+        // two passes genuinely differ.
+        let mut bc = BoolCoder::new(&bytes).expect("bc");
+        let mut inter_banks = CoeffProbBanks::keyframe();
+        decode_coefficient_prob_updates(&mut bc, &mut inter_banks).expect("decode");
+        assert_ne!(inter_banks, target, "inter semantics must not carry");
+        assert_eq!(inter_banks.dc_probs[0][2], 40, "transmitted value lands");
+        assert_eq!(
+            inter_banks.dc_probs[1][2], 128,
+            "clear flag leaves the inter bank at its incoming value"
+        );
     }
 }

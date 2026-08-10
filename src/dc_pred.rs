@@ -59,23 +59,20 @@
 //! | YES            | NO              | L                        |
 //! | YES            | YES             | `(L + A + Sign(L + A)) / 2` |
 //!
-//! The two-available formula. The spec's prose ("arithmetic average
-//! of their DC values, truncated towards zero (values may be
-//! negative)") is summarised by the table-row formula
-//! `(L + A + Sign(L + A)) / 2`. We implement the formula verbatim
-//! over Rust's `i32` division — which, like C99 integer division,
-//! truncates toward zero — so the result is **symmetric in sign**:
-//! for an even sum the `Sign` adjustment is the identity; for an odd
-//! positive sum `(2k+1) + 1 = 2k+2, /2 = k+1` (away from zero); for
-//! an odd negative sum `-(2k+1) + (-1) = -(2k+2), /2 = -(k+1)` (also
-//! away from zero, by the same magnitude). The prose's "truncated
-//! towards zero" therefore describes the predictor's behaviour for
-//! the common even-sum case and the away-from-zero rounding kicks in
-//! symmetrically for odd sums — the formula is the authoritative
-//! description (the spec's §1 Introduction directs ambiguities to be
-//! resolved in favour of the accompanying reference, but here the
-//! table-formula and prose only conflict on the parity edge and the
-//! formula is the more specific of the two).
+//! The two-available formula. The spec's prose says "arithmetic
+//! average of their DC values, **truncated towards zero** (values may
+//! be negative)", while the table-row formula `(L + A + Sign(L + A))
+//! / 2` rounds every odd sum *away* from zero (under truncating or
+//! flooring division alike). The two conflict on the odd-sum parity
+//! edge, and the **prose is operative**: the conformant fixture
+//! keyframe arbitrates both sign directions (a luma pair
+//! `(-299, -298)` must predict `-298` and a chroma pair `(15, 0)`
+//! must predict `7` — see [`average_both_neighbours`]'s docs and the
+//! whole-frame pixel-exact gate in `tests/conformance_vp6f.rs`). The
+//! implementation is plain toward-zero halving; the printed `Sign`
+//! term reads as a garbled attempt to express toward-zero truncation
+//! of a flooring shift with the correction's sign transcribed
+//! backwards.
 //!
 //! Per-prediction-frame last-DC reset. The third scenario uses a
 //! caller-side per-frame state: a "last decoded DC value for a block
@@ -173,19 +170,29 @@ pub fn sign(x: i32) -> i32 {
     }
 }
 
-/// The "L + A + Sign(L + A)) / 2" two-neighbour averaging formula from
-/// §14's predictor table.
+/// The §14 two-neighbour averaging formula — operative form
+/// `(L + A) / 2` **truncated toward zero** on both signs.
 ///
-/// Computes the average of two neighbour DC values, truncated toward
-/// zero for both positive and negative sums. The `Sign` adjustment
-/// matters when `L + A` is negative: plain `(L + A) / 2` truncates
-/// away from zero for negative sums in two's-complement integer
-/// arithmetic, and `(L + A + Sign(L+A)) / 2` corrects this back to
-/// truncation toward zero so the predictor is symmetric in sign.
+/// §14's predictor table prints `(L + A + Sign(L + A)) / 2`, which —
+/// under either a truncating or a flooring division — rounds every odd
+/// sum *away* from zero. That is a spec defect, arbitrated in both
+/// directions by the conformant fixture keyframe (whole-frame
+/// pixel-exact gate in `tests/conformance_vp6f.rs`):
+///
+/// * a luma block with `L = -299, A = -298` must predict `-298`
+///   (toward zero), not the printed `-299` — its transmitted delta of
+///   `-1` then reconstructs the oracle's pixels exactly;
+/// * a chroma block with `L = 15, A = 0` must predict `7` (toward
+///   zero), not the printed `8` — ruling out the round-half-up form
+///   that would fix only the negative side.
+///
+/// The `Sign` term in the printed formula reads as an attempt to
+/// describe toward-zero truncation *of a flooring shift* (`(x +
+/// [x<0]) >> 1`), where the correction's sign was transcribed
+/// backwards; the operative behaviour is plain toward-zero halving.
 #[inline]
 pub fn average_both_neighbours(left_dc: i32, above_dc: i32) -> i32 {
-    let sum = left_dc.wrapping_add(above_dc);
-    sum.wrapping_add(sign(sum)) / 2
+    left_dc.wrapping_add(above_dc) / 2
 }
 
 /// One block's neighbour metadata for the §14 DC predictor.
@@ -248,27 +255,36 @@ impl DcPredictionContext {
         }
     }
 
-    /// A freshly-seeded context for a **chroma** plane (U or V):
-    /// every bucket's last-DC value starts at
-    /// [`CHROMA_DC_PREDICTION_SEED`] (`128`), not zero.
+    /// A freshly-seeded context for a **chroma** plane (U or V): the
+    /// **Intra** bucket's last-DC value starts at
+    /// [`CHROMA_DC_PREDICTION_SEED`] (`128`); the inter buckets start
+    /// at zero like luma.
     ///
-    /// Fixture-arbitrated (round 411): on the conformant third-party
-    /// vp6f keyframe the first U and V blocks — which reconstruct to
-    /// exactly 128 (a coded DC of 0) — each carry a coded
-    /// `DCT_VAL_CATEGORY6` DC *delta* of `-128`, so the §14
-    /// no-neighbour fallback predictor for the first chroma block of
-    /// the frame must be `+128` in the quantized-DC domain, not the
-    /// zero §14's prose states ("this last decoded DC value is set to
-    /// zero for each prediction frame type" — contradicted for chroma
-    /// by the stream). Differential bit-flip probing against the
-    /// black-box decode oracle confirms the `-128` field bit-exactly
-    /// (see the fixture notes.md appendix). Luma keeps the zero seed
-    /// (the keyframe's first luma DC decodes as a plain `-299` against
-    /// a zero predictor).
+    /// Fixture-arbitrated in both directions:
+    ///
+    /// * **Intra = +128** (round 411): on the conformant third-party
+    ///   vp6f keyframe the first U and V blocks — which reconstruct to
+    ///   exactly 128 (a coded DC of 0) — each carry a coded
+    ///   `DCT_VAL_CATEGORY6` DC *delta* of `-128`, so the §14
+    ///   no-neighbour fallback predictor for the first chroma block of
+    ///   the frame must be `+128` in the quantized-DC domain, not the
+    ///   zero §14's prose states. Confirmed independently by the staged
+    ///   errata (`#277 part 2`, docs Round 1), which also pins the
+    ///   quantized-DC units.
+    /// * **Inter buckets = 0** (round 439): seeding the inter buckets
+    ///   at 128 desynchronises the same fixture's first P-frame — the
+    ///   first chroma blocks' reconstructed coded DC becomes non-zero,
+    ///   which flips the §13.2 Table-26 DC context of every following
+    ///   chroma block and derails the arithmetic coefficient parse.
+    ///   With the inter buckets at zero the P-frame's static prefix
+    ///   parses and reconstructs sample-exactly.
+    ///
+    /// Luma keeps the all-zero seed (the keyframe's first luma DC
+    /// decodes as a plain `-299` against a zero predictor).
     pub fn new_chroma() -> Self {
-        Self {
-            last_dc: [CHROMA_DC_PREDICTION_SEED; ReferenceBucket::COUNT],
-        }
+        let mut last_dc = [0; ReferenceBucket::COUNT];
+        last_dc[ReferenceBucket::Intra.as_index()] = CHROMA_DC_PREDICTION_SEED;
+        Self { last_dc }
     }
 
     /// Re-seed every bucket's last-DC value to zero, per §14's
@@ -365,13 +381,18 @@ mod tests {
     /// `new` keeps the §14 zero seed.
     #[test]
     fn chroma_context_seeds_at_128() {
+        // Intra bucket seeds at +128; inter buckets stay zero (the
+        // fixture P-frame arbitration — see `new_chroma`'s docs).
         let c = DcPredictionContext::new_chroma();
+        assert_eq!(c.last_dc(ReferenceBucket::Intra), CHROMA_DC_PREDICTION_SEED);
+        for bucket in [ReferenceBucket::InterLast, ReferenceBucket::InterGolden] {
+            assert_eq!(c.last_dc(bucket), 0);
+        }
         for bucket in [
             ReferenceBucket::Intra,
             ReferenceBucket::InterLast,
             ReferenceBucket::InterGolden,
         ] {
-            assert_eq!(c.last_dc(bucket), CHROMA_DC_PREDICTION_SEED);
             assert_eq!(DcPredictionContext::new().last_dc(bucket), 0);
         }
         // No-neighbour prediction returns the seed.
@@ -444,23 +465,15 @@ mod tests {
 
     #[test]
     fn average_both_neighbours_matches_formula_for_all_small_inputs() {
-        // The §14 table-row formula is `(L + A + Sign(L+A)) / 2`
-        // evaluated with C-style truncation-toward-zero division.
-        // Verify across a small but exhaustive range that the helper
-        // matches the formula computed independently here.
+        // The operative §14 average is `(L + A) / 2` truncated toward
+        // zero — NOT the printed `(L + A + Sign(L+A)) / 2`, which
+        // rounds odd sums away from zero (fixture-arbitrated in both
+        // sign directions; see `average_both_neighbours`'s docs).
         for l in -20..=20 {
             for a in -20..=20 {
-                let sum = l + a;
-                let s = if sum > 0 {
-                    1
-                } else if sum < 0 {
-                    -1
-                } else {
-                    0
-                };
-                // Rust /'s i32 truncation matches C's, so this
-                // expression is exactly the spec formula.
-                let want = (sum + s) / 2;
+                // Rust's `/` truncates toward zero, so this expression
+                // is exactly the operative formula.
+                let want = (l + a) / 2;
                 let got = average_both_neighbours(l, a);
                 assert_eq!(
                     got, want,
@@ -469,6 +482,9 @@ mod tests {
                 );
             }
         }
+        // The two fixture-pinned cases (see the function docs).
+        assert_eq!(average_both_neighbours(-299, -298), -298);
+        assert_eq!(average_both_neighbours(15, 0), 7);
     }
 
     #[test]
@@ -839,7 +855,8 @@ mod tests {
         assert_eq!(ctx.last_dc(ReferenceBucket::Intra), dc_10);
 
         // (1, 1): interior. L = (1, 0) = 7, A = (0, 1) = 14.
-        // Predictor = (7 + 14 + Sign(21)) / 2 = (21 + 1) / 2 = 11.
+        // Predictor = (7 + 14) / 2 = 10 (toward-zero truncation — the
+        // operative §14 average; see `average_both_neighbours`).
         let delta_11 = 0;
         let l = Some(Neighbour {
             dc: dc_10,
@@ -849,22 +866,22 @@ mod tests {
             dc: dc_01,
             reference: ReferenceBucket::Intra,
         });
-        let p_11 = ctx.predict_and_record(ReferenceBucket::Intra, l, a, 11 + delta_11);
-        assert_eq!(p_11, 11);
+        let p_11 = ctx.predict_and_record(ReferenceBucket::Intra, l, a, 10 + delta_11);
+        assert_eq!(p_11, 10);
 
-        // (1, 2): interior. L = (1, 1) = 11, A = (0, 2) = 12.
-        // Predictor = (11 + 12 + Sign(23)) / 2 = 24 / 2 = 12.
+        // (1, 2): interior. L = (1, 1) = 10, A = (0, 2) = 12.
+        // Predictor = (10 + 12) / 2 = 11.
         let delta_12 = 1;
         let l = Some(Neighbour {
-            dc: 11,
+            dc: 10,
             reference: ReferenceBucket::Intra,
         });
         let a = Some(Neighbour {
             dc: dc_02,
             reference: ReferenceBucket::Intra,
         });
-        let p_12 = ctx.predict_and_record(ReferenceBucket::Intra, l, a, 12 + delta_12);
-        assert_eq!(p_12, 12);
+        let p_12 = ctx.predict_and_record(ReferenceBucket::Intra, l, a, 11 + delta_12);
+        assert_eq!(p_12, 11);
     }
 
     #[test]

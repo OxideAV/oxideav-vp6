@@ -10,13 +10,20 @@
 //! §7.2.1 `VP6_CreateHuffmanTree` builder:
 //!
 //! * **DC** (§13.2.2) — one tree per Table 25 plane, from the *raw*
-//!   `DcProbs[plane][11]` bank (note: the Huffman DC decode does **not**
-//!   use the §13.2 Table 26 left/above context expansion; the tree is
-//!   built from the un-contexted per-plane bank the Figure-5 updates
-//!   mutate).
+//!   `DcProbs[plane][11]` bank via the printed §13.1 mapping — all
+//!   twelve leaves, EOB included (an EOB codeword in the DC position
+//!   is a bitstream error per §13.2.1). Note: the Huffman DC decode
+//!   does **not** use the §13.2 Table 26 left/above context expansion;
+//!   the tree is built from the un-contexted per-plane bank the
+//!   Figure-5 updates mutate — which on key frames means the
+//!   carry-forward-filled bank (errata `#277 part 7`; see
+//!   [`crate::coeff_prob_update::decode_coefficient_prob_updates_keyframe`]).
 //! * **AC** (§13.3.2) — `AcHuffTree[plane][prec][band]` over the Table
-//!   36 four-band split (coefficient 1 / 2–4 / 5–10 / 11–63), built from
-//!   the first four Table 30 bands of `AcProbs[plane][prec][band][11]`.
+//!   36 four-band split (coefficient 1 / 2–4 / 5–10 / 11–63; correct
+//!   as printed per errata `#277 part 6`), built from the first four
+//!   Table 30 bands of `AcProbs[plane][prec][band][11]` (the trees for
+//!   bands 4–5 are never selected by the Huffman band map, so building
+//!   four per context decodes identically — errata `#277 part 5`).
 //! * **Zero runs** (§13.3.3.2) — one tree per Table 37 ZRL band from
 //!   the first eight `ZeroRunProbs[band]` nodes.
 //!
@@ -36,30 +43,29 @@
 //! are `[2]` exactly like the probability banks, so a chroma run spans
 //! U and V blocks in stream order).
 //!
-//! ## Disambiguated readings (spec-internal evidence only)
+//! ## Disambiguated readings — now closed by the staged errata
 //!
 //! Three spots in §13.3.3.2/§13.4/§13.2.2 are internally inconsistent
-//! as printed; each is resolved here against the arithmetic coder's
-//! value space (the Huffman trees are built from the *same* probability
-//! banks, so their leaves must denote the same values):
+//! as printed. Each was originally resolved here against the
+//! arithmetic coder's value space; all three readings are now
+//! **measured and closed** by the staged errata
+//! (`docs/video/vp6/vp6-errata-and-clarifications.md`) and validated
+//! end-to-end by the whole-keyframe pixel-exact conformance gate:
 //!
-//! 1. **ZRL symbol → run length.** `ZRLBoolTreeToHuffProbs` maps
-//!    `HuffProb[0..=7]` to the §13.3.3.1 tree's run-length leaves 1..=8
-//!    and `HuffProb[8]` to the long-run escape (the products follow the
-//!    arithmetic tree's branch structure exactly). The §13.3.3.2
-//!    listing's `EncodedCoeffs += ZrlToken` (for `ZrlToken < 8`) would
-//!    make symbol 0 advance zero positions — an infinite loop — so the
-//!    operative reading is `run = symbol + 1` for symbols 0..=7.
-//! 2. **Long ZRL escape.** The listing prints `8 + R(6)`, but run 8 is
-//!    already leaf 7, and §13.3.3.1's escape is "run length minus nine
-//!    … six bits" (9..=72). The operative escape is `9 + R(6)`.
-//! 3. **DC zero-run store.** §13.2.2 prints `CurrentDcRunLen[Plane] =
-//!    DC Run Length` while the same-shaped AC1 case stores "EOB Token
-//!    Run − 1". The §13.4 run decoder's minimum value is 1, so a lone
-//!    zero-DC block (no additional zero-DC blocks) is only encodable if
-//!    the decoded value counts the run *inclusive* of the current block
-//!    — the operative store is `DC Run Length − 1`, symmetric with the
-//!    AC1 case.
+//! 1. **ZRL symbol → run length** (`#193 part 2, closed`). The nine
+//!    Figure-16 leaves denote run lengths 1..=8 and ">8", so the
+//!    advance is `run = symbol + 1` for symbols 0..=7 — the printed
+//!    `EncodedCoeffs += ZrlToken` would make symbol 0 loop forever.
+//!    The `tables/03` fixture datum pins the convention by coefficient
+//!    *positions* (the bit budget alone does not discriminate).
+//! 2. **Long ZRL escape** (`#193 part 2, closed`). `9 + R(6)`, not the
+//!    printed `8 + R(6)` — the reading consistent with the leaf
+//!    numbering above.
+//! 3. **DC zero-run store** (`#193 part 1, closed`). The operative
+//!    store is `DC Run Length − 1`, symmetric with the printed AC1
+//!    "EOB Token Run − 1" store; §13.2.2's unmodified store is the
+//!    printed defect (the §13.4 run decoder's minimum value of 1
+//!    counts the run inclusive of the current block).
 //!
 //! The in-tree encoder ([`encode_frame_blocks_huffman`]) mirrors each
 //! reading bit-for-bit, so encode→decode round-trips are exact.
@@ -202,17 +208,22 @@ impl HuffmanCoeffTables {
         zrl_probs: &ZeroRunProbBank,
     ) -> Self {
         // §13.2.2: DcHuffTree[plane] from the raw per-plane DC bank via
-        // the DC variant of the §13.1 conversion (node-0 left branch
-        // folded wholly into ZERO_TOKEN — §13.2.1: EOB is forbidden in
-        // the DC position, so the DC BoolCoder tree skips the EOB/0
-        // decision and the conversion credits `NodeProb[0]` to ZERO;
-        // fixture-arbitrated, see
-        // `dct_token_bool_tree_to_huff_probs_dc`).
+        // the printed §13.1 conversion — all twelve leaves, EOB
+        // included. The tree *contains* an EOB leaf (its codeword is
+        // simply never legal in the DC position — §13.2.1 forbids it,
+        // and the decoder surfaces it as a bitstream error). The
+        // earlier node-0 "fold into ZERO_TOKEN" variant was a
+        // compensating misreading fitted against the literal
+        // (pre-carry-forward) banks and the stable-sort tie-break;
+        // under the corrected §7.2.1 construction and the errata #277
+        // part 7 banks the printed mapping is the one that decodes the
+        // conformant fixture (whole-keyframe pixel-exact gate in
+        // `tests/conformance_vp6f.rs`).
         let dc = [
-            HuffTable::build(&crate::tokens::dct_token_bool_tree_to_huff_probs_dc(
+            HuffTable::build(&crate::tokens::dct_token_bool_tree_to_huff_probs(
                 &dc_probs[0],
             )),
-            HuffTable::build(&crate::tokens::dct_token_bool_tree_to_huff_probs_dc(
+            HuffTable::build(&crate::tokens::dct_token_bool_tree_to_huff_probs(
                 &dc_probs[1],
             )),
         ];
@@ -393,16 +404,11 @@ pub fn decode_block_coefficients_huffman(
         let token = DctToken::from_index(tables.dc[p].decode(r)?).ok_or(Error::Truncated)?;
         match token {
             DctToken::Zero => {
-                // §13.4 DC zero run, inclusive of this block
-                // (disambiguation note #3). NOTE: §13.2.2's prose
-                // ("the number of additional blocks") and its listing
-                // (`CurrentDcRunLen[Plane] = DC Run Length`, stored
-                // unmodified) both read as run-EXclusive of this
-                // block; the third-party fixture has not yet
-                // arbitrated between the two (both parses desync
-                // further downstream for an unrelated reason), so the
-                // r384 inclusive reading — which the in-tree encoder
-                // mirrors — is retained for now.
+                // §13.4 DC zero run, inclusive of this block: the
+                // operative store is `run − 1` (errata `#193 part 1,
+                // closed` — §13.2.2's printed unmodified store is the
+                // defect; the whole-keyframe pixel-exact conformance
+                // gate exercises hundreds of DC run refreshes).
                 let run = decode_eob_or_dc0_run(r)?;
                 state.dc_run[p] = run - 1;
             }

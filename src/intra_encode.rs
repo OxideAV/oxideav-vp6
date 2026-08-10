@@ -224,9 +224,11 @@ fn tokenize_intra_frame(frame: &Frame, dequant: DequantContext) -> Vec<Tokenized
     let mut y_grid = PlaneDcGrid::new(h_fragments, v_fragments);
     let mut u_grid = PlaneDcGrid::new(mb_cols, mb_rows);
     let mut v_grid = PlaneDcGrid::new(mb_cols, mb_rows);
+    // §14 frame-start seeds mirroring the decoder: 0 for luma, +128
+    // (quantized-DC domain) for chroma — errata #277 part 2.
     let mut y_dc_pred = DcPredictionContext::new();
-    let mut u_dc_pred = DcPredictionContext::new();
-    let mut v_dc_pred = DcPredictionContext::new();
+    let mut u_dc_pred = DcPredictionContext::new_chroma();
+    let mut v_dc_pred = DcPredictionContext::new_chroma();
 
     const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
 

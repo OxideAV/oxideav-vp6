@@ -117,6 +117,131 @@ pub fn decode_new_node_prob(bc: &mut BoolCoder<'_>, flag_prob: u8) -> Result<Opt
     Ok(Some(prob))
 }
 
+/// The keyframe **carry-forward vector** for the §13.2 / §13.3 node
+/// probability updates (errata `#277 (part 7)` in
+/// `docs/video/vp6/vp6-errata-and-clarifications.md`).
+///
+/// The printed §13.2 / §13.3 text reads as "an entry whose update flag
+/// is clear keeps its (keyframe-reset) default of 128". The operative
+/// rule is different on key frames: the decoder holds an **11-entry
+/// running vector, one slot per tree-node index**, initialised to 128
+/// once at the start of the whole Figure-5 update block. Every set
+/// update flag writes its decoded value both to the bank entry *and*
+/// to the vector's slot for that node index; on a key frame a **clear**
+/// flag writes the vector's current value into the bank entry (on an
+/// inter frame it leaves the entry untouched — the §13 persistence).
+///
+/// The vector is **shared between the DC and AC walks** and never reset
+/// between them, so values carry across plane, precision and band in
+/// bitstream-visit order (DC plane 0, DC plane 1, then AC in
+/// Prec → Plane → Band order). `ZeroRunProbs` is *not* subject to the
+/// carry-forward: its walk writes only on a set flag.
+///
+/// Construct one per keyframe Figure-5 block with [`Self::new`] and
+/// thread it through [`update_dc_probs_keyframe`] and
+/// [`update_ac_probs_keyframe`].
+#[derive(Debug, Clone)]
+pub struct KeyframeNodeCarry {
+    /// `vector[node]` — the running value for tree-node index `node`.
+    vector: [u8; NUM_TREE_NODES],
+}
+
+impl Default for KeyframeNodeCarry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeyframeNodeCarry {
+    /// A fresh carry vector, every slot at the §13 seed of 128.
+    pub fn new() -> Self {
+        Self {
+            vector: [128; NUM_TREE_NODES],
+        }
+    }
+
+    /// Apply one node's update outcome under the keyframe rule:
+    /// a decoded value writes through to both the bank entry and the
+    /// vector; a clear flag copies the vector's current slot into the
+    /// bank entry.
+    #[inline]
+    fn apply(&mut self, node: usize, decoded: Option<u8>, bank_entry: &mut u8) {
+        match decoded {
+            Some(v) => {
+                *bank_entry = v;
+                self.vector[node] = v;
+            }
+            None => *bank_entry = self.vector[node],
+        }
+    }
+
+    /// The value a clear flag would currently write for `node` — the
+    /// encoder-side mirror of the decode rule (a keyframe encoder may
+    /// emit a clear flag exactly when its target equals this value).
+    #[inline]
+    pub fn current(&self, node: usize) -> u8 {
+        self.vector[node]
+    }
+
+    /// Encoder-side mirror of a set flag: record the transmitted value
+    /// in the vector.
+    #[inline]
+    pub fn record(&mut self, node: usize, value: u8) {
+        self.vector[node] = value;
+    }
+}
+
+/// Walk the §13.2 DC coding-tree-node update bitstream on a **key
+/// frame**, applying the errata `#277 (part 7)` carry-forward rule
+/// via `carry` (see [`KeyframeNodeCarry`]): every bank entry is
+/// written — set flags with their decoded value, clear flags with the
+/// running vector's value.
+///
+/// Same traversal as [`update_dc_probs`] (Tables 22 / 23 / 24: plane
+/// outer, node inner).
+#[allow(clippy::needless_range_loop)]
+pub fn update_dc_probs_keyframe(
+    bc: &mut BoolCoder<'_>,
+    dc_probs: &mut [[u8; NUM_TREE_NODES]; NUM_PLANES],
+    flag_probs: &[[u8; NUM_TREE_NODES]; NUM_PLANES],
+    carry: &mut KeyframeNodeCarry,
+) -> Result<(), Error> {
+    for plane in 0..NUM_PLANES {
+        for node in 0..NUM_TREE_NODES {
+            let decoded = decode_new_node_prob(bc, flag_probs[plane][node])?;
+            carry.apply(node, decoded, &mut dc_probs[plane][node]);
+        }
+    }
+    Ok(())
+}
+
+/// Walk the §13.3 AC coding-tree-node update bitstream on a **key
+/// frame**, applying the errata `#277 (part 7)` carry-forward rule via
+/// `carry` — the same vector the DC walk used, *not* reset in between.
+///
+/// Same traversal and store-transpose as [`update_ac_probs`]
+/// (Tables 31–35: prec outer, then plane, band, node; stores to the
+/// `[plane][prec][band][node]`-ordered bank).
+#[allow(clippy::needless_range_loop)]
+pub fn update_ac_probs_keyframe(
+    bc: &mut BoolCoder<'_>,
+    ac_probs: &mut [[[[u8; NUM_TREE_NODES]; NUM_AC_BANDS]; NUM_AC_PREC_CONTEXTS]; NUM_PLANES],
+    flag_probs: &[[[[u8; NUM_TREE_NODES]; NUM_AC_BANDS]; NUM_PLANES]; NUM_AC_PREC_CONTEXTS],
+    carry: &mut KeyframeNodeCarry,
+) -> Result<(), Error> {
+    for prec in 0..NUM_AC_PREC_CONTEXTS {
+        for plane in 0..NUM_PLANES {
+            for band in 0..NUM_AC_BANDS {
+                for node in 0..NUM_TREE_NODES {
+                    let decoded = decode_new_node_prob(bc, flag_probs[prec][plane][band][node])?;
+                    carry.apply(node, decoded, &mut ac_probs[plane][prec][band][node]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Walk the §13.2 DC coding-tree-node update bitstream and apply each
 /// update in place to a persistent `DcProbs[plane][node]` bank.
 ///
@@ -126,10 +251,10 @@ pub fn decode_new_node_prob(bc: &mut BoolCoder<'_>, flag_prob: u8) -> Result<Opt
 /// optional b(7) NewNodeProbValue)` via [`decode_new_node_prob`].
 ///
 /// `dc_probs` is the persistent §13.2 bank the decoder threads from
-/// frame to frame — seeded with [`crate::tokens::baseline_dc_probs`]
-/// at every keyframe, and mutated in place by this driver at every
-/// frame (keyframes included; on a keyframe the prior bank state is
-/// discarded and replaced with the baseline before this walk runs).
+/// frame to frame. This is the **inter-frame** walk: a clear flag
+/// leaves the bank entry untouched (§13.2 persistence). On key frames
+/// use [`update_dc_probs_keyframe`], which applies the errata
+/// `#277 (part 7)` carry-forward instead.
 ///
 /// Returns [`Error::Truncated`] if the byte stream is exhausted.
 ///
@@ -188,9 +313,10 @@ pub fn update_dc_probs(
 /// outer two indices on each store.
 ///
 /// `ac_probs` is the persistent §13.3 bank the decoder threads from
-/// frame to frame — seeded with [`crate::tokens::baseline_ac_probs`]
-/// at every keyframe, and mutated in place by this driver at every
-/// frame.
+/// frame to frame. This is the **inter-frame** walk: a clear flag
+/// leaves the bank entry untouched (§13.3 persistence). On key frames
+/// use [`update_ac_probs_keyframe`], which applies the errata
+/// `#277 (part 7)` carry-forward instead.
 ///
 /// Returns [`Error::Truncated`] if the byte stream is exhausted.
 ///

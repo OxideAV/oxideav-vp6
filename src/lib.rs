@@ -246,8 +246,10 @@
 //!   of the §7.3 `Split` formula DOCS-GAP**. Surfaces: [`huffman::HuffNode`]
 //!   (the spec's `HUFF_NODE { Symbol, Prob, Left, Right }` with `-1`
 //!   sentinels for internal-vs-leaf); [`huffman::create_huffman_tree`]
-//!   (the verbatim §7.2.1 builder — `N-1` bottom-up merge rounds over
-//!   a stable-sorted leaf list, root at index `2N-2`); [`huffman::decode_symbol`]
+//!   (the §7.2.1 builder under the operative tie-break the staged
+//!   errata pins, `#277 part 3 closed` — insert-before-greater-or-equal
+//!   over an ascending weight list, `N-1` bottom-up merge rounds, root
+//!   at index `2N-2`); [`huffman::decode_symbol`]
 //!   (the verbatim §7.2 walk, parameterised over an external
 //!   `FnMut() -> u8` raw-bit oracle so the byte-stream `R(1)` reader
 //!   can land independently); plus [`huffman::tree_depth`] /
@@ -722,14 +724,11 @@
 //! whether the current MB carries a new-MV `CODE_INTER_PLUS_MV` /
 //! `CODE_GOLDEN_MV` / `CODE_INTER_FOURMV` mode at all (still the
 //! `B(Stats[0])` / `B(Stats[2])` else-branch DOCS-GAP from round 21);
-//! a sum-saturation clarification — the §11 intro paragraph does not
-//! mention a post-sum clamp, the §11.1 `±127` cap applies to the
-//! decoded delta alone, and the §17 reconstruction stage is
-//! well-defined for any sum via §11.5 UMV or the
-//! [`inter::fetch_prediction_block_clamped`] edge-clamped fetch
-//! ([`mv_diff::reconstruct_diff_mv`] therefore performs a plain
-//! i16 sum with no wrap, but a future round may want to revisit this
-//! choice if a clarifying errata entry lands); and the per-block
+//! a sum-saturation clarification — later resolved: the §11 component
+//! bound of `±127` governs the *final* vector, so
+//! [`mv_diff::reconstruct_diff_mv`] clamps the reference+delta sum to
+//! that bound (a conformant stream never exceeds it; the clamp keeps a
+//! corrupt one inside the §11.5 UMV border); and the per-block
 //! variant for `CODE_INTER_FOURMV` — Table 10 selects a per-block
 //! mode (already landed as [`fourmv::decode_fourmv_block_mode`]) and
 //! the spec leaves open whether the differential reference for each

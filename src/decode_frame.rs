@@ -77,7 +77,9 @@
 //! No external library code was consulted.
 
 use crate::bool_coder::BoolCoder;
-use crate::coeff_prob_update::{decode_coefficient_prob_updates, CoeffProbBanks};
+use crate::coeff_prob_update::{
+    decode_coefficient_prob_updates, decode_coefficient_prob_updates_keyframe, CoeffProbBanks,
+};
 use crate::coeff_source::CoeffSource;
 use crate::frame_assembly::Frame;
 use crate::frame_header::{CodingProfile, Vp3Version, Vp6FrameHeader, Vp6HeaderTail};
@@ -250,13 +252,15 @@ impl Vp6Decoder {
         // pass — there is no §10 mode or §11.2 MV tree on an I-frame
         // (§10: I-frame MBs are implicitly intra, no mode signaling). The
         // banks are reset to the §13 keyframe baselines, then the
-        // (typically empty) Figure-5 updates apply on top. The pass also
-        // yields the active §12.2 scan order. The pass always rides
-        // partition 1's coder (Figures 2/3/4 all open with it; in the
-        // Huffman arrangement partition 2 is raw bits and cannot carry
-        // BoolCoder-coded updates).
+        // Figure-5 updates apply under the keyframe carry-forward rule
+        // (errata #277 part 7: a clear DC/AC update flag writes the
+        // shared running vector's value, so every DC/AC entry is
+        // written). The pass also yields the active §12.2 scan order.
+        // The pass always rides partition 1's coder (Figures 2/3/4 all
+        // open with it; in the Huffman arrangement partition 2 is raw
+        // bits and cannot carry BoolCoder-coded updates).
         let mut banks = CoeffProbBanks::keyframe();
-        let scan = decode_coefficient_prob_updates(&mut bc, &mut banks)?;
+        let scan = decode_coefficient_prob_updates_keyframe(&mut bc, &mut banks)?;
         let probs = banks.to_intra_probs();
 
         // §6 coefficient transport dispatch: single-stream reads the

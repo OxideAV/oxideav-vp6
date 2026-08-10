@@ -2,13 +2,13 @@
 //!
 //! `tests/fixtures/vp6f-huffman-i-then-p-854x480/` holds the first GOP
 //! (1 I-frame + 2 P-frames) of a conformant third-party Flash VP6
-//! (`vp6f`) stream on the **Huffman** entropy path (`MultiStream == 1`,
-//! `UseHuffman == 1`), 854x480 display / 864x480 coded, together with
-//! the black-box decode-oracle output (`expected.yuv`, yuv420p). See
-//! the fixture's `notes.md` for full provenance. This is the crate's
-//! first real-encoder stream, and it arbitrates several readings the
-//! printed spec leaves wrong or open; each test below pins one of the
-//! fixture-arbitrated behaviours so they cannot regress:
+//! (`vp6f`) stream — the keyframe on the **Huffman** entropy path
+//! (`MultiStream == 1`, `UseHuffman == 1`), the two P-frames on the
+//! MultiStream **arithmetic** path — 854x480 display / 864x480 coded,
+//! together with the black-box decode-oracle output (`expected.yuv`,
+//! yuv420p). See the fixture's `notes.md` for full provenance. This is
+//! the crate's first real-encoder stream; the gates below pin the
+//! fixture-arbitrated readings so they cannot regress:
 //!
 //! 1. §9 Table 2 geometry is transmitted in **macroblock units** (the
 //!    printed "8x8 block units" prose is an erratum).
@@ -17,38 +17,45 @@
 //!    sizes partition 1 tightly and the coder's 32-bit look-ahead
 //!    legitimately renormalizes into the first partition-2 byte).
 //! 3. The §8 Figure-5 sub-stream of a real keyframe carries live DC
-//!    node updates, a custom §12.2 scan order, and AC updates.
-//! 4. The §13.2.2 DC Huffman tree folds the node-0 left branch wholly
-//!    into `ZERO_TOKEN` (EOB is forbidden in the DC position).
-//! 5. The §16 IDCT descale rounding (round-411 correction of an
-//!    earlier under-determined reading): the per-multiply `>> 16`
-//!    descales are arithmetic shifts exactly as printed, and the
-//!    final column-pass descale is `(x + 8) >> 4` — a rounding add
-//!    the printed listing omits. Arbitrated by AC-carrying oracle
-//!    blocks (`keyframe_content_blocks_reconstruct_pixel_exact`);
-//!    flat DC-only blocks reconstruct identically under several
-//!    roundings and cannot distinguish them.
+//!    node updates, a custom §12.2 scan order, and AC updates — filled
+//!    into the banks under the **keyframe carry-forward rule** (staged
+//!    errata `#277 part 7`): a clear DC/AC update flag writes the
+//!    shared 11-slot running vector's value, so every DC/AC entry is
+//!    written and the untouched chroma DC bank comes out a copy of the
+//!    retrained luma bank.
+//! 4. The §16 IDCT descale rounding (round-411 correction): the
+//!    per-multiply `>> 16` descales are arithmetic shifts exactly as
+//!    printed, and the final column-pass descale is `(x + 8) >> 4` — a
+//!    rounding add the printed listing omits. Arbitrated by AC-carrying
+//!    oracle blocks (`keyframe_content_blocks_reconstruct_pixel_exact`).
+//! 5. **The whole keyframe decodes pixel-exactly** through the
+//!    top-level `Vp6Decoder` (`keyframe_decodes_pixel_exact`): all
+//!    9720 blocks — every luma, U and V sample of the 854x480 display
+//!    region — match the black-box oracle bit-for-bit. This gate
+//!    closes the former full-frame Huffman blocker and jointly pins
+//!    the round-439 corrections: the operative §7.2.1 tree
+//!    construction (errata `#277 part 3, closed`), the keyframe
+//!    carry-forward banks (`#277 part 7`), the printed 12-leaf §13.1
+//!    DC mapping (superseding the earlier node-0 fold, which was a
+//!    compensating misreading fitted against the literal banks), the
+//!    §13.3.1 magnitude-based `Prec` seed, the §13.2.2/§13.3.3.2 run
+//!    conventions (`#193 parts 1+2, closed`), the §14 toward-zero
+//!    two-neighbour average, and the §14 chroma DC seed (+128 in the
+//!    quantized-DC domain, Intra bucket).
 //!
-//! Full three-frame pixel conformance is the outstanding goal: the
-//! keyframe currently decodes pixel-exactly through the leading
-//! macroblocks (pinned below) but a §13 Huffman-side desync further in
-//! is still under investigation, so the whole-frame gate is not yet
-//! landed. Differential bit-flip probing against the black-box decode
-//! oracle (flip one partition-2 bit, decode, observe which block's
-//! pixels change first) has mapped the true bit→block ownership of the
-//! keyframe's opening tokens; see the fixture `notes.md` appendix for
-//! the map and the open questions it raises about the §13.2.2 chroma
-//! DC field.
+//! The two P-frames do **not** yet decode pixel-exactly: their §10
+//! mode / §11 MV / arithmetic-coefficient wire semantics diverge at the
+//! first content macroblock (the static prefix decodes exactly). The
+//! staged extraction record (`provenance/03-extractor-binary-huffman.md`)
+//! explicitly leaves P-frames un-established; closing them needs a
+//! behavioural P-frame trace.
 
 use oxideav_vp6::bool_coder::BoolCoder;
-use oxideav_vp6::coeff_prob_update::{decode_coefficient_prob_updates, CoeffProbBanks};
-use oxideav_vp6::coeff_source::CoeffSource;
-use oxideav_vp6::dc_pred::{DcPredictionContext, Neighbour, ReferenceBucket};
+use oxideav_vp6::coeff_prob_update::{decode_coefficient_prob_updates_keyframe, CoeffProbBanks};
+use oxideav_vp6::decode_frame::Vp6Decoder;
 use oxideav_vp6::dequant::DequantContext;
 use oxideav_vp6::frame_header::{CodingProfile, Vp3Version, Vp6FrameHeader, Vp6HeaderTail};
-use oxideav_vp6::huff_coeff::HuffmanCoeffTables;
 use oxideav_vp6::scan_update::DEFAULT_BAND_ASSIGNMENT;
-use oxideav_vp6::tokens::{AcPlane, DcContext};
 
 const FIXTURE_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -144,10 +151,14 @@ fn keyframe_header_geometry_is_in_macroblock_units() {
 }
 
 /// The §8 Figure-5 probability-update sub-stream of the real keyframe
-/// parses to completion — pinning that partition 1's BoolCoder spans
-/// past `Buff2Offset` (the pass legitimately renormalizes one byte into
-/// partition 2) and that the stream carries live updates: retrained
-/// luma DC nodes, a custom §12.2 scan order, and AC updates.
+/// parses to completion under the keyframe carry-forward rule — pinning
+/// that partition 1's BoolCoder spans past `Buff2Offset` (the pass
+/// legitimately renormalizes one byte into partition 2), that the
+/// stream carries live updates (retrained luma DC nodes, a custom
+/// §12.2 scan order, AC updates), and that the carry-forward fills the
+/// untouched chroma DC bank with a copy of the retrained luma bank
+/// (errata `#277 part 7` — the staged corrected-banks table's
+/// `DcProbs` rows, re-derived here from the bitstream).
 #[test]
 fn keyframe_prob_updates_parse_and_span_partition_boundary() {
     let raw = load("input.vp6");
@@ -166,27 +177,33 @@ fn keyframe_prob_updates_parse_and_span_partition_boundary() {
     .unwrap();
     let mut banks = CoeffProbBanks::keyframe();
     assert!(
-        decode_coefficient_prob_updates(&mut sliced, &mut banks).is_err(),
+        decode_coefficient_prob_updates_keyframe(&mut sliced, &mut banks).is_err(),
         "tightly-sized partition 1 exhausts mid-pass when sliced at Buff2Offset"
     );
 
-    // ...while the full-span coder (what `decode_packet` now builds)
+    // ...while the full-span coder (what `decode_packet` builds)
     // completes exactly one byte past the boundary.
     let mut bc = BoolCoder::new(&raw[hdr.raw_prefix_len..]).unwrap();
     let _ = Vp6HeaderTail::parse_with(&mut bc, true, hdr.profile.unwrap(), hdr.version.unwrap())
         .unwrap();
     let mut banks = CoeffProbBanks::keyframe();
-    decode_coefficient_prob_updates(&mut bc, &mut banks).expect("Figure-5 pass");
+    decode_coefficient_prob_updates_keyframe(&mut bc, &mut banks).expect("Figure-5 pass");
     assert_eq!(
         bc.pos(),
         p1_end + 1,
         "the pass needs exactly one look-ahead byte past Buff2Offset"
     );
 
-    // Live content: luma DC nodes retrained, chroma left at defaults,
-    // a custom scan order, and retrained AC nodes.
-    assert_ne!(banks.dc_probs[0], [128u8; 11], "luma DC nodes retrained");
-    assert_eq!(banks.dc_probs[1], [128u8; 11], "chroma DC stays default");
+    // Live content under the carry-forward: the luma DC row carries
+    // this frame's six retrained nodes plus carried 128s, and the
+    // chroma row — which receives no updates of its own in this frame
+    // — inherits the running vector, coming out an exact copy of luma.
+    let expected_dc = [52u8, 1, 30, 36, 128, 128, 50, 128, 128, 128, 180];
+    assert_eq!(banks.dc_probs[0], expected_dc, "luma DC row (carry-filled)");
+    assert_eq!(
+        banks.dc_probs[1], banks.dc_probs[0],
+        "chroma DC row inherits the shared carry vector"
+    );
     assert_ne!(
         banks.band_assignment, DEFAULT_BAND_ASSIGNMENT,
         "custom §12.2 scan order"
@@ -305,19 +322,21 @@ fn keyframe_content_blocks_reconstruct_pixel_exact() {
     }
 }
 
-/// Decode the leading macroblocks of the keyframe's Huffman coefficient
-/// partition to pixels and compare against the decode oracle — the
-/// first real-stream pixel-exactness this crate has had.
+/// **The whole keyframe decodes pixel-exactly** through the top-level
+/// `Vp6Decoder`: every one of the 854x480 display luma samples and
+/// every 427x240 U and V sample matches the black-box decode oracle
+/// bit-for-bit.
 ///
-/// This pins, in one pass: the §13.2.2 DC-fold Huffman tree (block 0's
-/// `DCT_VAL_CATEGORY6` = -299 and the chroma zero-DC runs are only
-/// decodable under the fold), the §13.4 run decoding, the §15 dequant
-/// at `DctQMask == 60`, the §14 DC prediction chain, and the §16
-/// IDCT rounding on the flat path (`-299 * 12` reconstructs to the
-/// oracle's luma 16; the AC-sensitive rounding arbitration lives in
-/// `keyframe_content_blocks_reconstruct_pixel_exact`).
+/// This is the crate's strongest single gate. Because the frame is one
+/// serial Huffman parse with no resynchronisation points, any error in
+/// the §9 header, the keyframe carry-forward Figure-5 fill, the §7.2.1
+/// tree construction, the §13.1 leaf mapping, the Table-36 band map,
+/// the §13.2.2/§13.3.2/§13.4 cross-block run bookkeeping, the §13.3.1
+/// `Prec` seeding, the §14 DC prediction (toward-zero average + chroma
+/// +128 seed), the §12.2 custom scan, the §15 dequant or the §16 IDCT
+/// destroys the agreement within a few macroblocks.
 #[test]
-fn keyframe_leading_macroblocks_decode_pixel_exact() {
+fn keyframe_decodes_pixel_exact() {
     let raw = load("input.vp6");
     let expected = load("expected.yuv");
     let oy = &expected[..DISPLAY_W * DISPLAY_H];
@@ -325,106 +344,37 @@ fn keyframe_leading_macroblocks_decode_pixel_exact() {
         &expected[DISPLAY_W * DISPLAY_H..DISPLAY_W * DISPLAY_H + (DISPLAY_W / 2) * (DISPLAY_H / 2)];
     let ov = &expected[DISPLAY_W * DISPLAY_H + (DISPLAY_W / 2) * (DISPLAY_H / 2)..YUV_FRAME_LEN];
 
-    let hdr = Vp6FrameHeader::parse(&raw).unwrap();
-    let mut bc = BoolCoder::new(&raw[hdr.raw_prefix_len..]).unwrap();
-    let _ = Vp6HeaderTail::parse_with(&mut bc, true, hdr.profile.unwrap(), hdr.version.unwrap())
-        .unwrap();
-    let mut banks = CoeffProbBanks::keyframe();
-    let scan = decode_coefficient_prob_updates(&mut bc, &mut banks).unwrap();
-    let probs = banks.to_intra_probs();
-    let tables = HuffmanCoeffTables::from_banks(&banks);
-    let mut src = CoeffSource::huffman(&raw[hdr.buff2_offset.unwrap() as usize..], &tables);
-    let dequant = DequantContext::new(hdr.dct_q_mask);
+    let mut dec = Vp6Decoder::new();
+    let frame = dec.decode_packet(&raw).expect("whole-keyframe decode");
 
-    // §14 per-plane DC prediction state over the walked prefix.
-    struct PlaneState {
-        dc: Vec<Option<i32>>,
-        cols: usize,
-        pred: DcPredictionContext,
-    }
-    impl PlaneState {
-        fn new(cols: usize, rows: usize) -> Self {
-            Self {
-                dc: vec![None; cols * rows],
-                cols,
-                pred: DcPredictionContext::new(),
-            }
-        }
-    }
-    let decode_block = |src: &mut CoeffSource<'_, '_>,
-                        plane: AcPlane,
-                        st: &mut PlaneState,
-                        r: usize,
-                        c: usize|
-     -> [u8; 64] {
-        let left = if c == 0 {
-            None
-        } else {
-            st.dc[r * st.cols + c - 1]
-        };
-        let above = if r == 0 {
-            None
-        } else {
-            st.dc[(r - 1) * st.cols + c]
-        };
-        let dc_context =
-            DcContext::from_neighbours(left.is_some_and(|d| d != 0), above.is_some_and(|d| d != 0));
-        let block = src.decode_block(plane, dc_context, &probs).expect("block");
-        let reference = ReferenceBucket::Intra;
-        let ln = left.map(|dc| Neighbour { dc, reference });
-        let an = above.map(|dc| Neighbour { dc, reference });
-        let predictor = st.pred.predict(reference, ln, an);
-        let coded_dc = predictor.wrapping_add(block.coeffs[0]);
-        st.pred.set_last_dc(reference, coded_dc);
-        st.dc[r * st.cols + c] = Some(coded_dc);
-        let mut sc = block.coeffs;
-        sc[0] = coded_dc;
-        let mut raster = oxideav_vp6::block_decode::dequantize_to_raster(&sc, &scan, dequant);
-        oxideav_vp6::idct::idct_block(&mut raster);
-        oxideav_vp6::reconstruct::intra_block_to_pixels(&raster)
-    };
+    // 864x480 coded; the display region is the left 854 columns (the
+    // container's 10-px right crop).
+    assert_eq!(frame.y.width(), 864);
+    assert_eq!(frame.y.height(), 480);
 
-    // Walk the first 12 macroblocks of row 0 (x < 192 — well inside the
-    // display width) and require every reconstructed sample to match
-    // the oracle exactly.
-    const N_MBS: usize = 12;
-    let mut ys = PlaneState::new(108, 60);
-    let mut us = PlaneState::new(54, 30);
-    let mut vs = PlaneState::new(54, 30);
-    let mut checked = 0usize;
-    for mb_col in 0..N_MBS {
-        for (k, (dr, dc)) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)]
-            .iter()
-            .enumerate()
-        {
-            let (br, bcol) = (*dr, mb_col * 2 + dc);
-            let pix = decode_block(&mut src, AcPlane::Y, &mut ys, br, bcol);
-            for r in 0..8 {
-                for c in 0..8 {
-                    let (x, y) = (bcol * 8 + c, br * 8 + r);
-                    assert_eq!(
-                        pix[r * 8 + c],
-                        oy[y * DISPLAY_W + x],
-                        "luma mismatch at ({x},{y}), mb {mb_col} block {k}"
-                    );
-                    checked += 1;
-                }
-            }
-        }
-        for (oracle, st, tag) in [(ou, &mut us, "U"), (ov, &mut vs, "V")] {
-            let pix = decode_block(&mut src, AcPlane::UV, st, 0, mb_col);
-            for r in 0..8 {
-                for c in 0..8 {
-                    let (x, y) = (mb_col * 8 + c, r);
-                    assert_eq!(
-                        pix[r * 8 + c],
-                        oracle[y * (DISPLAY_W / 2) + x],
-                        "{tag} mismatch at ({x},{y}), mb {mb_col}"
-                    );
-                    checked += 1;
-                }
-            }
+    let yw = frame.y.width();
+    for y in 0..DISPLAY_H {
+        for x in 0..DISPLAY_W {
+            assert_eq!(
+                frame.y.samples()[y * yw + x],
+                oy[y * DISPLAY_W + x],
+                "luma mismatch at ({x},{y})"
+            );
         }
     }
-    assert_eq!(checked, N_MBS * 6 * 64, "all samples compared");
+    let cw = frame.u.width();
+    for y in 0..DISPLAY_H / 2 {
+        for x in 0..DISPLAY_W / 2 {
+            assert_eq!(
+                frame.u.samples()[y * cw + x],
+                ou[y * (DISPLAY_W / 2) + x],
+                "U mismatch at ({x},{y})"
+            );
+            assert_eq!(
+                frame.v.samples()[y * cw + x],
+                ov[y * (DISPLAY_W / 2) + x],
+                "V mismatch at ({x},{y})"
+            );
+        }
+    }
 }

@@ -1333,9 +1333,9 @@ mod tests {
         assert_eq!(bc_one.count(), bc_two.count());
     }
 
-    /// `AcPrecContext::seed_from_dc` matches the §13.3.1 listing's
-    /// `if (dc == 0) Prec = 0 else if (dc == 1) Prec = 1 else Prec = 2`
-    /// for the first AC coefficient.
+    /// `AcPrecContext::seed_from_dc` classifies the DC **magnitude**
+    /// (the §13.3.1 printed signed `dc == 1` test is a spec defect —
+    /// fixture-arbitrated; see `seed_from_dc`'s docs).
     #[test]
     fn ac_prec_context_seed_from_dc_matches_spec() {
         assert_eq!(AcPrecContext::seed_from_dc(0), AcPrecContext::WasZero);
@@ -1346,8 +1346,8 @@ mod tests {
         );
         assert_eq!(
             AcPrecContext::seed_from_dc(-1),
-            AcPrecContext::WasGreaterThanOne,
-            "dc == -1 is NOT WasOne per the spec's signed `dc == 1` test"
+            AcPrecContext::WasOne,
+            "dc == -1 seeds Prec = 1: the context is magnitude-based"
         );
         assert_eq!(
             AcPrecContext::seed_from_dc(100),

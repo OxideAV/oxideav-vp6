@@ -18,11 +18,11 @@
 //! * [`HuffNode`] — the spec's `HUFF_NODE { Symbol, Prob, Left, Right }`
 //!   struct, with `Symbol == -1` denoting an internal (merged) node and
 //!   `(Left, Right) == (-1, -1)` denoting a leaf, per §7.2.1.
-//! * [`create_huffman_tree`] — the verbatim §7.2.1 `VP6_CreateHuffmanTree`
-//!   algorithm. Given `N` symbol identifiers and their probabilities
-//!   (`1..=255`), it returns a `[HuffNode; 2N-1]` sort-list with the
-//!   root at index `2*N - 2`, satisfying the spec's stable-sort and
-//!   bottom-up-merge invariants.
+//! * [`create_huffman_tree`] — the §7.2.1 `VP6_CreateHuffmanTree`
+//!   algorithm under the **operative tie-break** the staged errata pins
+//!   (see below). Given `N` symbol identifiers and their probabilities
+//!   (`1..=255`), it returns a `[HuffNode; 2N-1]` node list with the
+//!   root at index `2*N - 2`.
 //! * [`decode_symbol`] — the verbatim §7.2 `VP6_HuffmanDecodeSymbol`
 //!   walk. Driven by an externally-supplied raw-bit oracle (the caller
 //!   provides the `R(1)` source), so this module ships the *traversal
@@ -32,22 +32,39 @@
 //! * [`tree_depth`] / [`codeword_for`] — convenience helpers that walk
 //!   the constructed tree to compute a symbol's codeword length and
 //!   bit pattern by tracing root-to-leaf. Useful for round-tripping
-//!   and for inspecting whether the spec's stable-sort produced the
-//!   tree shape the §13.1 / §13.3.3.2 conversions expect.
+//!   and for inspecting the tie-break-sensitive tree shape the §13.1 /
+//!   §13.3.3.2 conversions rely on.
 //!
-//! ## Stability of the §7.2.1 sort
+//! ## The operative §7.2.1 construction (errata `#277 part 3, closed`)
 //!
-//! The §7.2.1 listing twice calls for a sort that "[maintains] relative
-//! order of nodes having equal probability." This is a *stable* sort,
-//! not just any ascending sort: when the leaf-list (or the merged
-//! sub-list after each round) contains equal-probability entries the
-//! original insertion order must survive. The implementation here uses
-//! [`slice::sort_by`] / a stable insertion shuffle so the spec's
-//! invariant holds — any two leaf orderings that differ in stable-sort
-//! handling can produce structurally different (but symbol-equivalent)
-//! trees, which is exactly the property the spec relies on to make
-//! both encoder and decoder agree on the tree shape from the
-//! probability vector alone.
+//! The printed §7.2.1 listing fixes ties only *relatively* ("maintaining
+//! the relative order of symbols having equal probabilities") and never
+//! states the initial symbol order, so two conforming readings of the
+//! text produce two different codebooks whenever probabilities tie —
+//! which they do heavily at the §13 keyframe defaults. The staged
+//! errata (`docs/video/vp6/vp6-errata-and-clarifications.md`, "#277
+//! (part 3, closed)", arbitrated against the conformant fixture datum
+//! in `docs/video/vp6/tables/03-first-content-block.csv`) pins the
+//! operative construction:
+//!
+//! 1. A single list of nodes is maintained in **ascending** weight
+//!    order.
+//! 2. Symbols are offered in **index order** (`S[i] = i`, the Table 18
+//!    token order for the §13 alphabets), each inserted **before the
+//!    first node whose weight is greater than or equal to its own** —
+//!    so a group of equal-weight symbols ends up in **descending
+//!    symbol-index order**, not insertion order.
+//! 3. Each merge round takes the two head nodes (the two smallest
+//!    weights): the **first** becomes the **left** (bit-0) child, the
+//!    **second** the right (bit-1) child. The merged node re-enters the
+//!    list by the same insert-before-greater-or-equal rule, so it also
+//!    precedes equal-weight nodes.
+//!
+//! This is *not* the stable ascending sort the printed wording
+//! suggests; the stable-sort reading assigns `DCT_VAL_CATEGORY1` and
+//! `DCT_VAL_CATEGORY2` (tied at the §13 defaults) the opposite
+//! codewords and fails the fixture (the errata's measured
+//! `DCT_VAL_CATEGORY2 = 010` requirement).
 //!
 //! ## What this module does NOT land
 //!
@@ -64,9 +81,10 @@
 //! ## Provenance
 //!
 //! Sourced exclusively from `docs/video/vp6/vp6_format.pdf` §7.2 (On2
-//! Technologies, document version 1.02, August 2006). The §7.2.1
-//! pseudocode (the `VP6_CreateHuffmanTree` and `VP6_HuffmanDecodeSymbol`
-//! listings on page 14) was transcribed structurally into Rust. No
+//! Technologies, document version 1.02, August 2006) and the staged
+//! clean-room errata `docs/video/vp6/vp6-errata-and-clarifications.md`
+//! ("#277 (part 3, closed)"), which settles the tie-break, merge-order
+//! and clamp questions the printed §7.2.1 listing leaves free. No
 //! third-party VP6 implementation has been consulted.
 
 use core::fmt;
@@ -150,23 +168,32 @@ impl HuffNode {
 }
 
 /// Build a Huffman tree from `N` symbols and their probabilities, per
-/// the §7.2.1 `VP6_CreateHuffmanTree` listing.
+/// the §7.2.1 `VP6_CreateHuffmanTree` algorithm under the operative
+/// tie-break the staged errata pins ("#277 (part 3, closed)").
 ///
 /// `symbols[i]` is the spec's `S[i]` (the symbol identifier — for the
 /// VP6 DCT tree this is a [`crate::tokens::DctToken`] index 0..=11);
 /// `probs[i]` is the spec's `P[i]` (the per-symbol leaf probability,
 /// in the §7 valid range `1..=255`). The two slices must be the same
 /// length, which is `N`. `N >= 2` (a one-symbol tree is degenerate;
-/// the spec's loop runs `N-1` merge rounds and at least one is needed
-/// to produce a root).
+/// at least one merge round is needed to produce a root).
+///
+/// The construction maintains a single ascending-weight list. Symbols
+/// enter in slice order, each inserted **before the first node whose
+/// weight is greater than or equal to its own** (so equal-weight
+/// symbols end in reverse insertion order). Each of the `N - 1` merge
+/// rounds removes the two head nodes — the first becomes the left
+/// (bit-0) child, the second the right (bit-1) child — and re-inserts
+/// the merged node by the same before-greater-or-equal rule.
 ///
 /// The returned `Vec<HuffNode>` has length `2 * N - 1` exactly: `N`
-/// leaves followed by `N - 1` internal merge nodes, with the **root
-/// at index `2 * N - 2`** as the spec's terminating comment states
-/// (*"Huffman tree root node is at position 2\*N-2 in SortList"*).
+/// leaves (in input slice order) followed by `N - 1` internal merge
+/// nodes in merge order, with the **root at index `2 * N - 2`** as the
+/// spec's terminating comment states (*"Huffman tree root node is at
+/// position 2\*N-2 in SortList"*).
 ///
 /// The build is pure integer arithmetic and reads no bits from any
-/// bitstream — so it is independent of the §7.3 BoolCoder DOCS-GAP.
+/// bitstream.
 ///
 /// # Errors
 ///
@@ -174,7 +201,9 @@ impl HuffNode {
 /// [`HuffmanError::LengthMismatch`] if `symbols` and `probs` differ
 /// in length, [`HuffmanError::InvalidProbability`] if any probability
 /// is zero (§7: *"the value 0 is explicitly forbidden, so the valid
-/// range is `1 <= Node Probability <= 255`"*).
+/// range is `1 <= Node Probability <= 255`"*; the §13 callers clamp
+/// converted zero leaf-weights to 1 before calling, per the same
+/// errata entry's clamp rule).
 pub fn create_huffman_tree(symbols: &[i32], probs: &[u8]) -> Result<Vec<HuffNode>, HuffmanError> {
     if symbols.len() != probs.len() {
         return Err(HuffmanError::LengthMismatch);
@@ -189,77 +218,51 @@ pub fn create_huffman_tree(symbols: &[i32], probs: &[u8]) -> Result<Vec<HuffNode
         }
     }
 
-    // The spec's `SortList[2N-1]` array. Pre-fill the merged-node tail
-    // with a placeholder leaf so the slice's length is fixed at `2N-1`
-    // and we can write into it by index without `push`/`insert` shifts
-    // disturbing the indices the spec's pseudo-code refers to.
-    let sentinel = HuffNode::leaf(INTERNAL_SYMBOL, 0);
-    let mut sort_list: Vec<HuffNode> = vec![sentinel; 2 * n - 1];
-
-    // §7.2.1 step 1: populate leaves 0..N.
-    for (i, (&s, &p)) in symbols.iter().zip(probs.iter()).enumerate() {
-        sort_list[i] = HuffNode::leaf(s, p as u32);
+    // Node arena: leaves 0..N in input order, then the N-1 merge nodes
+    // appended in merge order (root last, at 2N-2).
+    let mut arena: Vec<HuffNode> = Vec::with_capacity(2 * n - 1);
+    for (&s, &p) in symbols.iter().zip(probs.iter()) {
+        arena.push(HuffNode::leaf(s, p as u32));
     }
 
-    // §7.2.1 step 2: "Sort SortList into ascending probability order
-    // maintaining relative order of nodes having equal probability."
-    // The spec sorts the *leaf* sub-list (positions 0..N) only at this
-    // stage; the rest is the placeholder zone we have not written yet.
-    // We track this sub-list explicitly so the spec's `L = 2*i` and
-    // `R = L+1` two-least-probable accessors trivially hit the right
-    // entries each round.
-    //
-    // Rust's `sort_by` is stable, so equal probabilities preserve
-    // insertion order — exactly the §7.2.1 invariant.
-    sort_list[..n].sort_by_key(|a| a.prob);
+    // The ascending-weight working list, holding arena indices.
+    // Insertion rule (errata "#277 (part 3, closed)"): a new node goes
+    // immediately before the first node whose weight is greater than
+    // OR EQUAL to its own — it jumps ahead of its equals.
+    let mut list: Vec<usize> = Vec::with_capacity(n);
+    let insert = |list: &mut Vec<usize>, arena: &[HuffNode], idx: usize| {
+        let w = arena[idx].prob;
+        let pos = list
+            .iter()
+            .position(|&e| arena[e].prob >= w)
+            .unwrap_or(list.len());
+        list.insert(pos, idx);
+    };
+    for i in 0..n {
+        insert(&mut list, &arena, i);
+    }
 
-    // §7.2.1 step 3: N-1 merge rounds.
-    //
-    // The spec writes:
-    //
-    //     for ( i=0; i<N-1; i++ )
-    //     {
-    //         L = 2*i           // Least probable node
-    //         R = L+1           // Second least probable node
-    //         SortList[N+i].Symbol  = -1
-    //         SortList[N+i].Prob    = SortList[L].Prob + SortList[R].Prob
-    //         SortList[N+i].Left    = L
-    //         SortList[N+i].Right   = R
-    //         Sort nodes in SortList between positions R+1 and N+i (inclusive)
-    //         in to ascending probability order maintaining relative order
-    //         of nodes having equal probability
-    //     }
-    //
-    // The `L = 2*i` / `R = 2*i+1` pattern works because every round
-    // consumes the two lowest-probability nodes at positions `2i` and
-    // `2i+1` and writes the new merged node at `N+i` — then resorts
-    // the *remaining* active sub-list (`R+1 .. N+i`) so the next
-    // round's `L = 2*(i+1) = 2i+2` (= the old R+1) once again points
-    // at the new lowest-probability entry.
-    for i in 0..(n - 1) {
-        let l = 2 * i;
-        let r = l + 1;
+    // N-1 merge rounds: the two head nodes (smallest weights) merge;
+    // the first (smaller) is the left / bit-0 child, the second the
+    // right / bit-1 child. The merged node re-enters the list by the
+    // same before-greater-or-equal rule.
+    for _ in 0..(n - 1) {
+        let l = list.remove(0);
+        let r = list.remove(0);
         let merged = HuffNode {
             symbol: INTERNAL_SYMBOL,
-            prob: sort_list[l].prob + sort_list[r].prob,
+            prob: arena[l].prob + arena[r].prob,
             left: l as i32,
             right: r as i32,
         };
-        let dest = n + i;
-        sort_list[dest] = merged;
-        // "Sort nodes in SortList between positions R+1 and N+i
-        // (inclusive)". When R+1 > N+i the slice is empty and the
-        // sort is a no-op (the final i = N-2 round leaves a single
-        // node in the active window — the just-written root — and
-        // there is nothing to sort against).
-        let start = r + 1;
-        let end_inclusive = dest;
-        if start <= end_inclusive {
-            sort_list[start..=end_inclusive].sort_by_key(|a| a.prob);
-        }
+        let idx = arena.len();
+        arena.push(merged);
+        insert(&mut list, &arena, idx);
     }
+    debug_assert_eq!(list.len(), 1);
+    debug_assert_eq!(list[0], 2 * n - 2, "root is the final merge node");
 
-    Ok(sort_list)
+    Ok(arena)
 }
 
 /// Decode one symbol from a constructed Huffman tree, per the §7.2
@@ -464,14 +467,16 @@ mod tests {
 
     #[test]
     fn create_two_symbol_tree_has_expected_geometry() {
-        // N = 2 → SortList of length 2N-1 = 3, root at index 2.
+        // N = 2 → node list of length 2N-1 = 3, root at index 2. The
+        // two symbols tie, so the later-inserted one (arena index 1)
+        // jumps ahead of its equal and becomes the left / bit-0 child.
         let tree = create_huffman_tree(&[10, 20], &[1, 1]).unwrap();
         assert_eq!(tree.len(), 3);
         // Root is the last entry.
         let root = tree.last().unwrap();
         assert!(!root.is_leaf());
-        assert_eq!(root.left, 0);
-        assert_eq!(root.right, 1);
+        assert_eq!(root.left, 1, "later equal jumps ahead → left child");
+        assert_eq!(root.right, 0);
         assert_eq!(root.prob, 2);
         // Children are leaves.
         assert!(tree[0].is_leaf());
@@ -518,11 +523,12 @@ mod tests {
     #[test]
     fn decode_symbol_round_trips_two_symbol_tree() {
         let tree = create_huffman_tree(&[100, 200], &[1, 1]).unwrap();
-        // Bit 0 → left (symbol 100); bit 1 → right (symbol 200).
+        // The two symbols tie: the later-inserted (200) jumps ahead
+        // and becomes the left / bit-0 child (errata #277 part 3).
         let mut bits0 = [0u8].iter().copied();
-        assert_eq!(decode_symbol(&tree, || bits0.next().unwrap()), 100);
+        assert_eq!(decode_symbol(&tree, || bits0.next().unwrap()), 200);
         let mut bits1 = [1u8].iter().copied();
-        assert_eq!(decode_symbol(&tree, || bits1.next().unwrap()), 200);
+        assert_eq!(decode_symbol(&tree, || bits1.next().unwrap()), 100);
     }
 
     #[test]
@@ -569,19 +575,40 @@ mod tests {
         }
     }
 
-    // -------- §7.2.1 stable-sort invariant --------
+    // -------- operative §7.2.1 tie-break (errata #277 part 3, closed) --------
 
     #[test]
-    fn stable_sort_preserves_input_order_for_equal_probabilities() {
-        // Three symbols, all equal probability. The spec mandates a
-        // stable sort, so the leaf zone of SortList must retain
-        // [10, 20, 30] in input order.
+    fn equal_probabilities_merge_in_descending_insertion_order() {
+        // Three symbols, all equal probability. Each new equal jumps
+        // ahead of the ones already in the list, so the first merge
+        // consumes the LAST two inserted symbols (30 as left, 20 as
+        // right), and the earliest-inserted symbol survives to pair
+        // with the merged node — getting the shortest codeword.
         let tree = create_huffman_tree(&[10, 20, 30], &[5, 5, 5]).unwrap();
-        // The first three positions are the leaf zone after the
-        // initial sort; they should still read 10, 20, 30.
+        assert_eq!(codeword_for(&tree, 10), Some((0b0, 1)));
+        assert_eq!(codeword_for(&tree, 30), Some((0b10, 2)));
+        assert_eq!(codeword_for(&tree, 20), Some((0b11, 2)));
+        // The arena keeps leaves in input order regardless.
         assert_eq!(tree[0].symbol, 10);
         assert_eq!(tree[1].symbol, 20);
         assert_eq!(tree[2].symbol, 30);
+    }
+
+    #[test]
+    fn merged_node_precedes_equal_weight_leaves() {
+        // Weights [1, 1, 2, 2]: symbols 0 and 1 merge to weight 2,
+        // which re-enters BEFORE the two weight-2 leaves. The second
+        // merge therefore pairs the merged node with the weight-2
+        // leaf ahead of it (symbol 3 — it jumped ahead of symbol 2),
+        // leaving symbol 2 the sole depth-1 leaf. (Under the
+        // after-equals placement the two weight-2 leaves merge with
+        // each other instead and the tree is a balanced depth-2 one;
+        // this pins the errata's before-equals rule.)
+        let tree = create_huffman_tree(&[0, 1, 2, 3], &[1, 1, 2, 2]).unwrap();
+        assert_eq!(tree_depth(&tree, 2), Some(1));
+        assert_eq!(tree_depth(&tree, 3), Some(2));
+        assert_eq!(tree_depth(&tree, 0), Some(3));
+        assert_eq!(tree_depth(&tree, 1), Some(3));
     }
 
     // -------- tree_depth / codeword_for --------

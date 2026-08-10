@@ -282,11 +282,14 @@ pub fn decode_intra_frame_from_source(
     let mut u_grid = PlaneDcGrid::new(mb_cols, mb_rows);
     let mut v_grid = PlaneDcGrid::new(mb_cols, mb_rows);
 
-    // §14: one DC-prediction context per plane, each re-seeded to zero
-    // at frame start. The "last decoded DC" seed is plane-local.
+    // §14: one DC-prediction context per plane, re-seeded at frame
+    // start. The "last decoded DC" seed is plane-local: 0 for luma,
+    // +128 (quantized-DC domain) for each chroma plane — the
+    // fixture-arbitrated #277 part 2 correction of §14's unqualified
+    // "set to zero".
     let mut y_dc_pred = DcPredictionContext::new();
-    let mut u_dc_pred = DcPredictionContext::new();
-    let mut v_dc_pred = DcPredictionContext::new();
+    let mut u_dc_pred = DcPredictionContext::new_chroma();
+    let mut v_dc_pred = DcPredictionContext::new_chroma();
 
     // The four luma block-grid offsets within a macroblock, in §13
     // page-58 raster order (TL, TR, BL, BR).
@@ -367,9 +370,11 @@ mod tests {
     /// all-zero byte stream, which under the baselines decodes every
     /// block as empty (DC = 0, EOB at the first AC position — proven in
     /// `block_decode`'s `all_zero_stream_decodes_empty_block`). An empty
-    /// block dequantizes/IDCTs/reconstructs to the §17.1 mid-grey 128.
+    /// block dequantizes/IDCTs/reconstructs to the §17.1 mid-grey 128
+    /// in luma; chroma rides the §14 +128 quantized-DC seed (errata
+    /// #277 part 2) and saturates instead.
     #[test]
-    fn all_zero_stream_decodes_flat_mid_grey_frame() {
+    fn all_zero_stream_decodes_flat_planes() {
         // A 2x2-MB frame: hf = vf = 4 luma blocks.
         let bytes = [0u8; 256];
         let mut bc = BoolCoder::new(&bytes).unwrap();
@@ -384,11 +389,17 @@ mod tests {
         for &s in frame.y.samples() {
             assert_eq!(s, 128, "empty intra luma block → mid-grey 128");
         }
+        // Chroma: the §14 frame-start seed is +128 in the quantized-DC
+        // domain (errata #277 part 2), so an all-zero stream (DC delta
+        // 0) reconstructs each chroma block at
+        // `clip(idct(128 * dc_factor) + 128)` — saturated white, not
+        // 128. Neutral chroma on the wire requires a coded DC delta of
+        // −128 (which the in-tree encoder now emits).
         for &s in frame.u.samples() {
-            assert_eq!(s, 128);
+            assert_eq!(s, 255, "chroma seed 128 saturates on a zero delta");
         }
         for &s in frame.v.samples() {
-            assert_eq!(s, 128);
+            assert_eq!(s, 255);
         }
     }
 

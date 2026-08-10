@@ -6,6 +6,92 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 439, 2026-08-11) — **whole-keyframe pixel-exact decode**
+
+- **The conformant third-party vp6f Huffman keyframe now decodes
+  pixel-exactly, end-to-end, through the top-level `Vp6Decoder`** — all
+  9720 blocks; every luma, U and V sample of the 854x480 display region
+  matches the black-box decode oracle bit-for-bit (new CI gate
+  `keyframe_decodes_pixel_exact`). This closes the crate's long-standing
+  full-frame Huffman blocker: the trace ask filed against the docs
+  collaborator was answered by the staged extraction record
+  (`docs/video/vp6/provenance/03-extractor-binary-huffman.md`, tables
+  04–06, and the substantially extended errata), and this round lands
+  every corrected reading it pins plus three further fixture-arbitrated
+  corrections of its own:
+  - **§7.2.1 Huffman tree construction — operative tie-break** (errata
+    `#277 part 3, closed`). `create_huffman_tree` now maintains an
+    ascending-weight list with insert-before-first-greater-or-equal
+    semantics (equal-weight symbols end in descending index order;
+    merged nodes precede their equals; first head = left/bit-0 child),
+    replacing the stable-ascending-sort reading of the printed text.
+  - **Keyframe carry-forward probability fill** (errata `#277 part 7`).
+    New `KeyframeNodeCarry` + `update_dc_probs_keyframe` /
+    `update_ac_probs_keyframe` / `decode_coefficient_prob_updates_keyframe`:
+    on a key frame a clear DC/AC update flag writes the shared 11-slot
+    running vector's value into the bank (the vector is seeded to 128
+    once and never reset between the DC and AC walks), so every DC/AC
+    entry is written; ZRL keeps literal semantics. The keyframe
+    Figure-5 emitter (`encode_coefficient_prob_updates_full`) mirrors
+    the rule. The fixture keyframe's re-derived banks match the staged
+    corrected table (`tables/05`) exactly; the earlier "chroma DC tree
+    is built from the luma bank" finding is explained by the rule (the
+    chroma row inherits the vector) and the special-case copy is gone.
+  - **§13.2.2 DC Huffman trees use the printed 12-leaf §13.1 mapping**
+    (EOB included; an EOB codeword in the DC position is a bitstream
+    error). The r390 "fold node 0's left branch into ZERO_TOKEN"
+    variant was a compensating misreading fitted against the literal
+    (pre-carry-forward) banks and is removed
+    (`dct_token_bool_tree_to_huff_probs_dc` deleted).
+  - **§13.3.1 `Prec` seed is magnitude-based** (new erratum, fixture-
+    arbitrated): `AcPrecContext::seed_from_dc(-1)` seeds `Prec = 1`,
+    not the printed signed `dc == 1` reading's `Prec = 2` — the block
+    after the staged `tables/03` datum block carries DC −1 followed by
+    an AC1 EOB that only decodes under the `Prec = 1` tree. Matches
+    the extraction record's mid-block `1 + (magnitude > 1)` form.
+  - **§14 two-neighbour DC average truncates toward zero** (new
+    erratum, fixture-arbitrated in both sign directions): the operative
+    average is `(L + A) / 2` toward zero; the printed
+    `(L + A + Sign(L+A)) / 2` rounds odd sums away from zero and fails
+    the fixture on both a negative (`(-299,-298) → -298`) and a
+    positive (`(15,0) → 7`) odd-sum pair.
+  - **§14 chroma DC seed wired into all drivers** (r411 finding, now
+    operative): chroma planes seed the "last decoded DC" register at
+    +128 in the quantized-DC domain — for the **Intra bucket only**
+    (new fixture arbitration: seeding the inter buckets at 128
+    desynchronises the fixture P-frame's Table-26 DC contexts; with
+    inter buckets at zero its static prefix parses sample-exactly).
+    Both decoders and all encoders thread `new_chroma()` so round-trips
+    stay exact.
+  - §13.2.2 DC-run store (`run − 1`) and §13.3.3.2 zero-run advance
+    (`symbol + 1`, escape `9 + R(6)`) — previously in-tree readings,
+    now confirmed closed by errata `#193 parts 1+2` and exercised by
+    the whole-frame gate.
+
+### Changed (round 439)
+
+- `reconstruct_diff_mv` clamps the reference+delta sum to the §11
+  component bound (±127 ¼-pel). A conformant stream never exceeds it;
+  the clamp keeps corrupt or desynchronised input from stepping past
+  the §11.5 UMV border during reconstruction (previously an
+  out-of-bounds panic was reachable).
+- The vp6f conformance suite's leading-macroblock prefix gate is
+  superseded by the whole-keyframe gate; the Figure-5 parse gate now
+  runs the keyframe carry-forward pass and pins the carry-filled
+  `DcProbs` rows.
+
+### Known remaining (round 439)
+
+- The fixture's two **P-frames** do not yet decode pixel-exactly: their
+  static prefix (first 31 macroblock columns) parses and reconstructs
+  sample-exactly under the corrected readings, but the parse diverges
+  at the first content macroblock — the §10 mode-tree probabilities /
+  §11.1 MV wire details / arithmetic-path content residuals are not
+  discriminable from this fixture alone (several single-knob
+  alternative readings all fail at the same macroblock). The staged
+  extraction record explicitly leaves P-frames un-established; a
+  behavioural P-frame trace ask has been filed with the round report.
+
 ### Changed
 
 - Marked the crate's internal plumbing (`#[doc(hidden)]`): the BoolCoder,

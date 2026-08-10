@@ -377,13 +377,9 @@ mod tests {
         let mut bc = BoolCoder::new(bytes)?;
         let mut coeff_data = [0i32; BLOCK_SIZE];
         coeff_data[0] = decode_dc(&mut bc, dc_node_probs)?;
-        let mut prec = if coeff_data[0] == 0 {
-            AcPrecContext::WasZero
-        } else if coeff_data[0] == 1 {
-            AcPrecContext::WasOne
-        } else {
-            AcPrecContext::WasGreaterThanOne
-        };
+        // Magnitude-based seed — the §13.3.1 printed `dc == 1` signed
+        // test is a spec defect (see `AcPrecContext::seed_from_dc`).
+        let mut prec = AcPrecContext::seed_from_dc(coeff_data[0]);
         let mut encoded_coeffs: usize = 1;
         loop {
             let band = AcBand::for_coefficient_position(encoded_coeffs).unwrap();
