@@ -34,17 +34,14 @@
 //!    the first qualifying neighbour's MV, or `(0, 0)` if neither
 //!    qualifies.
 //!
-//! 2. **Delta application.** [`reconstruct_diff_mv`] is the pure
-//!    per-component addition `final = reference + delta`. The §11.1
-//!    decoder produces signed components in `[-127, 127]`, so the
-//!    intermediate sum lives in `[-254, 254]` — well inside `i16` —
-//!    and no wrapping is needed. The spec does not mandate any
-//!    post-sum clamp; callers consuming the reconstructed vector
-//!    inside §17 reconstruction get well-defined behaviour from the
-//!    §11.5 UMV border extension landed in [`crate::umv`] when the
-//!    sum stays inside the 48-sample border and well-defined
-//!    edge-clamped behaviour from [`crate::inter::fetch_prediction_block_clamped`]
-//!    in any case.
+//! 2. **Delta application.** [`reconstruct_diff_mv`] is the
+//!    per-component addition `final = reference + delta`, clamped to
+//!    the §11 component bound of `[-127, 127]` ("The maximum magnitude
+//!    of a MV component is 31 ¾ whole pixels (127 in units of ¼
+//!    pixel)"). A conformant stream never produces a sum outside that
+//!    bound; the clamp keeps a corrupt or desynchronised one from
+//!    stepping past the §11.5 48-sample UMV border during §17
+//!    reconstruction.
 //!
 //! Composing them, [`reconstruct_new_mv`] is the one-shot the §10
 //! `CODE_INTER_PLUS_MV` / `CODE_GOLDEN_MV` paths consume per MB:
@@ -179,23 +176,35 @@ pub fn select_diff_reference_mv_from_grid(
     })
 }
 
-/// Apply a §11.1-decoded delta to a differential reference MV.
+/// Apply a §11.1-decoded delta to a differential reference MV, clamping
+/// the sum to the §11 component bound.
 ///
-/// Pure per-component addition: `final.x = reference.x + delta.x`,
-/// `final.y = reference.y + delta.y`. The §11.1 decoder produces
-/// signed components in `[-127, 127]`, so the intermediate sum lives
-/// in `[-254, 254]` — well inside `i16` — and no wrapping is needed.
-///
-/// The §11 intro paragraph does not mandate a post-sum clamp; callers
-/// consuming the reconstructed MV at §17 reconstruction get
-/// well-defined behaviour either from a §11.5 UMV-extended buffer
-/// ([`crate::umv`]) when the magnitude stays within the 48-sample
-/// border, or from edge-clamped fetch
-/// ([`crate::inter::fetch_prediction_block_clamped`]) when it does
-/// not.
+/// Per-component addition `final = reference + delta`, then a clamp of
+/// each component to `[-127, 127]` — §11's "The maximum magnitude of a
+/// MV component is 31 ¾ whole pixels (127 in units of ¼ pixel)". The
+/// §11.1 decoder produces delta components in `[-127, 127]` and the
+/// reference is itself a §11-bounded MV, so the raw sum lives in
+/// `[-254, 254]`; a *conformant* stream never lets it leave the §11
+/// bound, but a corrupt or desynchronised one can, and an unclamped
+/// out-of-bound vector would step past the §11.5 48-sample UMV border
+/// during §17 reconstruction (an out-of-buffer fetch). The clamp keeps
+/// every §17 fetch inside the bordered buffer for any input.
 #[inline]
 pub const fn reconstruct_diff_mv(reference: MotionVector, delta: MotionVector) -> MotionVector {
-    MotionVector::new(reference.x + delta.x, reference.y + delta.y)
+    const MV_COMPONENT_BOUND: i16 = 127;
+    const fn clamp_component(v: i16) -> i16 {
+        if v > MV_COMPONENT_BOUND {
+            MV_COMPONENT_BOUND
+        } else if v < -MV_COMPONENT_BOUND {
+            -MV_COMPONENT_BOUND
+        } else {
+            v
+        }
+    }
+    MotionVector::new(
+        clamp_component(reference.x + delta.x),
+        clamp_component(reference.y + delta.y),
+    )
 }
 
 /// One-shot wrapper that selects the §11 differential reference MV
@@ -425,18 +434,24 @@ mod tests {
         );
     }
 
-    /// At the §11.1 magnitude cap (`±127`) the sum saturates at
-    /// `±254` — still well inside `i16`'s `±32767` range, so the
-    /// addition does not wrap. Pins the no-overflow guarantee the
-    /// module documentation promises.
+    /// At the §11.1 magnitude cap (`±127`) the sum is clamped back to
+    /// the §11 component bound, so a corrupt stream whose
+    /// reference+delta sum leaves the legal range cannot step past the
+    /// §11.5 UMV border during reconstruction.
     #[test]
     fn maximum_magnitude_sum_stays_in_range() {
         let max_pos = mv(127, 127);
         let max_neg = mv(-127, -127);
-        assert_eq!(reconstruct_diff_mv(max_pos, max_pos), mv(254, 254));
-        assert_eq!(reconstruct_diff_mv(max_neg, max_neg), mv(-254, -254));
+        assert_eq!(reconstruct_diff_mv(max_pos, max_pos), mv(127, 127));
+        assert_eq!(reconstruct_diff_mv(max_neg, max_neg), mv(-127, -127));
         assert_eq!(reconstruct_diff_mv(max_pos, max_neg), MotionVector::ZERO);
         assert_eq!(reconstruct_diff_mv(max_neg, max_pos), MotionVector::ZERO);
+        // In-bound sums pass through unchanged.
+        assert_eq!(
+            reconstruct_diff_mv(mv(100, -100), mv(27, -27)),
+            mv(127, -127)
+        );
+        assert_eq!(reconstruct_diff_mv(mv(3, -4), mv(10, 8)), mv(13, 4));
     }
 
     /// One-shot wrapper composes reference selection and delta
