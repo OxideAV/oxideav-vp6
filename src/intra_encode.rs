@@ -492,6 +492,45 @@ pub fn encode_intra_frame_multistream(
     dct_q_mask: u8,
     use_huffman: bool,
 ) -> Result<Vec<u8>, Error> {
+    encode_intra_frame_multistream_with_banks(
+        frame,
+        dct_q_mask,
+        use_huffman,
+        &CoeffProbBanks::keyframe(),
+    )
+}
+
+/// Encode a two-partition keyframe whose §8 Figure-5 sub-stream carries
+/// the updates needed to reach `banks` under the keyframe
+/// **carry-forward** decode rule (errata `#277 part 7`;
+/// [`crate::coeff_prob_update::encode_coefficient_prob_updates_full`]),
+/// and whose partition-2 coefficient tokens are coded against those
+/// same retrained banks — BoolCoder-coded when `use_huffman` is
+/// `false`, §7.2 Huffman-coded (with the trees derived from `banks`
+/// exactly as the decoder derives them) when `true`.
+///
+/// This is the general form of [`encode_intra_frame_multistream`]
+/// (which passes [`CoeffProbBanks::keyframe`]) and the encode-side dual
+/// of the conformant fixture keyframe's shape: a Huffman MultiStream
+/// I-frame with live Figure-5 retraining. Like
+/// [`encode_intra_frame_with_banks`], the custom-scan half of `banks`
+/// is not applied to the coefficient ordering — pass a `banks` with
+/// the default `band_assignment` — and every node probability that
+/// differs from its carry-forward value must be representable by the
+/// §13 update mechanism
+/// ([`crate::coeff_prob_update::node_prob_update_representable`]).
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] for an over-large frame geometry (the §9
+/// `b(8)` per-axis fragment cap) or a partition-1 length that overflows
+/// the 16-bit `Buff2Offset` field.
+pub fn encode_intra_frame_multistream_with_banks(
+    frame: &Frame,
+    dct_q_mask: u8,
+    use_huffman: bool,
+    banks: &CoeffProbBanks,
+) -> Result<Vec<u8>, Error> {
     let h_fragments = frame.h_fragments;
     let v_fragments = frame.v_fragments;
     // §9 geometry is in macroblock units (see `encode_intra_frame_with_banks`).
@@ -505,10 +544,11 @@ pub fn encode_intra_frame_multistream(
 
     let dct_q_mask = dct_q_mask & 0x3F;
     let dequant = DequantContext::new(dct_q_mask);
-    let banks = CoeffProbBanks::keyframe();
     let intra_probs = banks.to_intra_probs();
 
-    // --- Partition 1: §9 tail + §8 Figure-5 (no-update) pass ---
+    // --- Partition 1: §9 tail + §8 Figure-5 pass (carry-forward
+    // emitter — the minimal all-clear stream when `banks` is the
+    // keyframe baseline) ---
     let mut p1 = BoolEncoder::new();
     p1.encode_b(mb_rows as u32, 8);
     p1.encode_b(mb_cols as u32, 8);
@@ -516,13 +556,13 @@ pub fn encode_intra_frame_multistream(
     p1.encode_b(mb_cols as u32, 8); // OutputHFragments = coded
     p1.encode_b(0, 2); // ScalingMode = MAINTAIN_ASPECT_RATIO
     p1.encode_b1(u8::from(use_huffman)); // UseHuffman
-    crate::coeff_prob_update::encode_coefficient_prob_updates(&mut p1);
+    crate::coeff_prob_update::encode_coefficient_prob_updates_full(&mut p1, banks);
     let p1_bytes = p1.finish();
 
     // --- Partition 2: the §13 tokens under the selected coder ---
     let blocks = tokenize_intra_frame(frame, dequant);
     let p2_bytes = if use_huffman {
-        let tables = crate::huff_coeff::HuffmanCoeffTables::from_banks(&banks);
+        let tables = crate::huff_coeff::HuffmanCoeffTables::from_banks(banks);
         let pairs: Vec<(AcPlane, [i32; 64])> =
             blocks.iter().map(|tb| (tb.plane, tb.scan)).collect();
         let mut w = oxideav_core::bits::BitWriter::new();

@@ -830,6 +830,57 @@ mod tests {
         assert_eq!(huff_out.v.samples(), ss_out.v.samples());
     }
 
+    /// A two-partition **Huffman keyframe carrying real Figure-5 bank
+    /// retraining** — the conformant fixture's exact shape — decodes
+    /// through `decode_packet` to the same pixels as the
+    /// baseline-banks encodings: the keyframe carry-forward emitter
+    /// and decode pass agree, and the §7.2 Huffman trees both sides
+    /// derive from the *retrained* banks match bit-for-bit. Exercises
+    /// carry-forward inheritance (the chroma DC row of `banks` is left
+    /// for the running vector to fill), a retrained ZRL node, and
+    /// deep-tie AC retraining, end-to-end through the top-level
+    /// decoder.
+    #[test]
+    fn multistream_huffman_keyframe_with_retrained_banks_round_trips() {
+        use crate::intra_encode::encode_intra_frame_multistream_with_banks;
+
+        let src = pattern_frame(4, 4);
+        let q = 48;
+
+        // Retrained target banks (representable values only). The
+        // chroma DC row copies the luma row — the carry-reachable
+        // shape the emitter encodes with pure clear flags.
+        let mut banks = CoeffProbBanks::keyframe();
+        banks.dc_probs[0] = [52, 2, 30, 36, 128, 128, 50, 128, 128, 128, 180];
+        banks.dc_probs[1] = banks.dc_probs[0];
+        banks.ac_probs[0][0][0][0] = 228;
+        banks.ac_probs[0][1][0][2] = 162;
+        banks.ac_probs[1][2][3][6] = 90;
+        banks.zrl_probs[0][2] = 234;
+
+        let bytes = encode_intra_frame_multistream_with_banks(&src, q, true, &banks)
+            .expect("encode huff + banks");
+        let mut dec = Vp6Decoder::new();
+        let out = dec.decode_packet(&bytes).expect("decode huff + banks");
+
+        let ss_bytes = encode_intra_frame(&src, q).expect("encode ss");
+        let mut dec2 = Vp6Decoder::new();
+        let ss_out = dec2.decode_packet(&ss_bytes).expect("decode ss");
+        assert_eq!(out.y.samples(), ss_out.y.samples());
+        assert_eq!(out.u.samples(), ss_out.u.samples());
+        assert_eq!(out.v.samples(), ss_out.v.samples());
+
+        // The arithmetic transport against the same retrained banks
+        // reconstructs identically too.
+        let bc_bytes = encode_intra_frame_multistream_with_banks(&src, q, false, &banks)
+            .expect("encode bool + banks");
+        let mut dec3 = Vp6Decoder::new();
+        let bc_out = dec3.decode_packet(&bc_bytes).expect("decode bool + banks");
+        assert_eq!(bc_out.y.samples(), ss_out.y.samples());
+        assert_eq!(bc_out.u.samples(), ss_out.u.samples());
+        assert_eq!(bc_out.v.samples(), ss_out.v.samples());
+    }
+
     /// A multistream keyframe seeds the §4 refs + profile/version, so a
     /// following single-stream P-frame decodes against it — the carried
     /// state is partition-arrangement-agnostic.

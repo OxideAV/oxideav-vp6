@@ -68,6 +68,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     now confirmed closed by errata `#193 parts 1+2` and exercised by
     the whole-frame gate.
 
+- **`encode_intra_frame_multistream_with_banks`** — the encode-side
+  dual of the fixture keyframe's shape: a two-partition keyframe whose
+  Figure-5 sub-stream carries the carry-forward-encoded retraining to
+  reach an arbitrary representable bank set, with the partition-2
+  tokens (BoolCoder or §7.2 Huffman) coded against those retrained
+  banks. Round-tripped through `Vp6Decoder::decode_packet` under both
+  transports, including pure carry-inheritance of the chroma DC row.
+
 ### Changed (round 439)
 
 - `reconstruct_diff_mv` clamps the reference+delta sum to the §11
