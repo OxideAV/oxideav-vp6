@@ -14,23 +14,33 @@ Specification" (document version 1.02, August 2006), staged at
 `docs/video/vp6/vp6-errata-and-clarifications.md`. No third-party VP6
 source has been consulted at any stage.
 
-**Round 411 — §16 IDCT rounding corrected + chroma DC coding cracked
-via bit-flip probing.** The round-390 "toward zero" IDCT reading was an
-under-determined misdiagnosis: AC-carrying oracle blocks arbitrate the
-true §16 descales as `>> 16` **exactly as printed** plus a final
-`(x + 8) >> 4` rounding add the listing omits — all 555 non-uniform
-oracle luma blocks reconstruct pixel-exactly under this combination
-and under no other (new CI gate). Differential bit-flip probing
-against the black-box decode oracle then mapped the keyframe's true
-bit→block token ownership and pinned two §13.2.2/§14 findings: the
-chroma DC Huffman tree derives from the **luma** probability bank, and
-the chroma §14 frame-start DC seed is **+128**, not zero. With both
-applied experimentally the keyframe's whole 31-MB uniform prefix and
-the first content block's DC parse pixel-exactly; the remaining
-divergence is isolated to the §13.3.2 AC Huffman trees. Driver wiring
-is deferred behind a newly-diagnosed pre-existing arithmetic-path
-encoder fidelity bug (see the changelog and the fixture `notes.md`
-appendix for the full investigation record).
+**Round 439 — the conformant third-party keyframe decodes
+pixel-exactly, end-to-end.** The full-frame Huffman blocker is closed:
+`Vp6Decoder::decode_packet` reconstructs the fixture keyframe's entire
+854x480 display region — all 9720 blocks, every Y/U/V sample —
+bit-identical to the black-box decode oracle (CI gate
+`keyframe_decodes_pixel_exact`). The staged extraction record
+(`docs/video/vp6/provenance/03-extractor-binary-huffman.md` + tables
+04–06 + the extended errata) supplied the corrected §7.2.1 tree
+construction (insert-before-equals tie-break), the keyframe
+carry-forward probability fill (`#277 part 7` — clear update flags
+write a shared running vector, which also subsumes the earlier
+"chroma DC tree from the luma bank" finding), and the closed
+§13.2.2/§13.3.3.2 run conventions (`#193`). Landing them surfaced and
+fixture-arbitrated three further printed-spec defects: the §13.3.1
+`Prec` seed classifies the DC **magnitude** (a DC of −1 seeds
+`Prec = 1`), the §14 two-neighbour DC average truncates **toward
+zero** (the printed `+Sign(L+A)` rounds odd sums away from zero and
+fails both sign directions), and the §14 chroma +128 quantized-DC seed
+applies to the **Intra bucket only** (seeding the inter buckets
+desynchronises the fixture P-frame's Table-26 DC contexts). The r390
+"DC-fold" tree variant is removed — under the corrected banks and
+tie-break the printed 12-leaf §13.1 DC mapping is the operative one.
+The two fixture **P-frames** (MultiStream arithmetic path) decode
+their static prefix sample-exactly but diverge at the first content
+macroblock; their §10/§11 wire semantics need a behavioural P-frame
+trace (ask filed — the extraction record explicitly leaves P-frames
+un-established).
 
 **Round 390 — first third-party conformance fixture.** A conformant
 external vp6f stream (Huffman/MultiStream, 854x480, I+P+P, black-box
@@ -39,11 +49,12 @@ decode-oracle YUV) lives at
 (`tests/conformance_vp6f.rs`). It arbitrated printed-spec errata, fixed
 and pinned: §9 Table 2 geometry is transmitted in **macroblock units**
 (not the printed 8x8-block units); partition 1's BoolCoder legitimately
-reads past `Buff2Offset` (tight partition sizing + 32-bit look-ahead);
-and the §13.2.2 DC Huffman trees fold node 0's left branch wholly into
-`ZERO_TOKEN` (EOB is forbidden in DC). The keyframe's real Huffman
-coefficient partition decodes pixel-exactly through its leading
-macroblocks against the oracle (gated in CI).
+reads past `Buff2Offset` (tight partition sizing + 32-bit look-ahead).
+Round 411 added the §16 IDCT rounding arbitration (per-multiply
+`>> 16` exactly as printed + a final `(x + 8) >> 4` rounding add the
+listing omits, pinned by all 555 non-uniform oracle luma blocks) and
+the differential bit-flip probe map that first exposed the chroma DC
+seed and bank findings round 439 wired in.
 
 Almost every decode primitive is implemented and unit-tested. The crate
 exposes a **full intra-frame (I-frame) decoder** (`decode_intra_frame`)
@@ -462,26 +473,38 @@ two-stage box-then-¼-pel luma search and §11 differential-MV emission), its
   `encode_inter_frame_packet_with_banks`) and the re-trained banks
   persist into following frames.
 - **MultiStream (§6) + Huffman (§7) second partition — LANDED (round
-  384).** `decode_packet` splits at `Buff2Offset` and dispatches on
-  `MultiStream`/`UseHuffman`; keyframes run the §6-general
-  `decode_intra_frame_from_source`, inter frames the Figure 3/4 two-pass
-  `decode_inter_frame_multistream` (all MB prediction info from
-  partition 1, then all coefficients from partition 2). `huff_coeff`
-  implements the full §13.1/§13.2.2/§13.3.2/§13.3.3.2/§13.4 Huffman
-  coefficient coder (tree derivation from the same §13 banks, cross-block
+  384), whole-frame validated (round 439).** `decode_packet` splits at
+  `Buff2Offset` and dispatches on `MultiStream`/`UseHuffman`; keyframes
+  run the §6-general `decode_intra_frame_from_source`, inter frames the
+  Figure 3/4 two-pass `decode_inter_frame_multistream` (all MB
+  prediction info from partition 1, then all coefficients from
+  partition 2). `huff_coeff` implements the full
+  §13.1/§13.2.2/§13.3.2/§13.3.3.2/§13.4 Huffman coefficient coder
+  (tree derivation from the carry-forward-filled §13 banks, cross-block
   DC/AC1 run state, EOB/DC0 block runs) with a frame-level bit-exact
-  encoder. Three printed-spec inconsistencies (the §13.3.3.2 ZRL
-  symbol↔run off-by-one, the long-escape base, the §13.2.2 DC-run store
-  missing its `− 1`) are disambiguated against the §13.3.3.1 arithmetic
-  value space and documented in `huff_coeff`'s module docs.
+  encoder. The three printed-spec inconsistencies it disambiguated in
+  r384 (the §13.3.3.2 ZRL symbol↔run off-by-one, the long-escape base,
+  the §13.2.2 DC-run store missing its `− 1`) are now **measured and
+  closed** by the staged errata (`#193 parts 1+2`) and exercised by the
+  whole-keyframe pixel-exact gate.
 - **FourMV MB neighbour representative — DOCS-GAP CLOSED (errata #155,
   round 384).** The representative a `CODE_INTER_FOURMV` MB contributes
   to later MBs' §10 Nearest/Near scans and §11 differential references
   is its §10 **chroma-derived average** (four Y vectors, rounded away
   from zero). Decoder and encoder both record it in the neighbour grid.
-- **High-bit-depth / scaling resampling math** and **sample-exact
-  validation against a conformant `.vp6` bitstream** — the latter
-  needs an encoder-produced fixture.
+- **P-frame wire semantics against the real fixture — the remaining
+  conformance blocker (round 439).** The fixture's two P-frames
+  (MultiStream, arithmetic coefficient path) decode their static prefix
+  sample-exactly under the corrected readings, but diverge at the first
+  content macroblock. The §10 mode-probability derivation
+  (`probXmitted` → tree-node probabilities), the §11.1 MV component
+  wire details and the arithmetic-path content residuals cannot be
+  discriminated from this fixture alone (single-knob alternative
+  readings — Nearest/Near zero-MV inclusion, MV sign/order/short-flag
+  variants, mode-weight variants — all fail at the same macroblock).
+  Needs a behavioural P-frame trace from the docs collaborator; the
+  staged extraction record explicitly leaves P-frames un-established.
+- **High-bit-depth / scaling resampling math**.
 
 ## License
 
