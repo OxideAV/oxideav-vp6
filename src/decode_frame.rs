@@ -219,6 +219,13 @@ impl Vp6Decoder {
         self.output_scaling
     }
 
+    /// The §9 coded geometry carried from the most recent I-frame
+    /// (`HFragments` / `VFragments`, macroblock units per erratum
+    /// #338), or `None` before the first keyframe.
+    pub fn coded_geometry(&self) -> Option<crate::scaling::FrameGeometry> {
+        self.coded_geometry
+    }
+
     /// Apply the carried §9 output scaling to a decoded coded-resolution
     /// frame (see [`crate::scaling::apply_output_scaling`]). With no
     /// carried scaling state, or an identity/`OTHER` (unspecified —
@@ -1440,6 +1447,77 @@ mod tests {
         assert_eq!(dec.output_scaling(), Some(signal));
         dec.reset();
         assert_eq!(dec.output_scaling(), None);
+    }
+
+    /// `CENTER` end-to-end through the driver: a 2x2 MB keyframe
+    /// signalling a 4x4 MB `CENTER` output decodes to a 64x64 frame
+    /// whose centred 32x32 window is exactly the unscaled decode and
+    /// whose surround is the neutral fill (Y = 0, U = V = 128).
+    #[test]
+    fn scaled_center_mode_end_to_end() {
+        use crate::intra_encode::encode_intra_frame_scaled;
+        use crate::scaling::{FrameGeometry, OutputScaling, ScalingMode};
+
+        let src = pattern_frame(4, 4);
+        let signal = OutputScaling::new(FrameGeometry::new(4, 4), ScalingMode::Center);
+        let bytes = encode_intra_frame_scaled(&src, 48, signal).expect("encode");
+
+        let mut dec_plain = Vp6Decoder::new();
+        let coded = dec_plain.decode_packet(&bytes).expect("decode coded");
+        let mut dec = Vp6Decoder::new();
+        let out = dec.decode_packet_scaled(&bytes).expect("decode scaled");
+        assert_eq!(dec.coded_geometry(), Some(FrameGeometry::new(2, 2)));
+
+        assert_eq!(out.y.width(), 64);
+        assert_eq!(out.y.height(), 64);
+        // Centred window == the coded decode.
+        for r in 0..32 {
+            for c in 0..32 {
+                assert_eq!(out.y.sample(16 + r, 16 + c), coded.y.sample(r, c));
+            }
+        }
+        for r in 0..16 {
+            for c in 0..16 {
+                assert_eq!(out.u.sample(8 + r, 8 + c), coded.u.sample(r, c));
+                assert_eq!(out.v.sample(8 + r, 8 + c), coded.v.sample(r, c));
+            }
+        }
+        // Neutral surround.
+        assert_eq!(out.y.sample(0, 0), Some(0));
+        assert_eq!(out.y.sample(63, 63), Some(0));
+        assert_eq!(out.u.sample(0, 0), Some(128));
+        assert_eq!(out.v.sample(31, 31), Some(128));
+    }
+
+    /// Letterboxed `MAINTAIN_ASPECT_RATIO` end-to-end through the
+    /// driver: a wide 4x2 MB (64x32) keyframe signalling a square 2x2 MB
+    /// (32x32) output decodes to a 32x32 frame with the 32x16 fitted
+    /// rectangle at y = 8 and neutral letterbox bands above and below.
+    #[test]
+    fn scaled_aspect_fit_letterbox_end_to_end() {
+        use crate::intra_encode::encode_intra_frame_scaled;
+        use crate::scaling::{FrameGeometry, OutputScaling, ScalingMode};
+
+        let src = flat_frame(8, 4, 200); // 4x2 MB, luma 64x32
+        let signal = OutputScaling::new(FrameGeometry::new(2, 2), ScalingMode::MaintainAspectRatio);
+        let bytes = encode_intra_frame_scaled(&src, 32, signal).expect("encode");
+
+        let mut dec = Vp6Decoder::new();
+        let out = dec.decode_packet_scaled(&bytes).expect("decode scaled");
+        assert_eq!(out.y.width(), 32);
+        assert_eq!(out.y.height(), 32);
+        // Fitted rows carry the (exactly reconstructed, constant-
+        // preserved) flat value; letterbox rows carry the fill.
+        for c in 0..32 {
+            assert_eq!(out.y.sample(4, c), Some(0), "top letterbox");
+            assert_eq!(out.y.sample(16, c), Some(200), "fitted rect");
+            assert_eq!(out.y.sample(28, c), Some(0), "bottom letterbox");
+        }
+        for c in 0..16 {
+            assert_eq!(out.u.sample(2, c), Some(128));
+            assert_eq!(out.u.sample(8, c), Some(200));
+            assert_eq!(out.u.sample(14, c), Some(128));
+        }
     }
 
     /// The MultiStream scaled keyframe emitter signals the same §9
