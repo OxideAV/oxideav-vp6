@@ -361,6 +361,35 @@ pub fn encode_intra_frame(frame: &Frame, dct_q_mask: u8) -> Result<Vec<u8>, Erro
     encode_intra_frame_with_banks(frame, dct_q_mask, &CoeffProbBanks::keyframe())
 }
 
+/// [`encode_intra_frame`] with an explicit §9 output-scaling signal: the
+/// keyframe is coded at `frame`'s (reduced) resolution and its
+/// IntraHeader carries `output`'s `OutputHFragments` /
+/// `OutputVFragments` / `ScalingMode` fields, telling the decoder to
+/// present the frame at the output geometry (§2 "scaling on output
+/// after decode"; macroblock units per erratum #338).
+///
+/// This is the signalling half of the downsampled-encode path: pair it
+/// with [`crate::scaling::resample_frame`] to shrink the source before
+/// encoding, and [`crate::decode_frame::Vp6Decoder::decode_packet_scaled`]
+/// reconstructs at the coded size then upscales back to the signalled
+/// output size. Inter frames carry no geometry (§9 Table 3), so the
+/// following P-frames of the GOP need no scaling-aware variant — they
+/// are coded at the same reduced resolution and inherit the keyframe's
+/// scaling on output.
+///
+/// # Errors
+///
+/// [`Error::NotImplemented`] for an over-large coded geometry (the §9
+/// `b(8)` per-axis cap) or an `output` geometry outside `1..=255`
+/// macroblocks per axis.
+pub fn encode_intra_frame_scaled(
+    frame: &Frame,
+    dct_q_mask: u8,
+    output: crate::scaling::OutputScaling,
+) -> Result<Vec<u8>, Error> {
+    encode_intra_frame_with_banks_impl(frame, dct_q_mask, &CoeffProbBanks::keyframe(), Some(output))
+}
+
 /// Encode a keyframe whose §8 Figure 5 sub-stream carries the §13
 /// coefficient-probability updates needed to reach `banks` from the
 /// keyframe baseline, and whose coefficient tokens are then BoolCoder-coded
@@ -390,6 +419,48 @@ pub fn encode_intra_frame_with_banks(
     frame: &Frame,
     dct_q_mask: u8,
     banks: &CoeffProbBanks,
+) -> Result<Vec<u8>, Error> {
+    encode_intra_frame_with_banks_impl(frame, dct_q_mask, banks, None)
+}
+
+/// Emit the §9 Table 2 geometry + scaling tail fields:
+/// `VFragments b(8)`, `HFragments b(8)`, `OutputVFragments b(8)`,
+/// `OutputHFragments b(8)`, `ScalingMode b(2)` (all `*Fragments` in
+/// macroblock units per erratum #338). With no `scaling` the output
+/// geometry mirrors the coded geometry and `ScalingMode` is 0
+/// (`MAINTAIN_ASPECT_RATIO` — moot at identity geometry).
+fn emit_intra_geometry(
+    enc: &mut BoolEncoder,
+    mb_rows: usize,
+    mb_cols: usize,
+    scaling: Option<crate::scaling::OutputScaling>,
+) -> Result<(), Error> {
+    enc.encode_b(mb_rows as u32, 8); // VFragments
+    enc.encode_b(mb_cols as u32, 8); // HFragments
+    match scaling {
+        None => {
+            enc.encode_b(mb_rows as u32, 8); // OutputVFragments = coded
+            enc.encode_b(mb_cols as u32, 8); // OutputHFragments = coded
+            enc.encode_b(0, 2); // ScalingMode = MAINTAIN_ASPECT_RATIO
+        }
+        Some(s) => {
+            let (ov, oh) = (s.output.mb_rows, s.output.mb_cols);
+            if s.output.is_degenerate() || ov > u8::MAX as u32 || oh > u8::MAX as u32 {
+                return Err(Error::NotImplemented);
+            }
+            enc.encode_b(ov, 8); // OutputVFragments
+            enc.encode_b(oh, 8); // OutputHFragments
+            enc.encode_b(s.mode.index() as u32, 2); // ScalingMode
+        }
+    }
+    Ok(())
+}
+
+fn encode_intra_frame_with_banks_impl(
+    frame: &Frame,
+    dct_q_mask: u8,
+    banks: &CoeffProbBanks,
+    scaling: Option<crate::scaling::OutputScaling>,
 ) -> Result<Vec<u8>, Error> {
     let h_fragments = frame.h_fragments;
     let v_fragments = frame.v_fragments;
@@ -438,11 +509,7 @@ pub fn encode_intra_frame_with_banks(
     // PredictionFilterAlpha (VP6.0). Then UseHuffman b(1) = 0
     // (BoolCoder second-half, matching the single-partition arithmetic
     // coefficient stream).
-    enc.encode_b(mb_rows as u32, 8);
-    enc.encode_b(mb_cols as u32, 8);
-    enc.encode_b(mb_rows as u32, 8); // OutputVFragments = coded
-    enc.encode_b(mb_cols as u32, 8); // OutputHFragments = coded
-    enc.encode_b(0, 2); // ScalingMode = MAINTAIN_ASPECT_RATIO
+    emit_intra_geometry(&mut enc, mb_rows, mb_cols, scaling)?;
     enc.encode_b1(0); // UseHuffman = 0
 
     // --- §8 Figure 5 coefficient-probability-update sub-stream ---
@@ -531,6 +598,34 @@ pub fn encode_intra_frame_multistream_with_banks(
     use_huffman: bool,
     banks: &CoeffProbBanks,
 ) -> Result<Vec<u8>, Error> {
+    encode_intra_frame_multistream_with_banks_impl(frame, dct_q_mask, use_huffman, banks, None)
+}
+
+/// [`encode_intra_frame_multistream`] with an explicit §9 output-scaling
+/// signal — the two-partition dual of [`encode_intra_frame_scaled`]
+/// (same signalling semantics and error conditions).
+pub fn encode_intra_frame_multistream_scaled(
+    frame: &Frame,
+    dct_q_mask: u8,
+    use_huffman: bool,
+    output: crate::scaling::OutputScaling,
+) -> Result<Vec<u8>, Error> {
+    encode_intra_frame_multistream_with_banks_impl(
+        frame,
+        dct_q_mask,
+        use_huffman,
+        &CoeffProbBanks::keyframe(),
+        Some(output),
+    )
+}
+
+fn encode_intra_frame_multistream_with_banks_impl(
+    frame: &Frame,
+    dct_q_mask: u8,
+    use_huffman: bool,
+    banks: &CoeffProbBanks,
+    scaling: Option<crate::scaling::OutputScaling>,
+) -> Result<Vec<u8>, Error> {
     let h_fragments = frame.h_fragments;
     let v_fragments = frame.v_fragments;
     // §9 geometry is in macroblock units (see `encode_intra_frame_with_banks`).
@@ -550,11 +645,7 @@ pub fn encode_intra_frame_multistream_with_banks(
     // emitter — the minimal all-clear stream when `banks` is the
     // keyframe baseline) ---
     let mut p1 = BoolEncoder::new();
-    p1.encode_b(mb_rows as u32, 8);
-    p1.encode_b(mb_cols as u32, 8);
-    p1.encode_b(mb_rows as u32, 8); // OutputVFragments = coded
-    p1.encode_b(mb_cols as u32, 8); // OutputHFragments = coded
-    p1.encode_b(0, 2); // ScalingMode = MAINTAIN_ASPECT_RATIO
+    emit_intra_geometry(&mut p1, mb_rows, mb_cols, scaling)?;
     p1.encode_b1(u8::from(use_huffman)); // UseHuffman
     crate::coeff_prob_update::encode_coefficient_prob_updates_full(&mut p1, banks);
     let p1_bytes = p1.finish();

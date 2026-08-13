@@ -6,6 +6,94 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 442, 2026-08-13) — **§9 output scaling applied + downsampled-encode path**
+
+- **The §9 output scaling is now applied, not just parsed.** The
+  `scaling` module grows from the typed field surface into the full
+  post-decode resample/placement stage:
+  - `FrameGeometry` is reworked to the operative **macroblock units**
+    (erratum #338 — the printed "8x8 block units" description is wrong
+    for all four `*Fragments` fields): `mb_cols`/`mb_rows` with
+    `luma_*`/`chroma_*`/`block_*` pixel and grid derivations, plus
+    `from_wire` / `of_frame` constructors. `MACROBLOCK_DIM` joins
+    `FRAGMENT_DIM`.
+  - `OutputScaling::plan` derives a typed `ScalingPlan` per §9 mode.
+    What is spec-fixed vs name-implied vs implementation-defined is
+    documented exhaustively in the module docs: scaling is a §2
+    "on output after decode" **presentation step** (§11.5 ties the
+    UMV borders to "the playback scaling features") — the §4 reference
+    buffers stay at the coded resolution, so no resampling choice can
+    affect bitstream conformance. `SCALE_TO_FIT` stretches to the
+    output rectangle; `MAINTAIN_ASPECT_RATIO` performs the largest
+    centred aspect-preserving fit (degenerating to the full stretch
+    when aspects match — the plain quarter-res→full-res case);
+    `CENTER` places unscaled, centred (pad or crop per axis);
+    `OTHER` remains unspecified by the staged doc (docs-gap) and is
+    applied as the identity.
+  - `resample_plane` / `resample_frame` — the implementation-defined
+    kernel, documented as such: separable 2-tap linear interpolation on
+    the centre-aligned grid, Q8 fixed point, edge-clamped, exact at
+    equal sizes and on constants; at 2:1 it degenerates to the 2x2 box
+    average (the encoder-side downsample).
+  - `apply_output_scaling` executes the plan (neutral Y=0/U=V=128
+    letterbox fill; even-rounded rectangles so chroma is exactly half).
+- **Decoder wiring:** `Vp6HeaderTail::coded_geometry` /
+  `output_scaling` expose the typed §9 fields; `Vp6Decoder` carries the
+  keyframe's output-scaling state across the GOP (Table 3 does not
+  re-transmit it), and `decode_packet_scaled` / `scale_to_output` /
+  `output_scaling` emit frames at the signalled output geometry. The
+  registered `Vp6CodecDecoder` now decodes through
+  `decode_packet_scaled`, so the framework surface presents the
+  signalled output size (identity for streams whose output matches the
+  coded geometry — pinned bit-identical on the conformance fixture by
+  the new `keyframe_output_scaling_is_identity` gate; the fixture
+  transmits Output == coded 54x30, mode 0).
+- **Encoder-side scaling signalling + downsampled-encode path:**
+  `encode_intra_frame_scaled` / `encode_intra_frame_multistream_scaled`
+  emit a keyframe whose IntraHeader carries a caller-chosen
+  `Output*Fragments` + `ScalingMode`; `Vp6CodecEncoder::with_downscale
+  (factor)` codes the whole GOP at `1/factor` resolution per axis
+  (source resampled down before encoding, internal reference loop at
+  the coded size) while signalling the display geometry, so a
+  downstream decoder reconstructs at the coded size and upscales back
+  on output. P-frames need no variant — Table 3 carries no geometry,
+  so they inherit the keyframe's signal. Round-trips pinned end-to-end:
+  flat scaled keyframe exact through `decode_packet_scaled`; a 64x64
+  gradient coded at 32x32 reconstructs ≥35 dB against the original
+  full-resolution source; the scaled GOP's unchanged P-frame reproduces
+  the scaled keyframe bit-for-bit; both MultiStream transports match
+  the single-stream scaled decode; the trait-surface downscaled GOP
+  decodes at the display size ≥30 dB.
+
+### Corroborated (round 442) — r439 errata statically re-checked against the staged docs
+
+- **§14 two-neighbour average, truncate toward zero — AGREES with the
+  spec prose.** The staged PDF's §14 prose itself says "the arithmetic
+  average of their DC values, **truncated towards zero** (values may be
+  negative)"; only the summary-table row `(L + A + Sign(L+A)) / 2`
+  conflicts (it rounds odd sums away from zero). The r439 correction is
+  a resolution of a printed internal contradiction in favour of the
+  prose sentence, not a deviation from the document.
+- **§13.3.1 magnitude-based `Prec` seed — internally consistent
+  reading; the printed seed comparison is the outlier.** Both printed
+  *mid-block* `Prec` updates are magnitude-domain (§13.3.1 arithmetic:
+  `Prec = 1` on the ±1 token / `Prec = 2` on the greater-than-one
+  branch, set before the sign is applied; §13.3.2 Huffman:
+  `Prec = (value > 1) ? 2 : 1` on the pre-sign `value`), and the staged
+  extraction record pins the vendor decoder's index term as
+  `1 + (previous magnitude > 1)`. Only the DC-based seed is printed
+  signed (`dc == 1`); the magnitude seed aligns it with every other
+  `Prec` write in the document. The staged errata doc has no
+  seed-specific entry yet.
+- **§14 chroma +128 seed — the +128 and its quantized-DC units are
+  corroborated (errata `#277 part 2` + docs Round 1); the
+  Intra-bucket-only scoping is NOT yet corroborated.** The staged
+  errata state the chroma exception without bucket qualification; the
+  Intra-only scoping rests solely on the r439 P-frame-prefix
+  arbitration. Ask filed: statically confirm from the vendor decoder's
+  frame-setup whether the chroma "last DC" registers seed 128 into the
+  intra bank only or into all buckets.
+
 ### Added (clean-room round 439, 2026-08-11) — **whole-keyframe pixel-exact decode**
 
 - **The conformant third-party vp6f Huffman keyframe now decodes

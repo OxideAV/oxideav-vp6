@@ -1070,7 +1070,10 @@ pub use interp::{
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use intra_encode::{encode_intra_frame, encode_intra_frame_with_banks};
+pub use intra_encode::{
+    encode_intra_frame, encode_intra_frame_multistream_scaled, encode_intra_frame_scaled,
+    encode_intra_frame_with_banks,
+};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use intra_frame::{decode_intra_frame, IntraProbs};
@@ -1149,7 +1152,10 @@ pub use raw_bits::{RawBitError, RawBitReader};
 pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use scaling::{FrameGeometry, OutputScaling, ScalingMode, FRAGMENT_DIM};
+pub use scaling::{
+    apply_output_scaling, resample_frame, resample_plane, FrameGeometry, OutputScaling,
+    ScalingMode, ScalingPlan, FRAGMENT_DIM, MACROBLOCK_DIM,
+};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use scan::{

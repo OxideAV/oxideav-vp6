@@ -656,6 +656,34 @@ impl Vp6HeaderTail {
             use_huffman,
         })
     }
+
+    /// The coded frame geometry this IntraHeader transmits
+    /// (`HFragments` / `VFragments`, macroblock units per erratum #338),
+    /// or `None` on an InterHeader (Table 3 carries no geometry) or a
+    /// degenerate zero-macroblock axis (which no real bitstream
+    /// describes).
+    pub fn coded_geometry(&self) -> Option<crate::scaling::FrameGeometry> {
+        let g = crate::scaling::FrameGeometry::from_wire(self.h_fragments?, self.v_fragments?);
+        (!g.is_degenerate()).then_some(g)
+    }
+
+    /// The §9 output-scaling description this IntraHeader transmits
+    /// (`OutputHFragments` / `OutputVFragments` + `ScalingMode`), or
+    /// `None` on an InterHeader (an inter frame inherits the keyframe's
+    /// scaling) or a degenerate zero-macroblock output axis.
+    pub fn output_scaling(&self) -> Option<crate::scaling::OutputScaling> {
+        let output = crate::scaling::FrameGeometry::from_wire(
+            self.output_h_fragments?,
+            self.output_v_fragments?,
+        );
+        if output.is_degenerate() {
+            return None;
+        }
+        Some(crate::scaling::OutputScaling::new(
+            output,
+            self.scaling_mode?,
+        ))
+    }
 }
 
 #[cfg(test)]

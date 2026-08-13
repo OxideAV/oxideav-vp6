@@ -130,7 +130,11 @@ impl Decoder for Vp6CodecDecoder {
                 Err(CoreError::NeedMore)
             };
         };
-        let decoded = self.state.decode_packet(&pkt.data)?;
+        // Decode at the coded resolution, then apply the §9 output
+        // scaling the keyframe header signalled (§2 "scaling on output
+        // after decode") so the emitted frame has the output geometry.
+        // Identity for streams whose output matches the coded size.
+        let decoded = self.state.decode_packet_scaled(&pkt.data)?;
         let mut vf: VideoFrame = (&decoded).into();
         vf.pts = pkt.pts;
         Ok(Frame::Video(vf))

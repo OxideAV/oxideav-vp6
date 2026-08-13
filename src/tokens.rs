@@ -1129,6 +1129,17 @@ impl AcPrecContext {
     /// decodes under the `Prec = 1` tree; the signed reading selects
     /// the `Prec = 2` tree and misparses it as a value token
     /// (whole-keyframe pixel-exact gate in `tests/conformance_vp6f.rs`).
+    ///
+    /// The magnitude reading is also the **internally consistent** one:
+    /// both printed *mid-block* `Prec` updates are magnitude-domain —
+    /// the §13.3.1 arithmetic listing sets `Prec = 1` on the ±1 token
+    /// and `Prec = 2` on the greater-than-one branch *before* the sign
+    /// is applied (`CoeffData[…] = (value ^ -SignBit) + SignBit`
+    /// follows), and the §13.3.2 Huffman listing prints
+    /// `Prec = (value > 1) ? 2 : 1` on the pre-sign `value`. Only the
+    /// DC-based seed is printed with a signed comparison; correcting it
+    /// to the magnitude aligns the seed with every other `Prec` write
+    /// in the document.
     #[inline]
     pub const fn seed_from_dc(dc: i32) -> Self {
         match dc.unsigned_abs() {

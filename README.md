@@ -14,6 +14,35 @@ Specification" (document version 1.02, August 2006), staged at
 `docs/video/vp6/vp6-errata-and-clarifications.md`. No third-party VP6
 source has been consulted at any stage.
 
+**Round 442 — §9 output scaling applied, plus the downsampled-encode
+path.** The `scaling` module grows from the typed field surface into the
+executed post-decode stage: `FrameGeometry` is reworked to the operative
+macroblock units (erratum #338), `OutputScaling::plan` derives the
+per-mode placement (`SCALE_TO_FIT` stretch; `MAINTAIN_ASPECT_RATIO`
+centred aspect-preserving fit, degenerating to the stretch when aspects
+match; `CENTER` pad/crop; `OTHER` stays unspecified by the staged doc —
+docs-gap — and applies as identity), and `apply_output_scaling` executes
+it with a documented implementation-defined resampler (separable 2-tap
+centre-aligned linear, Q8 fixed point, edge-clamped — scaling is a §2
+"on output after decode" presentation step that never re-enters the §4
+prediction loop, so the kernel is not conformance-bearing).
+`Vp6Decoder::decode_packet_scaled` (and the registered decoder) emit
+frames at the signalled output geometry, carrying the keyframe's scaling
+across the GOP; `encode_intra_frame_scaled` (+ the MultiStream dual) and
+`Vp6CodecEncoder::with_downscale` land the encoder half — code the GOP
+at reduced resolution, signal the display geometry, decoder upscales
+back. Round-trips pinned: flat scaled keyframe exact; 64x64 gradient
+coded at 32x32 reconstructs ≥35 dB vs the full-res source; the fixture's
+identity scaling (Output == coded 54x30, mode 0) decodes bit-identical
+through the scaled path. The round also statically corroborated the r439
+errata against the staged docs: the §14 toward-zero average **agrees
+with the spec's own prose** (only the summary-table `Sign` formula is
+defective); the magnitude-based §13.3.1 `Prec` seed is the internally
+consistent reading (both printed mid-block updates are
+magnitude-domain) and matches the extraction record; the chroma +128
+seed's **Intra-only bucket scoping remains uncorroborated** by the
+staged errata (ask filed).
+
 **Round 439 — the conformant third-party keyframe decodes
 pixel-exactly, end-to-end.** The full-frame Huffman blocker is closed:
 `Vp6Decoder::decode_packet` reconstructs the fixture keyframe's entire
@@ -188,7 +217,9 @@ two-stage box-then-¼-pel luma search and §11 differential-MV emission), its
   feed the next MB's neighbour grid via `as_neighbour`), the §10 Table 4
   mode→reference and mode→MV-source classifiers
   (`CodingMode::reference_bucket` / `mv_source`), and the §9
-  output-scaling surface (`scaling`).
+  output-scaling surface **and application** (`scaling` — macroblock-unit
+  geometry per erratum #338, per-mode placement plans, and the
+  post-decode resample/placement `apply_output_scaling` executes).
 - **Frame assembly** (`frame_assembly`) — block-to-plane raster
   placement of reconstructed 8×8 blocks into a YUV 4:2:0 image.
 
@@ -504,7 +535,16 @@ two-stage box-then-¼-pel luma search and §11 differential-MV emission), its
   variants, mode-weight variants — all fail at the same macroblock).
   Needs a behavioural P-frame trace from the docs collaborator; the
   staged extraction record explicitly leaves P-frames un-established.
-- **High-bit-depth / scaling resampling math**.
+- **§9 output scaling — LANDED (round 442).** Decode-side application
+  (`decode_packet_scaled` + the registered decoder emitting the
+  signalled output geometry) and the encoder-side downsampled-encode
+  path (`encode_intra_frame_scaled` /
+  `Vp6CodecEncoder::with_downscale`) both exist and round-trip.
+  Remaining docs-gaps, both presentation-only (not conformance-
+  bearing): the `OTHER` scaling mode's semantics are not defined by the
+  staged doc (applied as identity), and the vendor's own resampling
+  kernel is undescribed — matching it bit-for-bit would need a scaled
+  fixture (coded ≠ output geometry) with a decode oracle.
 
 ## License
 

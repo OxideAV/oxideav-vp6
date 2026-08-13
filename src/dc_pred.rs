@@ -279,6 +279,13 @@ impl DcPredictionContext {
     ///   With the inter buckets at zero the P-frame's static prefix
     ///   parses and reconstructs sample-exactly.
     ///
+    /// Note the staged errata entry (`#277 part 2`) states the chroma
+    /// exception **without bucket qualification** — the Intra-only
+    /// scoping rests on the round-439 P-frame-prefix arbitration alone
+    /// and is not yet corroborated by the docs workspace (a static
+    /// confirmation from the vendor decoder's frame-setup would close
+    /// it either way).
+    ///
     /// Luma keeps the all-zero seed (the keyframe's first luma DC
     /// decodes as a plain `-299` against a zero predictor).
     pub fn new_chroma() -> Self {

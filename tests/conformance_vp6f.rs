@@ -378,3 +378,45 @@ fn keyframe_decodes_pixel_exact() {
         }
     }
 }
+
+/// §9 output scaling on the real stream: the keyframe transmits
+/// `Output*Fragments == *Fragments` (54x30) with `ScalingMode == 0`
+/// (`MAINTAIN_ASPECT_RATIO`, staged `tables/01`) — an **identity**
+/// scaling description — so the scaled decode entry point must emit
+/// bit-identical pixels at the identical coded geometry. Pins that
+/// wiring the §9 scaling application into the driver cannot perturb a
+/// conformant stream whose output geometry matches its coded geometry.
+#[test]
+fn keyframe_output_scaling_is_identity() {
+    use oxideav_vp6::scaling::{FrameGeometry, OutputScaling, ScalingMode};
+
+    let raw = load("input.vp6");
+    let hdr = Vp6FrameHeader::parse(&raw).expect("§9 raw prefix");
+    let mut bc = BoolCoder::new(&raw[hdr.raw_prefix_len..]).expect("partition 1");
+    let tail = Vp6HeaderTail::parse_with(&mut bc, true, hdr.profile.unwrap(), hdr.version.unwrap())
+        .expect("§9 tail");
+
+    // Typed surface: 54x30 MB output, mode 0, identity vs the coded
+    // geometry (erratum #338 macroblock units on both field pairs).
+    let coded = tail.coded_geometry().expect("keyframe coded geometry");
+    assert_eq!(coded, FrameGeometry::new(54, 30));
+    let scaling = tail.output_scaling().expect("keyframe scaling fields");
+    assert_eq!(
+        scaling,
+        OutputScaling::new(FrameGeometry::new(54, 30), ScalingMode::MaintainAspectRatio)
+    );
+    assert!(scaling.is_identity(coded));
+
+    // The scaled decode is bit-identical to the unscaled decode.
+    let mut dec_plain = Vp6Decoder::new();
+    let plain = dec_plain.decode_packet(&raw).expect("decode");
+    let mut dec_scaled = Vp6Decoder::new();
+    let scaled = dec_scaled
+        .decode_packet_scaled(&raw)
+        .expect("decode scaled");
+    assert_eq!(dec_scaled.output_scaling(), Some(scaling));
+    assert_eq!(scaled.y.width(), 864);
+    assert_eq!(scaled.y.samples(), plain.y.samples());
+    assert_eq!(scaled.u.samples(), plain.u.samples());
+    assert_eq!(scaled.v.samples(), plain.v.samples());
+}

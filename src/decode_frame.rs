@@ -120,6 +120,14 @@ pub struct Vp6Decoder {
     /// previous frame … when an intra frame is decoded all the
     /// probability values must all be reset to their defaults").
     mv_probs: Option<[crate::mv_decode::MvProbs; 2]>,
+    /// The §9 coded geometry carried from the most recent I-frame
+    /// (Table 3 carries no geometry — inter frames inherit it).
+    coded_geometry: Option<crate::scaling::FrameGeometry>,
+    /// The §9 output-scaling description (`Output*Fragments` +
+    /// `ScalingMode`) carried from the most recent I-frame. Like the
+    /// coded geometry, Table 3 does not re-transmit it, so it applies to
+    /// every frame of the GOP.
+    output_scaling: Option<crate::scaling::OutputScaling>,
 }
 
 /// The §10 `probXmitted[3][20]` bank type.
@@ -200,6 +208,44 @@ impl Vp6Decoder {
         self.coeff_banks = None;
         self.mode_probs = None;
         self.mv_probs = None;
+        self.coded_geometry = None;
+        self.output_scaling = None;
+    }
+
+    /// The §9 output-scaling description carried from the most recent
+    /// I-frame (`Output*Fragments` + `ScalingMode`, macroblock units per
+    /// erratum #338), or `None` before the first keyframe.
+    pub fn output_scaling(&self) -> Option<crate::scaling::OutputScaling> {
+        self.output_scaling
+    }
+
+    /// Apply the carried §9 output scaling to a decoded coded-resolution
+    /// frame (see [`crate::scaling::apply_output_scaling`]). With no
+    /// carried scaling state, or an identity/`OTHER` (unspecified —
+    /// docs-gap) plan, the frame is returned unchanged.
+    pub fn scale_to_output(&self, frame: &Frame) -> Frame {
+        match self.output_scaling {
+            Some(s) => crate::scaling::apply_output_scaling(frame, s),
+            None => frame.clone(),
+        }
+    }
+
+    /// [`Self::decode_packet`], then the §9 output scaling: decode one
+    /// compressed frame and emit it at the **output** geometry the
+    /// keyframe header signalled (upscaled / letterboxed / centred per
+    /// `ScalingMode`), instead of the coded geometry.
+    ///
+    /// The §4 reference state is still carried at the coded resolution —
+    /// scaling is a §2 "on output after decode" presentation step and
+    /// never re-enters the prediction loop — so a GOP decoded through
+    /// this entry point reconstructs identically to one decoded through
+    /// [`Self::decode_packet`], differing only in the emitted geometry.
+    pub fn decode_packet_scaled(&mut self, bytes: &[u8]) -> Result<Frame, Error> {
+        let frame = self.decode_packet(bytes)?;
+        match self.output_scaling {
+            Some(s) => Ok(crate::scaling::apply_output_scaling(&frame, s)),
+            None => Ok(frame),
+        }
     }
 
     /// True once a keyframe has seeded the §4 reference buffers — i.e.
@@ -311,6 +357,12 @@ impl Vp6Decoder {
         self.refs = Some(ReferenceFrames::from_keyframe(frame.clone()));
         self.profile = Some(profile);
         self.version = Some(version);
+
+        // §9: the coded geometry and the output-scaling description
+        // (Output*Fragments + ScalingMode) are IntraHeader-only; carry
+        // them so every frame of the GOP scales identically.
+        self.coded_geometry = tail.coded_geometry();
+        self.output_scaling = tail.output_scaling();
 
         // Persistence: the keyframe's post-update §13 banks (+ §12.2
         // band assignment) carry into the following inter frames ("The
@@ -1245,5 +1297,176 @@ mod tests {
         assert!(dec.has_reference());
         dec.reset();
         assert!(!dec.has_reference());
+    }
+
+    // ---- §9 output scaling (Output*Fragments + ScalingMode) ----------
+
+    /// A flat keyframe coded at 2x2 MB (32x32) signalling a 4x4 MB
+    /// (64x64) `SCALE_TO_FIT` output decodes through
+    /// `decode_packet_scaled` to a 64x64 frame that is still exactly
+    /// flat: the flat coded frame round-trips exactly and the
+    /// resampler preserves constants exactly, so the upscaled output is
+    /// bit-exactly the flat value at every sample.
+    #[test]
+    fn scaled_flat_keyframe_upscales_exactly() {
+        use crate::intra_encode::encode_intra_frame_scaled;
+        use crate::scaling::{FrameGeometry, OutputScaling, ScalingMode};
+
+        let src = flat_frame(4, 4, 90);
+        let signal = OutputScaling::new(FrameGeometry::new(4, 4), ScalingMode::ScaleToFit);
+        let bytes = encode_intra_frame_scaled(&src, 32, signal).expect("encode");
+
+        let mut dec = Vp6Decoder::new();
+        assert_eq!(dec.output_scaling(), None, "no state before a keyframe");
+        let out = dec.decode_packet_scaled(&bytes).expect("decode");
+        assert_eq!(
+            dec.output_scaling(),
+            Some(signal),
+            "keyframe must carry the §9 scaling state"
+        );
+        assert_eq!(out.y.width(), 64);
+        assert_eq!(out.y.height(), 64);
+        assert_eq!(out.u.width(), 32);
+        assert!(out.y.samples().iter().all(|&s| s == 90));
+        assert!(out.u.samples().iter().all(|&s| s == 90));
+        assert!(out.v.samples().iter().all(|&s| s == 90));
+
+        // `decode_packet` (unscaled) on the same stream still emits the
+        // coded geometry: scaling is presentation-only.
+        let mut dec2 = Vp6Decoder::new();
+        let coded_out = dec2.decode_packet(&bytes).expect("decode unscaled");
+        assert_eq!(coded_out.y.width(), 32);
+    }
+
+    /// The full downsampled-encode arc: a 64x64 gradient source is
+    /// resampled down to 32x32, coded with the §9 scaling header
+    /// signalling the original 64x64 geometry, decoded, and upscaled
+    /// back on output — the reconstruction must track the original
+    /// full-resolution source above a quantiser-plus-resample floor.
+    #[test]
+    fn downsampled_encode_reconstructs_source_through_scaled_decode() {
+        use crate::intra_encode::encode_intra_frame_scaled;
+        use crate::scaling::{resample_frame, FrameGeometry, OutputScaling, ScalingMode};
+
+        // A smooth 8x8-block (4x4 MB, 64x64) gradient source — smooth
+        // content survives the down/up resample cycle with little loss.
+        let mut src = Frame::new(8, 8);
+        let w = src.y.width();
+        for r in 0..64 {
+            for c in 0..64 {
+                src.y.samples_mut()[r * w + c] = (32 + 2 * ((r + c) / 2)) as u8;
+            }
+        }
+        let cw = src.u.width();
+        for r in 0..32 {
+            for c in 0..32 {
+                src.u.samples_mut()[r * cw + c] = (100 + r + c) as u8;
+                src.v.samples_mut()[r * cw + c] = (160 - (r + c) as i32) as u8;
+            }
+        }
+
+        // Encoder side: downsample to the coded geometry, signal the
+        // display geometry.
+        let coded_geom = FrameGeometry::new(2, 2);
+        let display = FrameGeometry::new(4, 4);
+        let reduced = resample_frame(&src, coded_geom);
+        assert_eq!(reduced.y.width(), 32);
+        let signal = OutputScaling::new(display, ScalingMode::ScaleToFit);
+        let bytes = encode_intra_frame_scaled(&reduced, 56, signal).expect("encode");
+
+        // Decoder side: decode + upscale on output.
+        let mut dec = Vp6Decoder::new();
+        let out = dec.decode_packet_scaled(&bytes).expect("decode");
+        assert_eq!(out.y.width(), 64);
+        assert_eq!(out.y.height(), 64);
+
+        let y = psnr(src.y.samples(), out.y.samples());
+        let u = psnr(src.u.samples(), out.u.samples());
+        let v = psnr(src.v.samples(), out.v.samples());
+        assert!(y >= 35.0, "luma PSNR {y:.2} dB below the down/up floor");
+        assert!(u >= 35.0, "U PSNR {u:.2} dB below the down/up floor");
+        assert!(v >= 35.0, "V PSNR {v:.2} dB below the down/up floor");
+    }
+
+    /// Inter frames carry no §9 geometry (Table 3) — a P-frame decoded
+    /// through `decode_packet_scaled` inherits the keyframe's scaling
+    /// state and emits the same output geometry. An unchanged P-frame
+    /// reproduces the scaled keyframe output bit-for-bit (the coded-
+    /// resolution reconstruction is exact and the resample is
+    /// deterministic).
+    #[test]
+    fn scaled_gop_pframe_inherits_output_geometry() {
+        use crate::intra_encode::encode_intra_frame_scaled;
+        use crate::scaling::{FrameGeometry, OutputScaling, ScalingMode};
+
+        let src = pattern_frame(4, 4);
+        let q = 40;
+        let signal = OutputScaling::new(FrameGeometry::new(4, 4), ScalingMode::ScaleToFit);
+
+        let mut dec = Vp6Decoder::new();
+        let kf_scaled = dec
+            .decode_packet_scaled(&encode_intra_frame_scaled(&src, q, signal).expect("encode I"))
+            .expect("decode I");
+        assert_eq!(kf_scaled.y.width(), 64);
+
+        // The §4 reference is the *coded-resolution* reconstruction —
+        // encode the unchanged P-frame against it.
+        let kf_coded = dec.references().expect("refs seeded").previous.clone();
+        assert_eq!(kf_coded.y.width(), 32, "references stay coded-resolution");
+        let probs = InterProbs::keyframe();
+        let filter = simple_inter_filter();
+        let pf_bytes =
+            encode_inter_frame_packet(&kf_coded, &BorderedRef::new(&kf_coded), q, &probs, &filter)
+                .expect("encode P");
+        let pf_scaled = dec.decode_packet_scaled(&pf_bytes).expect("decode P");
+
+        assert_eq!(pf_scaled.y.width(), 64, "P-frame inherits output geometry");
+        assert_eq!(pf_scaled.y.samples(), kf_scaled.y.samples());
+        assert_eq!(pf_scaled.u.samples(), kf_scaled.u.samples());
+        assert_eq!(pf_scaled.v.samples(), kf_scaled.v.samples());
+    }
+
+    /// `reset` also drops the carried §9 scaling state.
+    #[test]
+    fn reset_clears_output_scaling() {
+        use crate::intra_encode::encode_intra_frame_scaled;
+        use crate::scaling::{FrameGeometry, OutputScaling, ScalingMode};
+
+        let src = flat_frame(2, 2, 100);
+        let signal = OutputScaling::new(FrameGeometry::new(2, 2), ScalingMode::Center);
+        let bytes = encode_intra_frame_scaled(&src, 32, signal).expect("encode");
+        let mut dec = Vp6Decoder::new();
+        dec.decode_packet(&bytes).expect("decode");
+        assert_eq!(dec.output_scaling(), Some(signal));
+        dec.reset();
+        assert_eq!(dec.output_scaling(), None);
+    }
+
+    /// The MultiStream scaled keyframe emitter signals the same §9
+    /// fields: both transports decode to bit-identical scaled output.
+    #[test]
+    fn multistream_scaled_keyframe_matches_single_stream() {
+        use crate::intra_encode::{
+            encode_intra_frame_multistream_scaled, encode_intra_frame_scaled,
+        };
+        use crate::scaling::{FrameGeometry, OutputScaling, ScalingMode};
+
+        let src = pattern_frame(4, 4);
+        let signal = OutputScaling::new(FrameGeometry::new(3, 4), ScalingMode::MaintainAspectRatio);
+
+        let single = encode_intra_frame_scaled(&src, 48, signal).expect("single");
+        let mut d1 = Vp6Decoder::new();
+        let out1 = d1.decode_packet_scaled(&single).expect("decode single");
+
+        for use_huffman in [false, true] {
+            let multi = encode_intra_frame_multistream_scaled(&src, 48, use_huffman, signal)
+                .expect("multi");
+            let mut d2 = Vp6Decoder::new();
+            let out2 = d2.decode_packet_scaled(&multi).expect("decode multi");
+            assert_eq!(d2.output_scaling(), Some(signal));
+            assert_eq!(out1.y.samples(), out2.y.samples(), "huffman={use_huffman}");
+            assert_eq!(out1.u.samples(), out2.u.samples());
+            assert_eq!(out1.v.samples(), out2.v.samples());
+        }
     }
 }

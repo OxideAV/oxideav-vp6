@@ -56,6 +56,12 @@ pub struct Vp6CodecEncoder {
     output_params: CodecParameters,
     h_fragments: usize,
     v_fragments: usize,
+    /// §9 downsampled-encode state: when set, every source frame is
+    /// resampled down to `coded` before encoding and the keyframe header
+    /// signals `signal` (the display geometry + `ScalingMode`), so a
+    /// decoder presents the GOP back at the original size (§2 "scaling
+    /// on output after decode"). `None` ⇒ code at the display size.
+    downscale: Option<(crate::scaling::FrameGeometry, crate::scaling::OutputScaling)>,
     dct_q_mask: u8,
     keyframe_interval: u32,
     time_base: TimeBase,
@@ -141,6 +147,7 @@ impl Vp6CodecEncoder {
             output_params,
             h_fragments,
             v_fragments,
+            downscale: None,
             dct_q_mask: dct_q_mask & 0x3F,
             keyframe_interval: keyframe_interval.max(1),
             time_base,
@@ -150,6 +157,54 @@ impl Vp6CodecEncoder {
             pending: VecDeque::new(),
             eof: false,
         })
+    }
+
+    /// Enable the §9 **downsampled-encode** path: code every frame at
+    /// `1/factor` of the display resolution (each axis) and signal the
+    /// display geometry through the keyframe's `OutputVFragments` /
+    /// `OutputHFragments` / `ScalingMode` fields
+    /// ([`crate::intra_encode::encode_intra_frame_scaled`]), so a
+    /// downstream decoder reconstructs at the coded size and upscales
+    /// back on output ([`crate::decode_frame::Vp6Decoder::
+    /// decode_packet_scaled`] / the registered [`crate::decoder::
+    /// Vp6CodecDecoder`]). Inter frames carry no geometry (§9 Table 3),
+    /// so the whole GOP is coded at the reduced size under the one
+    /// keyframe signal.
+    ///
+    /// `factor == 1` disables downsampling. The signalled mode is
+    /// `SCALE_TO_FIT` (the aspect ratio is preserved by construction, so
+    /// the fit is the full-rectangle stretch).
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::invalid`] if the display dimensions are not
+    /// macroblock-aligned (multiples of 16) or the macroblock grid is
+    /// not divisible by `factor` (each coded axis must stay a whole,
+    /// non-zero macroblock count).
+    pub fn with_downscale(mut self, factor: u8) -> Result<Self> {
+        if factor <= 1 {
+            self.downscale = None;
+            return Ok(self);
+        }
+        let f = factor as usize;
+        if self.h_fragments % 2 != 0 || self.v_fragments % 2 != 0 {
+            return Err(CoreError::invalid(
+                "vp6 encoder: downscale needs macroblock-aligned dimensions (multiples of 16)",
+            ));
+        }
+        let (mb_cols, mb_rows) = (self.h_fragments / 2, self.v_fragments / 2);
+        if mb_cols % f != 0 || mb_rows % f != 0 || mb_cols / f == 0 || mb_rows / f == 0 {
+            return Err(CoreError::invalid(
+                "vp6 encoder: macroblock grid must divide evenly by the downscale factor",
+            ));
+        }
+        let coded = crate::scaling::FrameGeometry::new((mb_cols / f) as u32, (mb_rows / f) as u32);
+        let signal = crate::scaling::OutputScaling::new(
+            crate::scaling::FrameGeometry::new(mb_cols as u32, mb_rows as u32),
+            crate::scaling::ScalingMode::ScaleToFit,
+        );
+        self.downscale = Some((coded, signal));
+        Ok(self)
     }
 
     /// Convert a framework [`VideoFrame`] (three I420 planes) into this crate's
@@ -174,11 +229,26 @@ impl Vp6CodecEncoder {
     /// Encode one source frame into a self-describing VP6 packet, advancing the
     /// §4 reference state via the internal decoder.
     fn encode_one(&mut self, v: &VideoFrame) -> Result<Vec<u8>> {
-        let source = self.to_vp6_frame(v)?;
+        let display = self.to_vp6_frame(v)?;
+        // Downsampled-encode path: shrink the source to the coded
+        // geometry; the keyframe header signals the display geometry so
+        // the decoder upscales on output. The internal reference loop
+        // stays at the coded resolution (scaling never re-enters the
+        // §4 prediction loop).
+        let source = match self.downscale {
+            Some((coded, _)) => crate::scaling::resample_frame(&display, coded),
+            None => display,
+        };
         let is_keyframe = self.frames_since_keyframe == 0 || self.reference.is_none();
 
         let bytes = if is_keyframe {
-            encode_intra_frame(&source, self.dct_q_mask).map_err(CoreError::from)?
+            match self.downscale {
+                Some((_, signal)) => {
+                    crate::intra_encode::encode_intra_frame_scaled(&source, self.dct_q_mask, signal)
+                        .map_err(CoreError::from)?
+                }
+                None => encode_intra_frame(&source, self.dct_q_mask).map_err(CoreError::from)?,
+            }
         } else {
             let prev = self
                 .reference
@@ -453,5 +523,123 @@ mod tests {
         assert!(matches!(enc.receive_packet(), Err(CoreError::NeedMore)));
         enc.flush().expect("flush");
         assert!(matches!(enc.receive_packet(), Err(CoreError::Eof)));
+    }
+
+    /// Build a smooth (wrap-free) I420 gradient — content that survives
+    /// a downsample/upsample cycle with little loss, for the scaled-GOP
+    /// PSNR gate.
+    fn smooth_video_frame(w: usize, h: usize, shift: u8) -> VideoFrame {
+        let cw = w / 2;
+        let ch = h / 2;
+        let mut y = vec![0u8; w * h];
+        for r in 0..h {
+            for c in 0..w {
+                y[r * w + c] = (32 + (r + c) / 2) as u8 + shift;
+            }
+        }
+        let mut u = vec![0u8; cw * ch];
+        let mut vv = vec![0u8; cw * ch];
+        for r in 0..ch {
+            for c in 0..cw {
+                u[r * cw + c] = (96 + (r + c) / 2) as u8;
+                vv[r * cw + c] = (160 - ((r + c) / 2) as i32) as u8;
+            }
+        }
+        VideoFrame {
+            pts: None,
+            planes: vec![
+                VideoPlane { stride: w, data: y },
+                VideoPlane {
+                    stride: cw,
+                    data: u,
+                },
+                VideoPlane {
+                    stride: cw,
+                    data: vv,
+                },
+            ],
+        }
+    }
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let sse: f64 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| {
+                let d = x as f64 - y as f64;
+                d * d
+            })
+            .sum();
+        let mse = sse / a.len() as f64;
+        if mse == 0.0 {
+            return f64::INFINITY;
+        }
+        10.0 * (255.0 * 255.0 / mse).log10()
+    }
+
+    /// The §9 downsampled-encode arc through the **trait surfaces**: a
+    /// 64x64 GOP coded at 32x32 (`with_downscale(2)`), whose keyframe
+    /// signals the display geometry via `Output*Fragments` /
+    /// `ScalingMode`, decodes through the registered decoder back at
+    /// 64x64 (the decoder applies the §9 upscale on output) and tracks
+    /// the original full-resolution source above a down/up-plus-
+    /// quantiser floor. The P-frame inherits the keyframe's scaling.
+    #[test]
+    fn downscaled_gop_round_trips_at_display_size() {
+        let mut enc = Vp6CodecEncoder::new(&params(64, 64), 64, 64, 56, 12)
+            .expect("encoder")
+            .with_downscale(2)
+            .expect("downscale config");
+
+        let f0 = smooth_video_frame(64, 64, 0);
+        let f1 = smooth_video_frame(64, 64, 2);
+        let src0 = f0.planes[0].data.clone();
+        let src1 = f1.planes[0].data.clone();
+
+        enc.send_frame(&Frame::Video(f0)).expect("send f0");
+        let k = enc.receive_packet().expect("keyframe");
+        assert!(k.flags.keyframe);
+        enc.send_frame(&Frame::Video(f1)).expect("send f1");
+        let p = enc.receive_packet().expect("pframe");
+        assert!(!p.flags.keyframe, "second frame must be a P-frame");
+
+        let mut dec = Vp6CodecDecoder::new(CodecId::new(VP6_CODEC_ID));
+        dec.send_packet(&k).expect("send k");
+        let out_k = match dec.receive_frame().expect("decode k") {
+            Frame::Video(v) => v,
+            other => panic!("expected video, got {other:?}"),
+        };
+        dec.send_packet(&p).expect("send p");
+        let out_p = match dec.receive_frame().expect("decode p") {
+            Frame::Video(v) => v,
+            other => panic!("expected video, got {other:?}"),
+        };
+
+        // Both frames emit at the *display* geometry (the §9 upscale is
+        // applied by the decoder), not the 32x32 coded geometry.
+        assert_eq!(out_k.planes[0].data.len(), 64 * 64);
+        assert_eq!(out_p.planes[0].data.len(), 64 * 64);
+        assert_eq!(out_k.planes[1].data.len(), 32 * 32);
+
+        let yk = psnr(&src0, &out_k.planes[0].data);
+        let yp = psnr(&src1, &out_p.planes[0].data);
+        assert!(yk >= 30.0, "keyframe luma PSNR {yk:.2} dB below floor");
+        assert!(yp >= 30.0, "P-frame luma PSNR {yp:.2} dB below floor");
+    }
+
+    /// `with_downscale` validates the geometry: the macroblock grid must
+    /// divide evenly by the factor, and factor 1 disables the path.
+    #[test]
+    fn downscale_config_validation() {
+        // 48x48 = 3x3 macroblocks: not divisible by 2.
+        let enc = Vp6CodecEncoder::new(&params(48, 48), 48, 48, 32, 12).expect("encoder");
+        assert!(enc.with_downscale(2).is_err());
+        // 24x24 is not macroblock-aligned.
+        let enc = Vp6CodecEncoder::new(&params(24, 24), 24, 24, 32, 12).expect("encoder");
+        assert!(enc.with_downscale(2).is_err());
+        // Factor 1 is a no-op and always valid.
+        let enc = Vp6CodecEncoder::new(&params(48, 48), 48, 48, 32, 12).expect("encoder");
+        assert!(enc.with_downscale(1).is_ok());
     }
 }
