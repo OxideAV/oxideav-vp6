@@ -117,8 +117,19 @@ pub fn decode_token_value(bc: &mut BoolCoder<'_>, token: DctToken) -> Result<i32
             // `probs[BitsCount]` is the probability for the bit at
             // position `BitsCount` of the magnitude (so the highest
             // bit is read first, matching Table 18's printed order).
+            // Table 18 lists the per-extrabit probabilities in
+            // transmission order — the FIRST-listed probability codes
+            // the most-significant magnitude bit ("the most
+            // significant bit of the magnitude sent first … encoded
+            // with differing probabilities as specified by the final
+            // column"). The §13.2.1/§13.3.1 listings' `Probs[BitsCount]`
+            // (BitsCount descending) would instead put the LAST-listed
+            // probability on the MSB; the conformant third-party
+            // P-frame arbitrates for the prose pairing (MB (0,31) Y3's
+            // CATEGORY5 DC magnitude decodes 54 = the oracle-recovered
+            // value only under it), so the index is mirrored here.
             for bits_count in (0..bits).rev() {
-                let bit = bc.decode_bool(probs[bits_count])? as i32;
+                let bit = bc.decode_bool(probs[bits - 1 - bits_count])? as i32;
                 value += bit << bits_count;
             }
             let sign = bc.decode_b1()? as i32;

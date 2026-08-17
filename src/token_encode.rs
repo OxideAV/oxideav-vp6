@@ -77,8 +77,11 @@ pub fn encode_token_value(enc: &mut BoolEncoder, token: DctToken, coeff: i32) {
         _ => {
             // CATEGORY1..CATEGORY6. The decoder accumulates
             // `value = min; for bits_count in (0..bits).rev()
-            //   value += B(probs[bits_count]) << bits_count`,
-            // i.e. `value - min` is read MSB-first across the slice.
+            //   value += B(probs[bits - 1 - bits_count]) << bits_count`
+            // — `value - min` is sent MSB-first, and the Table 18
+            // probability list is in transmission order (first-listed
+            // prob codes the MSB; fixture-arbitrated round 447), so the
+            // encoder mirrors the same mirrored index.
             let min = token.min_value() as i32;
             let probs = token.magnitude_probs();
             let bits = probs.len();
@@ -90,7 +93,7 @@ pub fn encode_token_value(enc: &mut BoolEncoder, token: DctToken, coeff: i32) {
             );
             for bits_count in (0..bits).rev() {
                 let bit = ((offset >> bits_count) & 1) as u8;
-                enc.encode_bool(bit, probs[bits_count]);
+                enc.encode_bool(bit, probs[bits - 1 - bits_count]);
             }
             let sign = (coeff < 0) as u8;
             enc.encode_b1(sign);

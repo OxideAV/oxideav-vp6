@@ -835,15 +835,14 @@ mod tests {
         use crate::tokens::DcContext;
         let dc_contexts = dc_probs_to_node_contexts(&baseline_dc_probs());
         let ac_probs = baseline_ac_probs();
-        let seeds: [[u8; 16]; 4] = [
-            [0x00; 16],
-            [0xFF; 16],
-            [
-                0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x0F, 0xED, 0xCB, 0xA9, 0x87, 0x65,
-                0x43, 0x21,
-            ],
-            [0xA5; 16],
+        let mut seeds: [[u8; 512]; 4] = [[0x00; 512], [0xFF; 512], [0u8; 512], [0xA5; 512]];
+        let pattern = [
+            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x0F, 0xED, 0xCB, 0xA9, 0x87, 0x65,
+            0x43, 0x21,
         ];
+        for (i, b) in seeds[2].iter_mut().enumerate() {
+            *b = pattern[i % pattern.len()];
+        }
         for plane in [AcPlane::Y, AcPlane::UV] {
             for &ctx in &DcContext::ALL {
                 for bytes in &seeds {
