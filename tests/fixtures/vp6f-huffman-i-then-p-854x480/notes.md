@@ -253,3 +253,73 @@ PY
 ffmpeg -y -i mut.flv -frames:v 1 -f rawvideo -pix_fmt yuv420p mut.yuv
 cmp mut.yuv expected.yuv
 ```
+
+## Appendix B — round 447 P-frame pixel-arbitration data
+
+The round-447 campaign recovered ground truth for the first P-frame
+(frame 1) by inverting the reconstruction pipeline against the
+bit-exact decoded keyframe: for a candidate (prediction, motion
+vector), the residual `oracle − prediction` was forward-transformed,
+quantised at `DctQMask == 60` and accepted only when the rounded
+integer coefficients reproduce the oracle samples exactly through the
+in-tree §15/§16/§17 chain. Facts established (all display-region,
+¼-pel units):
+
+* **MB (0,31)** — single-MV inter, MV in `{(-1..1, 24..26)}` (interior
+  ambiguity from locally smooth content; all candidates share the
+  visible prediction), ~30 non-zero quantised coefficients. Its
+  bottom-right luma block (Y3) opens with a CATEGORY5 DC of delta 54
+  followed by 16 AC coefficients — the datum that arbitrates the
+  Table 18 extra-bit probability pairing (see the round-447 CHANGELOG
+  entry and the `pframe_first_content_mb_tokens_decode_exact` gate).
+* **MB (0,32)** — single-MV inter, MV in `{(-1..1, 24..25)}`, 13
+  non-zero coefficients; its §13 tokens decode exactly under the
+  corrected pairing, with the wire mode most plausibly a
+  Nearest-class reuse of (0,31)'s vector.
+* Other pixel-pinned motion samples: (1,7) ≈ (0, −24..−25);
+  (2,6)/(2,51) ≈ (−28..−29, 0..1); (2,43) ≈ (−1..0, 24); (3,9) =
+  (0, −24) uniquely; (2,7) is FourMV-shaped (per-block solutions
+  include (0, −24) on its top-right luma block with the others near
+  zero or far-field ≈ (x, −54)). A full-frame map (zero-MV inter for
+  ~1431 MBs, ~108 searched single-MV, ~51 FourMV-shaped, ~30 intra)
+  was derived and is reproducible from the fixture alone.
+
+**Wire-reading exclusions (partition 1).** Decoding the §9 InterHeader
++ §10/§11.2/Figure-5 prefix and then walking all 1620 macroblocks'
+prediction data consumes 653 bytes under the crate's printed-spec
+reading, against a partition-1 budget of `Buff2Offset − prefix = 473`
+bytes — so the §10/§11.1 wire reading is wrong beyond the zero-motion
+prefix (first divergence: the §11.1 decode at MB (0,31) yields
+(−5, −73) where pixels require ≈ (1, 24); the first mode-level
+divergence sits at MB (0,32), the frame's first
+`NearestOnly`-availability macroblock). An exhaustive screen of
+24 576 reading pairs — 384 §10 variants (same-as-last polarity ×
+weight source × four `probModeSame` forms × six availability-row
+permutations × branch polarity × own-weight zeroing) × 64 §11.1
+variants (component order, sign position, short/long flag polarity,
+long-magnitude bit order, implicit-bit-3 handling, sign-on-zero) —
+found **no** combination that both lands in the byte-budget window
+and decodes the pixel-true motion at MB (0,31): the 188
+budget-window hits all fail the pixel screen at MB 31, and the
+combinations that decode (1, 24) at MB 31 overrun the budget. The
+operative reading therefore differs outside this space (candidates:
+the Nearest/Near walk semantics feeding availability and implicit-MV
+reuse, the golden modes' reuse source, the §10 VQ/update grammar, or
+the §11.2 MV-probability update), and needs the staged decoder
+extraction to settle — the extraction record explicitly leaves
+P-frames un-established.
+
+**§13.2/§14 bookkeeping observations (partition 2).** With
+pixel-derived prediction info substituted for pass 1, the partition-2
+arithmetic token stream was constraint-solved under several Table-26
+context readings. No single tested rule (neighbour reconstructed-DC
+zero-ness — the crate's current reading; transmitted-delta zero-ness;
+reference-gated variants; mixed within-MB/completed-MB forms)
+reconciles the whole frame: each reading decodes exactly for hundreds
+of macroblocks and then requires a contradictory choice at a specific
+block, with per-macroblock reference buckets (previous vs golden —
+pixel-identical on the first P-frame, but §14-distinct) as the
+coupling unknown. The discriminating blocks are recorded in the
+round-447 report; the question is directly answerable by static
+extraction of the vendor decoder's DC-context selection and §14
+bookkeeping.
