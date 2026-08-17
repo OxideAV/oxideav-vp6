@@ -14,6 +14,33 @@ Specification" (document version 1.02, August 2006), staged at
 `docs/video/vp6/vp6-errata-and-clarifications.md`. No third-party VP6
 source has been consulted at any stage.
 
+**Round 447 — P-frame arithmetic-path beachhead + a new Table 18
+erratum.** Verify-first: the round-2 Extractor-03 staging (docs commit
+2026-08-10) was already consumed by round 439, so the round attacked
+the open P-frame blocker by pixel arbitration (recovering each
+macroblock's true motion and integer coefficients from the oracle by
+inverting the reconstruction pipeline against the bit-exact keyframe).
+It landed one conclusive printed-spec correction: **Table 18's
+extra-bit probability list is in transmission order — the first-listed
+probability codes the most-significant magnitude bit** — where the
+§13.2.1/§13.3.1 listings' `B(Probs[BitsCount])` (descending) would
+pair the last-listed probability with the MSB. Arbitrated by the
+P-frame's first content macroblock (a CATEGORY5 DC whose magnitude
+bits decode to the oracle-recovered 54 only under the corrected
+pairing, with every following token then exact); invisible to all
+earlier gates because the keyframe's Huffman transport reads extras as
+raw bits. Decoder and encoder both carry the pairing. Two new CI
+gates: the P-frame partition-2 arithmetic token stream decodes
+coefficient-exact through the static prefix plus the first content
+macroblock, and macroblocks (0,0)..=(0,30) of the P-frame reconstruct
+bit-exactly through the two-pass MultiStream driver (pass 1 walking
+all 1620 MBs). The remaining blocker is sharpened: the §10/§11.1 wire
+diverges at the first transmitted MV (pixel truth ~(1,24) ¼-pel vs the
+printed reading's (-5,-73); pass 1 over-runs the 473-byte partition-1
+budget by 180 bytes), first at the first `NearestOnly`-availability
+macroblock — see the CHANGELOG for the candidate readings and the
+docs asks.
+
 **Round 442 — §9 output scaling applied, plus the downsampled-encode
 path.** The `scaling` module grows from the typed field surface into the
 executed post-decode stage: `FrameGeometry` is reworked to the operative
@@ -523,17 +550,24 @@ two-stage box-then-¼-pel luma search and §11 differential-MV emission), its
   to later MBs' §10 Nearest/Near scans and §11 differential references
   is its §10 **chroma-derived average** (four Y vectors, rounded away
   from zero). Decoder and encoder both record it in the neighbour grid.
-- **P-frame wire semantics against the real fixture — the remaining
-  conformance blocker (round 439).** The fixture's two P-frames
-  (MultiStream, arithmetic coefficient path) decode their static prefix
-  sample-exactly under the corrected readings, but diverge at the first
-  content macroblock. The §10 mode-probability derivation
-  (`probXmitted` → tree-node probabilities), the §11.1 MV component
-  wire details and the arithmetic-path content residuals cannot be
-  discriminated from this fixture alone (single-knob alternative
-  readings — Nearest/Near zero-MV inclusion, MV sign/order/short-flag
-  variants, mode-weight variants — all fail at the same macroblock).
-  Needs a behavioural P-frame trace from the docs collaborator; the
+- **P-frame §10/§11 wire semantics — the remaining conformance
+  blocker (sharpened round 447).** The arithmetic-path **coefficient
+  transport is now pinned** (partition-2 tokens decode
+  coefficient-exact through the first content macroblock; the static
+  31-MB prefix reconstructs bit-exactly — both CI-gated), and the
+  round's pixel arbitration recovered the true motion field around the
+  divergence: the first transmitted MV at MB (0,31) is ~(1, 24) ¼-pel
+  while the printed §11.1 reading decodes (-5, -73), and pass 1
+  consumes 653 bytes against a 473-byte partition-1 budget. The first
+  §10 divergence lands exactly at the first macroblock whose
+  availability is not `Neither`. Open questions (all statically
+  extractable from the staged vendor decoder builds): the operative
+  §11.1 short/long discriminator polarity + long-magnitude bit order
+  (a flipped-polarity, LSB-first candidate decodes the pixel-true MV
+  at (0,31) but fails deeper), the §10 mode-tree behaviour on the
+  VQ-updated nearest-exists `probXmitted` rows, the Nearest/Near reuse
+  semantics of the golden modes, and the §13.2 Table 26 / §14
+  bookkeeping interlock with per-MB reference buckets on P-frames. The
   staged extraction record explicitly leaves P-frames un-established.
 - **§9 output scaling — LANDED (round 442).** Decode-side application
   (`decode_packet_scaled` + the registered decoder emitting the

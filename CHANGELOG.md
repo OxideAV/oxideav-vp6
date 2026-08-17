@@ -6,6 +6,91 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed (fixture-arbitrated spec erratum, round 447, 2026-08-17) — **§13 Table 18 extra-bit probability pairing**
+
+- **The Table 18 arithmetic extra-bit probability list is in
+  transmission order: the first-listed probability codes the
+  most-significant magnitude bit.** The §13.2.1/§13.3.1 listings read
+  the magnitude MSB-first via `B(Probs[BitsCount])` with `BitsCount`
+  descending, which — against a `Probs[]` stored in the printed Table
+  18 order — would pair the *last*-listed probability with the MSB.
+  Table 18's own prose fixes the pairing the other way ("the most
+  significant bit of the magnitude sent first … encoded with differing
+  probabilities as specified by the final column"), and the conformant
+  third-party fixture arbitrates for the prose: the first P-frame's
+  first content macroblock opens its bottom-right luma block with a
+  CATEGORY5 DC whose five magnitude bits decode to the
+  oracle-recovered delta 54 (= 35 + 0b10011) only under the MSB-first
+  pairing, after which **every remaining token of the block decodes
+  exactly** (17 scan positions, pinned by the new
+  `pframe_first_content_mb_tokens_decode_exact` gate); the listing's
+  pairing decodes 59 and desynchronises the partition.
+  `decode_token_value` now mirrors the index
+  (`probs[bits - 1 - bits_count]`), and `token_encode` emits with the
+  same pairing so encode→decode round-trips stay bit-exact. This
+  defect was invisible to every earlier gate: the keyframe's §7.2
+  Huffman transport reads category extra-bits as **raw bits** (no
+  probabilities), the in-tree encoder round-trips were symmetric, and
+  the pairing only shows when the per-bit probabilities differ (the
+  ONE..FOUR tokens and CATEGORY1 have at most one magnitude bit).
+
+### Added (clean-room round 447, 2026-08-17) — **P-frame arithmetic-path conformance beachhead**
+
+- **Verify-first:** the round-2 Extractor-03 staging
+  (`docs/video/vp6/provenance/03-extractor-binary-huffman.md`, docs
+  commit 2026-08-10) was already fully consumed by round 439 (the
+  whole-keyframe pixel-exact gate); this round pivoted to the open
+  P-frame blocker it explicitly leaves un-established.
+- **Two new fixture gates** (`tests/conformance_vp6f.rs`):
+  - `pframe_first_content_mb_tokens_decode_exact` — the P-frame's
+    partition-2 arithmetic token stream decodes coefficient-exact
+    through the 189-block static prefix and the first content
+    macroblock's three coefficient-carrying blocks (oracle-recovered
+    expected values), pinning the §13.2.1/§13.3.1 arithmetic path —
+    contexts, category magnitude bits, zero runs — against
+    vendor-encoded wire data for the first time.
+  - `pframe_static_prefix_reconstructs_pixel_exact` — the §9
+    InterHeader + §10/§11.2/Figure-5 update prefix + the full 1620-MB
+    pass-1 walk complete without error, and macroblocks (0,0)..=(0,30)
+    reconstruct bit-exactly against the oracle through the two-pass
+    MultiStream driver.
+- **Diagnostic surfaces** (doc-hidden, powering the gates and future
+  conformance work): `decode_inter_frame_multistream_traced` (tolerant
+  two-pass decode returning per-MB §10/§11 prediction records +
+  first-error positions), `decode_inter_frame_multistream_pass2`
+  (coefficient pass with caller-supplied prediction info,
+  `ExternalMbMotion`), and `Clone` on `BoolCoder` (snapshot/restore
+  for wire probing).
+
+### Known remaining (round 447) — P-frame §10/§11 wire + §13.2/§14 bookkeeping
+
+Pixel-arbitration this round pinned the P-frame divergence far more
+precisely than round 439's "diverges at the first content macroblock":
+
+- The true motion at MBs (0,31)/(0,32) is ~(0..1, +24..26) ¼-pel
+  (oracle-arbitrated, exact integer-coefficient solutions); the §11.1
+  reading decodes (-5, -73) there, and pass 1 over-runs the partition-1
+  budget (653 bytes consumed vs `Buff2Offset` − prefix = 473), so the
+  §10/§11.1 wire reading is wrong beyond the zero-motion prefix. A
+  candidate §11.1 reading (short/long discriminator polarity flipped +
+  long magnitude as plain LSB-first bits 0..7 with no implicit bit 3)
+  decodes the pixel-true (1,24) at MB (0,31) but fails deeper; it is
+  recorded here, not landed.
+- The first §10 divergence sits exactly at the first macroblock whose
+  availability leaves `Neither` (MB (0,32), `NearestOnly`) — the
+  updated `probXmitted` rows for the nearest-exists situations and/or
+  the Nearest/Near reuse semantics of the golden modes are the open
+  question (the mode row for that situation carries VQ-updated
+  weights whose Nearest/Near entries are zero, which contradicts a
+  plain reuse reading).
+- §13.2 Table 26 DC contexts and the §14 chain on the arithmetic
+  P-frame path interlock with per-MB reference buckets in a way the
+  fixture alone did not fully discriminate this round (constraint
+  solving reconciled the first ~160 MBs under several partial rules
+  before diverging); the crate keeps its existing readings. All of
+  these are answerable by static extraction from the staged vendor
+  decoder builds; precise asks are listed in the round report.
+
 ### Added (clean-room round 442, 2026-08-13) — **§9 output scaling applied + downsampled-encode path**
 
 - **The §9 output scaling is now applied, not just parsed.** The
