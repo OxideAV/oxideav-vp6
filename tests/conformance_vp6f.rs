@@ -71,6 +71,25 @@ fn load(name: &str) -> Vec<u8> {
     std::fs::read(format!("{FIXTURE_DIR}/{name}")).unwrap_or_else(|e| panic!("read {name}: {e}"))
 }
 
+/// The three VP6 video-tag bodies (I + P + P) of `input.flv`, with the
+/// two FLV per-frame prefix bytes stripped (see `flv_transport_framing`).
+fn flv_video_bodies(flv: &[u8]) -> Vec<Vec<u8>> {
+    let data_offset = u32::from_be_bytes([flv[5], flv[6], flv[7], flv[8]]) as usize;
+    let mut pos = data_offset + 4;
+    let mut out = Vec::new();
+    while pos + 11 <= flv.len() {
+        let tag_type = flv[pos];
+        let data_size = ((flv[pos + 1] as usize) << 16)
+            | ((flv[pos + 2] as usize) << 8)
+            | flv[pos + 3] as usize;
+        if tag_type == 9 {
+            out.push(flv[pos + 11 + 2..pos + 11 + data_size].to_vec());
+        }
+        pos += 11 + data_size + 4;
+    }
+    out
+}
+
 /// Fixture integrity: sizes match the notes' inventory.
 #[test]
 fn fixture_inventory() {
@@ -419,4 +438,267 @@ fn keyframe_output_scaling_is_identity() {
     assert_eq!(scaled.y.samples(), plain.y.samples());
     assert_eq!(scaled.u.samples(), plain.u.samples());
     assert_eq!(scaled.v.samples(), plain.v.samples());
+}
+
+/// **P-frame partition-2 arithmetic tokens — the first content
+/// macroblock decodes coefficient-exact** (round 447).
+///
+/// The fixture's first P-frame codes its coefficients on the
+/// MultiStream **arithmetic** path (partition 2 BoolCoder at
+/// `Buff2Offset`). Its letterboxed static prefix tokenises 189
+/// consecutive all-zero blocks (every §13.2 Table 26 context is
+/// both-zero there under any reading, since every decoded DC is 0),
+/// then macroblock (0,31) carries the frame's first content. The
+/// expected coefficient sets below were recovered from the oracle
+/// frame (`expected.yuv` frame 1) by inverting the §15/§16
+/// reconstruction pipeline against the bit-exact decoded keyframe
+/// (integer-exact solutions, unique at the frame quantiser), so the
+/// gate pins the *arithmetic* §13.2.1/§13.3.1 token path against
+/// vendor-encoded wire data for the first time (the keyframe gate
+/// exercises only the §7.2 Huffman transport, which reads its
+/// category extra-bits as raw bits).
+///
+/// This arbitrated a new printed-spec defect (round 447): §13's
+/// Table 18 lists each category's extra-bit probabilities in
+/// **transmission order** (the first-listed probability codes the
+/// most-significant magnitude bit — "the most significant bit of the
+/// magnitude sent first … encoded with differing probabilities as
+/// specified by the final column"), while the §13.2.1/§13.3.1
+/// pseudo-code's `B(Probs[BitsCount])` with `BitsCount` descending
+/// would pair the *last*-listed probability with the MSB. The
+/// MSB-first pairing is operative: macroblock (0,31)'s bottom-right
+/// luma block opens with a CATEGORY5 DC (delta magnitude 54 = 35 +
+/// 0b10011) whose five magnitude bits decode to the oracle-recovered
+/// value only under it, and every following AC token then lands
+/// exactly; under the listing's pairing the same bits decode 59 and
+/// the block (and frame) desynchronises.
+#[test]
+fn pframe_first_content_mb_tokens_decode_exact() {
+    use oxideav_vp6::block_decode::decode_block_coefficients_ctx;
+    use oxideav_vp6::coeff_prob_update::decode_coefficient_prob_updates;
+    use oxideav_vp6::mode_prob_update::update_mode_probs;
+    use oxideav_vp6::mv_prob_update::update_mv_probs;
+    use oxideav_vp6::tokens::{AcPlane, DcContext};
+
+    let flv = load("input.flv");
+    let bodies = flv_video_bodies(&flv);
+
+    // Keyframe: derive the persistent post-Figure-5 banks.
+    let khdr = Vp6FrameHeader::parse(&bodies[0]).unwrap();
+    let mut kbc = BoolCoder::new(&bodies[0][khdr.raw_prefix_len..]).unwrap();
+    let _ = Vp6HeaderTail::parse_with(&mut kbc, true, khdr.profile.unwrap(), khdr.version.unwrap())
+        .unwrap();
+    let mut banks = CoeffProbBanks::keyframe();
+    decode_coefficient_prob_updates_keyframe(&mut kbc, &mut banks).unwrap();
+
+    // P-frame 1: run the §10/§11.2/Figure-5 update prefix to obtain the
+    // frame's operative coefficient banks.
+    let body = &bodies[1];
+    let hdr = Vp6FrameHeader::parse_with_profile(body, khdr.profile).unwrap();
+    assert!(hdr.multi_stream && !hdr.is_keyframe);
+    let buff2 = hdr.buff2_offset.unwrap() as usize;
+    let mut bc = BoolCoder::new(&body[hdr.raw_prefix_len..]).unwrap();
+    let tail =
+        Vp6HeaderTail::parse_with(&mut bc, false, khdr.profile.unwrap(), khdr.version.unwrap())
+            .unwrap();
+    assert!(!tail.use_huffman, "P-frames ride the arithmetic path");
+    let mut mode_probs = oxideav_vp6::modes::VP6_BASELINE_XMITTED_PROBS;
+    update_mode_probs(&mut bc, &mut mode_probs).unwrap();
+    let mut mv_probs = [
+        oxideav_vp6::mv_decode::MvProbs::defaults(oxideav_vp6::mv_decode::MV_AXIS_X),
+        oxideav_vp6::mv_decode::MvProbs::defaults(oxideav_vp6::mv_decode::MV_AXIS_Y),
+    ];
+    update_mv_probs(&mut bc, &mut mv_probs).unwrap();
+    let _scan = decode_coefficient_prob_updates(&mut bc, &mut banks).unwrap();
+    let probs = banks.to_intra_probs();
+
+    // Partition 2: 31 letterboxed MBs (186 all-zero blocks) + MB (0,31)'s
+    // Y0 (still empty), then the three content blocks.
+    let mut p2 = BoolCoder::new(&body[buff2..]).unwrap();
+    let decode = |bc: &mut BoolCoder, plane: AcPlane, ctx: DcContext| -> Vec<(usize, i32)> {
+        let b = decode_block_coefficients_ctx(
+            bc,
+            plane,
+            &probs.dc_contexts,
+            ctx,
+            &probs.ac_probs,
+            &probs.zrl_probs,
+        )
+        .expect("partition-2 block");
+        b.coeffs
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v != 0)
+            .map(|(i, &v)| (i, v))
+            .collect()
+    };
+    for blk in 0..31 * 6 + 1 {
+        let plane = if blk % 6 < 4 { AcPlane::Y } else { AcPlane::UV };
+        let nz = decode(&mut p2, plane, DcContext::BothZero);
+        assert!(nz.is_empty(), "static-prefix block {blk} must be all-zero");
+    }
+    // MB (0,31) Y1/Y2 (left/above coded DCs still zero) then Y3 (both
+    // neighbours' coded DCs non-zero). Values are scan-order (position,
+    // value) pairs in DC-delta form, oracle-recovered.
+    assert_eq!(
+        decode(&mut p2, AcPlane::Y, DcContext::BothZero),
+        vec![(0, 1), (1, -2), (3, 1), (9, -1), (10, 1)],
+        "MB (0,31) Y1"
+    );
+    assert_eq!(
+        decode(&mut p2, AcPlane::Y, DcContext::BothZero),
+        vec![
+            (0, 2),
+            (1, -1),
+            (2, -2),
+            (3, -1),
+            (4, 1),
+            (5, 2),
+            (6, -1),
+            (8, 1)
+        ],
+        "MB (0,31) Y2"
+    );
+    assert_eq!(
+        decode(&mut p2, AcPlane::Y, DcContext::BothNonZero),
+        vec![
+            (0, 54),
+            (1, -10),
+            (2, -6),
+            (3, -8),
+            (4, 1),
+            (5, -8),
+            (6, -1),
+            (7, 2),
+            (8, 1),
+            (9, 3),
+            (10, -2),
+            (11, 1),
+            (12, 1),
+            (15, 1),
+            (20, -1),
+            (25, -1),
+            (26, -1)
+        ],
+        "MB (0,31) Y3 — the CATEGORY5 DC that arbitrates the Table 18 \
+         extra-bit probability pairing"
+    );
+}
+
+/// **P-frame static prefix reconstructs pixel-exactly through the
+/// two-pass MultiStream driver** (round 447).
+///
+/// The first P-frame's §10 mode / §11 MV wire is still un-established
+/// past the first transmitted motion vector (macroblock (0,31); the
+/// staged extraction record leaves P-frames un-established), so the
+/// full frame cannot yet be gated. What *is* pinned: the §9
+/// InterHeader parse, the §10/§11.2/Figure-5 update prefix, the pass-1
+/// walk across all 1620 macroblocks, and — for the leading 31
+/// macroblocks, whose §10 modes are zero-motion and whose §13 blocks
+/// are all-zero — bit-exact reconstruction against the decode oracle.
+#[test]
+fn pframe_static_prefix_reconstructs_pixel_exact() {
+    use oxideav_vp6::coeff_prob_update::decode_coefficient_prob_updates;
+    use oxideav_vp6::coeff_source::CoeffSource;
+    use oxideav_vp6::inter_frame::{
+        decode_inter_frame_multistream_traced, FilterConfig, InterProbs, ReferenceFrames,
+    };
+    use oxideav_vp6::mode_prob_update::update_mode_probs;
+    use oxideav_vp6::mv_prob_update::update_mv_probs;
+
+    let flv = load("input.flv");
+    let expected = load("expected.yuv");
+    let bodies = flv_video_bodies(&flv);
+
+    // Keyframe (bit-exact per `keyframe_decodes_pixel_exact`) seeds the
+    // §4 references and the persistent banks.
+    let mut dec = Vp6Decoder::new();
+    let f0 = dec.decode_packet(&bodies[0]).expect("keyframe");
+    let khdr = Vp6FrameHeader::parse(&bodies[0]).unwrap();
+    let mut kbc = BoolCoder::new(&bodies[0][khdr.raw_prefix_len..]).unwrap();
+    let _ = Vp6HeaderTail::parse_with(&mut kbc, true, khdr.profile.unwrap(), khdr.version.unwrap())
+        .unwrap();
+    let mut banks = CoeffProbBanks::keyframe();
+    decode_coefficient_prob_updates_keyframe(&mut kbc, &mut banks).unwrap();
+    let refs = ReferenceFrames::from_keyframe(f0);
+
+    let body = &bodies[1];
+    let hdr = Vp6FrameHeader::parse_with_profile(body, khdr.profile).unwrap();
+    let buff2 = hdr.buff2_offset.unwrap() as usize;
+    let mut bc = BoolCoder::new(&body[hdr.raw_prefix_len..]).unwrap();
+    let tail =
+        Vp6HeaderTail::parse_with(&mut bc, false, khdr.profile.unwrap(), khdr.version.unwrap())
+            .expect("§9 InterHeader tail");
+    let mut mode_probs = oxideav_vp6::modes::VP6_BASELINE_XMITTED_PROBS;
+    update_mode_probs(&mut bc, &mut mode_probs).unwrap();
+    let mut mv_probs = [
+        oxideav_vp6::mv_decode::MvProbs::defaults(oxideav_vp6::mv_decode::MV_AXIS_X),
+        oxideav_vp6::mv_decode::MvProbs::defaults(oxideav_vp6::mv_decode::MV_AXIS_Y),
+    ];
+    update_mv_probs(&mut bc, &mut mv_probs).unwrap();
+    let scan = decode_coefficient_prob_updates(&mut bc, &mut banks).unwrap();
+    let probs = InterProbs {
+        mode_probs,
+        mv_probs,
+        coeffs: banks.to_intra_probs(),
+    };
+    let filter = FilterConfig::from_header(&tail, hdr.dct_q_mask);
+    let (prev, golden) = refs.bordered();
+    let mut bc2 = BoolCoder::new(&body[buff2..]).unwrap();
+    let mut src = CoeffSource::Bool(&mut bc2);
+    let (hf, vf) = refs.coded_fragments();
+    let trace = decode_inter_frame_multistream_traced(
+        &mut bc,
+        &mut src,
+        hf,
+        vf,
+        hdr.dct_q_mask,
+        &probs,
+        &scan,
+        &filter,
+        &prev,
+        &golden,
+    );
+
+    // Pass 1 walks the whole MB grid without erroring.
+    assert!(trace.prediction_error.is_none(), "pass-1 walk completes");
+    assert_eq!(trace.prediction.len(), 54 * 30);
+    // The leading 31 macroblocks decode zero-motion modes...
+    for m in trace.prediction.iter().take(31) {
+        assert!(
+            m.mb_mv.is_zero() && m.four_mvs.is_none(),
+            "static prefix MBs carry no motion"
+        );
+    }
+    // ...and reconstruct bit-exactly: luma rows 0..16 x cols 0..496,
+    // chroma rows 0..8 x cols 0..248 (MBs (0,0)..=(0,30)).
+    let o1 = &expected[YUV_FRAME_LEN..2 * YUV_FRAME_LEN];
+    let oy = &o1[..DISPLAY_W * DISPLAY_H];
+    let ou = &o1[DISPLAY_W * DISPLAY_H..DISPLAY_W * DISPLAY_H + (DISPLAY_W / 2) * (DISPLAY_H / 2)];
+    let ov = &o1[DISPLAY_W * DISPLAY_H + (DISPLAY_W / 2) * (DISPLAY_H / 2)..];
+    let yw = trace.frame.y.width();
+    for y in 0..16 {
+        for x in 0..496 {
+            assert_eq!(
+                trace.frame.y.samples()[y * yw + x],
+                oy[y * DISPLAY_W + x],
+                "P-frame static-prefix luma ({x},{y})"
+            );
+        }
+    }
+    let cw = trace.frame.u.width();
+    for y in 0..8 {
+        for x in 0..248 {
+            assert_eq!(
+                trace.frame.u.samples()[y * cw + x],
+                ou[y * (DISPLAY_W / 2) + x],
+                "P-frame static-prefix U ({x},{y})"
+            );
+            assert_eq!(
+                trace.frame.v.samples()[y * cw + x],
+                ov[y * (DISPLAY_W / 2) + x],
+                "P-frame static-prefix V ({x},{y})"
+            );
+        }
+    }
 }

@@ -93,7 +93,7 @@ use crate::Error;
 /// byte slice ([`BoolCoder::new`]); it never crosses a partition
 /// boundary on its own. Partition layout (single-partition vs.
 /// `Buff2Offset`-split) is a §6 / §9 concern handled by the caller.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BoolCoder<'a> {
     /// Byte stream the decoder pulls renormalization fill from.
     bytes: &'a [u8],

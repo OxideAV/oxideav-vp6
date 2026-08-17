@@ -431,6 +431,18 @@ fn decode_block(
 
     let block = src.decode_block(plane, dc_context, probs)?;
 
+    // EXPERIMENT r447: env-gated block trace for conformance probing.
+    if std::env::var_os("VP6_TRACE_BLOCKS").is_some() {
+        let nz: Vec<(usize, i32)> = block
+            .coeffs
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v != 0)
+            .map(|(i, &v)| (i, v))
+            .collect();
+        eprintln!("TRACE blk plane={plane:?} ctx={dc_context:?} scan_nz={nz:?}");
+    }
+
     // §14 DC prediction: reconstructed coded DC = predictor + delta. The
     // same-reference rule filters out neighbours whose bucket differs.
     let left_n = left.map(|c| Neighbour {
@@ -762,7 +774,7 @@ fn decode_mb_prediction(
 /// reconstruct + place its pixels — the Figure 7 unit both drivers
 /// share.
 #[allow(clippy::too_many_arguments)]
-fn decode_mb_blocks(
+fn decode_mb_blocks_logged(
     src: &mut CoeffSource<'_, '_>,
     motion: &MbMotion,
     mb_row: usize,
@@ -777,7 +789,8 @@ fn decode_mb_blocks(
     golden: &BorderedRef,
     dc_state: &mut DcState,
     frame: &mut Frame,
-) -> Result<(), Error> {
+) -> Result<[[i32; BLOCK_SIZE]; 6], Error> {
+    let mut coeff_log = [[0i32; BLOCK_SIZE]; 6];
     const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
     const LUMA_CORNERS: [(i32, i32); 4] = [(0, 0), (0, 8), (8, 0), (8, 8)];
 
@@ -816,6 +829,7 @@ fn decode_mb_blocks(
                 reference,
             },
         );
+        coeff_log[k] = decoded.scan_coeffs;
         let residual = residual_of(&decoded.scan_coeffs, scan_to_raster, dequant);
         luma_pixels[k] = reconstruct_luma_block(
             mode,
@@ -851,6 +865,7 @@ fn decode_mb_blocks(
             reference,
         },
     );
+    coeff_log[4] = u_decoded.scan_coeffs;
     let u_residual = residual_of(&u_decoded.scan_coeffs, scan_to_raster, dequant);
     let u_pixels = reconstruct_chroma_block(
         mode,
@@ -882,6 +897,7 @@ fn decode_mb_blocks(
             reference,
         },
     );
+    coeff_log[5] = v_decoded.scan_coeffs;
     let v_residual = residual_of(&v_decoded.scan_coeffs, scan_to_raster, dequant);
     let v_pixels = reconstruct_chroma_block(
         mode,
@@ -900,7 +916,44 @@ fn decode_mb_blocks(
         .place_macroblock(mb_row, mb_col, &luma_pixels, &u_pixels, &v_pixels)
         .map_err(|_| Error::Truncated)?;
 
-    Ok(())
+    Ok(coeff_log)
+}
+
+/// [`decode_mb_blocks_logged`] without the coefficient payload.
+#[allow(clippy::too_many_arguments)]
+fn decode_mb_blocks(
+    src: &mut CoeffSource<'_, '_>,
+    motion: &MbMotion,
+    mb_row: usize,
+    mb_col: usize,
+    h_fragments: usize,
+    v_fragments: usize,
+    coeff_probs: &IntraProbs,
+    scan_to_raster: &[u8; BLOCK_SIZE],
+    dequant: DequantContext,
+    filter: &FilterConfig,
+    prev: &BorderedRef,
+    golden: &BorderedRef,
+    dc_state: &mut DcState,
+    frame: &mut Frame,
+) -> Result<(), Error> {
+    decode_mb_blocks_logged(
+        src,
+        motion,
+        mb_row,
+        mb_col,
+        h_fragments,
+        v_fragments,
+        coeff_probs,
+        scan_to_raster,
+        dequant,
+        filter,
+        prev,
+        golden,
+        dc_state,
+        frame,
+    )
+    .map(|_| ())
 }
 
 /// Decode a P-frame against a [`ReferenceFrames`] state holder, building
@@ -1132,6 +1185,211 @@ fn reconstruct_chroma_block(
     let mut out = [0u8; 64];
     reconstruct_inter_block(&pred, residual, &mut out);
     out
+}
+
+/// One MB's traced §10/§11 prediction record — diagnostic mirror of the
+/// private `MbMotion` unit, with the partition-1 coder position after
+/// the MB's prediction data was consumed.
+// internal diagnostic — exposed for conformance probing; not stable API
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct MsTraceMb {
+    pub mode: CodingMode,
+    pub mb_mv: MotionVector,
+    pub four_mvs: Option<[MotionVector; 4]>,
+    pub p1_pos_after: usize,
+}
+
+/// Diagnostic result of a tolerant two-pass MultiStream P-frame decode:
+/// per-MB prediction trace + partial frame + first-error positions.
+// internal diagnostic — exposed for conformance probing; not stable API
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct MsTrace {
+    /// Pass-1 per-MB records, in raster order, up to the first pass-1
+    /// error (if any).
+    pub prediction: Vec<MsTraceMb>,
+    /// `(mb_index, error)` if pass 1 failed.
+    pub prediction_error: Option<(usize, Error)>,
+    /// Partition-1 coder byte position after the last pass-1 MB.
+    pub p1_pos_after_prediction: usize,
+    /// The (possibly partial) reconstructed frame; MBs past a pass-2
+    /// error hold neutral grey.
+    pub frame: Frame,
+    /// `(mb_index, error)` if pass 2 failed.
+    pub pass2_error: Option<(usize, Error)>,
+}
+
+/// Tolerant, instrumented variant of [`decode_inter_frame_multistream`]
+/// for conformance probing: never fails — instead records where each
+/// pass first errored and returns everything decoded up to that point.
+#[allow(clippy::too_many_arguments)]
+// internal diagnostic — exposed for conformance probing; not stable API
+#[doc(hidden)]
+pub fn decode_inter_frame_multistream_traced(
+    bc: &mut crate::bool_coder::BoolCoder<'_>,
+    src: &mut CoeffSource<'_, '_>,
+    h_fragments: usize,
+    v_fragments: usize,
+    dct_q_mask: u8,
+    probs: &InterProbs,
+    scan_to_raster: &[u8; BLOCK_SIZE],
+    filter: &FilterConfig,
+    prev: &BorderedRef,
+    golden: &BorderedRef,
+) -> MsTrace {
+    let mut frame = Frame::new(h_fragments, v_fragments);
+    let mb_cols = frame.mb_cols();
+    let mb_rows = frame.mb_rows();
+    let dequant = DequantContext::new(dct_q_mask);
+
+    let mut mv_grid: Vec<Option<NeighbourMv>> = vec![None; mb_cols.saturating_mul(mb_rows)];
+    let mut last_mode = CodingMode::InterNoMv;
+    let mut prediction: Vec<MsTraceMb> = Vec::with_capacity(mb_cols * mb_rows);
+    let mut motions: Vec<MbMotion> = Vec::with_capacity(mb_cols * mb_rows);
+    let mut prediction_error = None;
+    'p1: for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            match decode_mb_prediction(
+                bc,
+                probs,
+                &mut mv_grid,
+                &mut last_mode,
+                mb_row,
+                mb_col,
+                mb_cols,
+                mb_rows,
+            ) {
+                Ok(m) => {
+                    prediction.push(MsTraceMb {
+                        mode: m.mode,
+                        mb_mv: m.mb_mv,
+                        four_mvs: m.four_mvs,
+                        p1_pos_after: bc.pos(),
+                    });
+                    motions.push(m);
+                }
+                Err(e) => {
+                    prediction_error = Some((mb_row * mb_cols + mb_col, e));
+                    break 'p1;
+                }
+            }
+        }
+    }
+    let p1_pos_after_prediction = bc.pos();
+
+    let mut pass2_error = None;
+    if prediction_error.is_none() {
+        let mut dc_state = DcState::new(h_fragments, v_fragments, mb_cols, mb_rows);
+        'p2: for mb_row in 0..mb_rows {
+            for mb_col in 0..mb_cols {
+                if let Err(e) = decode_mb_blocks(
+                    src,
+                    &motions[mb_row * mb_cols + mb_col],
+                    mb_row,
+                    mb_col,
+                    h_fragments,
+                    v_fragments,
+                    &probs.coeffs,
+                    scan_to_raster,
+                    dequant,
+                    filter,
+                    prev,
+                    golden,
+                    &mut dc_state,
+                    &mut frame,
+                ) {
+                    pass2_error = Some((mb_row * mb_cols + mb_col, e));
+                    break 'p2;
+                }
+            }
+        }
+    }
+
+    MsTrace {
+        prediction,
+        prediction_error,
+        p1_pos_after_prediction,
+        frame,
+        pass2_error,
+    }
+}
+
+/// Caller-supplied per-MB prediction info for the pass-2-only driver —
+/// the public mirror of the private `MbMotion` unit.
+// internal diagnostic — exposed for conformance probing; not stable API
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct ExternalMbMotion {
+    pub mode: CodingMode,
+    pub mb_mv: MotionVector,
+    pub four_mvs: Option<[MotionVector; 4]>,
+}
+
+/// Run ONLY the Figure 3/4 coefficient pass over `src`, with the per-MB
+/// §10/§11 prediction info supplied by the caller instead of decoded
+/// from partition 1. Tolerant: returns the partial frame + first-error
+/// position instead of failing.
+#[allow(clippy::too_many_arguments)]
+// internal diagnostic — exposed for conformance probing; not stable API
+#[doc(hidden)]
+pub fn decode_inter_frame_multistream_pass2(
+    src: &mut CoeffSource<'_, '_>,
+    motions: &[ExternalMbMotion],
+    h_fragments: usize,
+    v_fragments: usize,
+    dct_q_mask: u8,
+    coeff_probs: &IntraProbs,
+    scan_to_raster: &[u8; BLOCK_SIZE],
+    filter: &FilterConfig,
+    prev: &BorderedRef,
+    golden: &BorderedRef,
+    coeff_log: Option<&mut Vec<[[i32; BLOCK_SIZE]; 6]>>,
+) -> (Frame, Option<(usize, Error)>) {
+    let mut frame = Frame::new(h_fragments, v_fragments);
+    let mb_cols = frame.mb_cols();
+    let mb_rows = frame.mb_rows();
+    let dequant = DequantContext::new(dct_q_mask);
+    let mut dc_state = DcState::new(h_fragments, v_fragments, mb_cols, mb_rows);
+    let mut err = None;
+    let mut log = coeff_log;
+    'p2: for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let m = &motions[mb_row * mb_cols + mb_col];
+            let motion = MbMotion {
+                mode: m.mode,
+                mb_mv: m.mb_mv,
+                four_mvs: m.four_mvs,
+            };
+            match decode_mb_blocks_logged(
+                src,
+                &motion,
+                mb_row,
+                mb_col,
+                h_fragments,
+                v_fragments,
+                coeff_probs,
+                scan_to_raster,
+                dequant,
+                filter,
+                prev,
+                golden,
+                &mut dc_state,
+                &mut frame,
+            ) {
+                Ok(coeffs) => {
+                    if let Some(l) = log.as_deref_mut() {
+                        l.push(coeffs);
+                    }
+                }
+                Err(e) => {
+                    err = Some((mb_row * mb_cols + mb_col, e));
+                    break 'p2;
+                }
+            }
+        }
+    }
+    (frame, err)
 }
 
 #[cfg(test)]
