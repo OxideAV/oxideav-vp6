@@ -385,6 +385,28 @@ The crate decodes MB (0,31)'s motion as `(-5, -73)`; the wire carries
   cleanly past the first row of content macroblocks, so the full
   component grammar is **not** closed here.
 
+### Why this fixture cannot close §11.1 alone (the root under-determination)
+
+The decisive measurement of round 450: the first P-frame's leading ~30
+macroblocks are **not** wire-static. They sit in the 854→864 letterbox
+(luma 16, black) and the vendor stream codes several of them with real
+coding modes and motion vectors — `CODE_INTER_PLUS_MV`, `CODE_USING_GOLDEN`,
+`CODE_INTER_FOURMV` — whose motion compensates from one black region into
+another and therefore reconstructs black **regardless of the vector**. So
+the pixels leave those macroblocks' modes and MVs entirely unconstrained,
+while the coder position they consume is very much real: any error in the
+letterbox mode/MV grammar shifts the BoolCoder before it reaches MB (0,31),
+the first macroblock whose pixels actually pin a motion vector. A full
+crate-verified-mode-decode sweep over the §11.1 component grammar (short-tree
+node assignment, component order/axis, availability walk, differential
+predictor) — scored by whole-frame reconstruction against the oracle —
+finds **no** assignment that reaches MB (0,31) in sync, because the
+uninformative letterbox macroblocks ahead of it cannot be pinned from
+pixels. This is not a search-depth limitation; it is a genuine
+under-determination of the wire from this fixture's pixels, and it is why
+the §11.1 grammar needs the static decoder extraction rather than more
+oracle arbitration.
+
 ### DOCS-GAP — Extractor round 3 ask
 
 Settling the §11.1 wire from the spec plus this one fixture is

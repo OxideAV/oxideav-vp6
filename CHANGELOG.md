@@ -41,10 +41,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   motion (24), not the horizontal as the spec's "the X component is
   decoded first" implies; and the printed §11.1 short-vector tree decodes
   the macroblock's horizontal magnitude to 2 where the reconstruction
-  admits only |x| ≤ 1. Closing the grammar needs the staged decoder
-  extraction — `docs/video/vp6/provenance/03` explicitly leaves P-frames
-  un-established. The measured facts and the discriminating datums are
-  recorded in the fixture's `notes.md` (Appendix C).
+  admits only |x| ≤ 1. The root reason this fixture cannot close the
+  grammar: its leading ~30 macroblocks sit in the 854→864 letterbox and
+  the vendor stream codes several of them with real modes and motion
+  vectors that motion-compensate black-into-black and so reconstruct
+  identically for *any* vector — leaving the letterbox mode/MV wire
+  pixel-unconstrained while it still consumes coder position, so a full
+  crate-verified-mode sweep over the §11.1 component grammar scored by
+  whole-frame reconstruction finds no assignment that even reaches MB
+  (0,31) in sync. This is a genuine under-determination of the wire from
+  the fixture's pixels, not a search-depth limit. Closing the grammar
+  needs the staged decoder extraction — `docs/video/vp6/provenance/03`
+  explicitly leaves P-frames un-established. The measured facts and the
+  discriminating datums are recorded in the fixture's `notes.md`
+  (Appendix C).
 
 ### Fixed (fixture-arbitrated spec erratum, round 447, 2026-08-17) — **§13 Table 18 extra-bit probability pairing**
 
