@@ -6,6 +6,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (clean-room round 450, 2026-08-24) — **P-frame inter reconstruction gate + §11.1 MV-wire characterisation**
+
+- **The first P-frame's first content macroblock, MB (0,31), now
+  reconstructs pixel-exactly under its oracle-recovered motion** — the
+  new `pframe_mb31_inter_reconstruction_pixel_exact` gate. Driving the
+  §13 coefficient pass (`decode_inter_frame_multistream_pass2`) with the
+  per-MB motion supplied externally (static prefix zero-motion inter, MB
+  (0,31) `CODE_INTER_PLUS_MV` with the arbitrated `(-1, 24)` ¼-pel
+  vector), MB (0,31)'s sixteen luma columns **and** its U and V chroma
+  blocks match the decode oracle bit-for-bit. This is the first gate to
+  exercise §11.4 fractional-pixel motion compensation (¼-pel luma, ⅛-pel
+  chroma), the §15/§16 dequant+IDCT residual path and the §17
+  motion-compensated recombination against **real vendor-encoded inter
+  coefficients** — machinery the intra-only keyframe gate never touches.
+  The partition-2 stream stays aligned through the macroblock because its
+  token decode is bit-exact (the round-447 pinned-token gate); this gate
+  adds the reconstruction half.
+- **The remaining P-frame blocker is localised to the §10/§11.1
+  mode/motion-vector wire, and the mode layer is cleared.** Round 450
+  probed the fixture's first P-frame by whole-partition synthesis
+  (re-encoding a semantically-identical partition 1 through the crate's
+  own encoders, then appending scripted BoolCoder symbols, and letting
+  the black-box oracle judge each hypothesis by whole-frame
+  re-synchronisation) plus single-bit-flip ownership mapping of the real
+  partition 1. Established, all against the decode oracle only: the §10
+  mode-decode grammar (root "same-as-last" bit, Figure-10 tree topology,
+  the `ModeAvailability` neighbour walk) reproduces the vendor wire for
+  the whole frame when scripted; MB (0,31)'s coding mode is
+  `CODE_INTER_PLUS_MV` and its motion is uniquely `(-1, 24)`; the
+  **§11.1 motion-vector component grammar is the sole open defect** — the
+  crate reads `(-5, -73)` where the wire carries `(-1, 24)`. Two
+  discriminated symptoms: the first-decoded component is the *vertical*
+  motion (24), not the horizontal as the spec's "the X component is
+  decoded first" implies; and the printed §11.1 short-vector tree decodes
+  the macroblock's horizontal magnitude to 2 where the reconstruction
+  admits only |x| ≤ 1. Closing the grammar needs the staged decoder
+  extraction — `docs/video/vp6/provenance/03` explicitly leaves P-frames
+  un-established. The measured facts and the discriminating datums are
+  recorded in the fixture's `notes.md` (Appendix C).
+
 ### Fixed (fixture-arbitrated spec erratum, round 447, 2026-08-17) — **§13 Table 18 extra-bit probability pairing**
 
 - **The Table 18 arithmetic extra-bit probability list is in

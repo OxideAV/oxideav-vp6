@@ -702,3 +702,156 @@ fn pframe_static_prefix_reconstructs_pixel_exact() {
         }
     }
 }
+
+/// **P-frame MB (0,31) inter reconstruction is pixel-exact under the
+/// oracle-recovered motion** (round 450).
+///
+/// The first P-frame's first content macroblock, MB (0,31), is a
+/// single-vector inter macroblock. Round 447 pixel-arbitrated its
+/// motion to `(-1..1, 24..26)` ¼-pel (a locally-smooth interior
+/// ambiguity) and pinned its arithmetic coefficient tokens
+/// (`pframe_first_content_mb_tokens_decode_exact`). This gate closes
+/// the loop on the **reconstruction** side: driving the §13 coefficient
+/// pass (`decode_inter_frame_multistream_pass2`) with the pinned
+/// per-MB motion supplied externally — the whole static prefix as
+/// zero-motion inter, MB (0,31) as `CODE_INTER_PLUS_MV` with the
+/// arbitrated `(-1, 24)` vector — reconstructs MB (0,31)'s sixteen
+/// luma columns **and** its U and V chroma blocks bit-exactly against
+/// the decode oracle.
+///
+/// This exercises, against real vendor-encoded coefficients for the
+/// first time, the §11.4 fractional-pixel motion compensation (the
+/// vector is ¼-pel in luma, ⅛-pel in chroma), the §15/§16
+/// dequant+IDCT residual path on an inter block, and the §17
+/// motion-compensated recombination — the machinery the keyframe gate
+/// (intra-only) never touches. The partition-2 coefficient stream stays
+/// aligned through MB (0,31) because its token decode is bit-exact
+/// (the pinned-token gate); the reconstruction is what this gate adds.
+///
+/// The §10 mode / §11.1 motion-vector **wire** grammar remains the open
+/// P-frame blocker: the crate cannot yet recover `(-1, 24)` from the
+/// partition-1 bits (it reads `(-5, -73)` at this macroblock). Closing
+/// that needs the staged decoder extraction — the docs record
+/// (`provenance/03`) explicitly leaves P-frames un-established. Here the
+/// motion is supplied, isolating the reconstruction path from the wire.
+#[test]
+fn pframe_mb31_inter_reconstruction_pixel_exact() {
+    use oxideav_vp6::coeff_prob_update::decode_coefficient_prob_updates;
+    use oxideav_vp6::coeff_source::CoeffSource;
+    use oxideav_vp6::inter_frame::{
+        decode_inter_frame_multistream_pass2, ExternalMbMotion, FilterConfig, InterProbs,
+        ReferenceFrames,
+    };
+    use oxideav_vp6::mode_prob_update::update_mode_probs;
+    use oxideav_vp6::modes::CodingMode;
+    use oxideav_vp6::mv_prob_update::update_mv_probs;
+    use oxideav_vp6::near_mv::MotionVector;
+
+    let flv = load("input.flv");
+    let expected = load("expected.yuv");
+    let bodies = flv_video_bodies(&flv);
+
+    // Keyframe (bit-exact) seeds the references and the persistent banks.
+    let mut dec = Vp6Decoder::new();
+    let f0 = dec.decode_packet(&bodies[0]).expect("keyframe");
+    let khdr = Vp6FrameHeader::parse(&bodies[0]).unwrap();
+    let mut kbc = BoolCoder::new(&bodies[0][khdr.raw_prefix_len..]).unwrap();
+    let _ = Vp6HeaderTail::parse_with(&mut kbc, true, khdr.profile.unwrap(), khdr.version.unwrap())
+        .unwrap();
+    let mut banks = CoeffProbBanks::keyframe();
+    decode_coefficient_prob_updates_keyframe(&mut kbc, &mut banks).unwrap();
+    let refs = ReferenceFrames::from_keyframe(f0);
+
+    // P-frame 1: run the §10/§11.2/Figure-5 update prefix to obtain the
+    // operative banks and the active scan order.
+    let body = &bodies[1];
+    let hdr = Vp6FrameHeader::parse_with_profile(body, khdr.profile).unwrap();
+    let buff2 = hdr.buff2_offset.unwrap() as usize;
+    let mut bc = BoolCoder::new(&body[hdr.raw_prefix_len..]).unwrap();
+    let tail =
+        Vp6HeaderTail::parse_with(&mut bc, false, khdr.profile.unwrap(), khdr.version.unwrap())
+            .unwrap();
+    let mut mode_probs = oxideav_vp6::modes::VP6_BASELINE_XMITTED_PROBS;
+    update_mode_probs(&mut bc, &mut mode_probs).unwrap();
+    let mut mv_probs = [
+        oxideav_vp6::mv_decode::MvProbs::defaults(oxideav_vp6::mv_decode::MV_AXIS_X),
+        oxideav_vp6::mv_decode::MvProbs::defaults(oxideav_vp6::mv_decode::MV_AXIS_Y),
+    ];
+    update_mv_probs(&mut bc, &mut mv_probs).unwrap();
+    let scan = decode_coefficient_prob_updates(&mut bc, &mut banks).unwrap();
+    let probs = InterProbs {
+        mode_probs,
+        mv_probs,
+        coeffs: banks.to_intra_probs(),
+    };
+    let filter = FilterConfig::from_header(&tail, hdr.dct_q_mask);
+    let (prev, golden) = refs.bordered();
+
+    // Supplied per-MB motion: static prefix (MBs 0..=30) zero-motion
+    // inter, MB (0,31) the arbitrated single-vector inter, the remainder
+    // zero-motion inter (their reconstruction is not asserted, but their
+    // coefficient decode must proceed to keep MB (0,31) aligned).
+    let mut motions = vec![
+        ExternalMbMotion {
+            mode: CodingMode::InterNoMv,
+            mb_mv: MotionVector::ZERO,
+            four_mvs: None,
+        };
+        54 * 30
+    ];
+    motions[31] = ExternalMbMotion {
+        mode: CodingMode::InterPlusMv,
+        mb_mv: MotionVector::new(-1, 24),
+        four_mvs: None,
+    };
+
+    let mut bc2 = BoolCoder::new(&body[buff2..]).unwrap();
+    let mut src = CoeffSource::Bool(&mut bc2);
+    let (frame, _err) = decode_inter_frame_multistream_pass2(
+        &mut src,
+        &motions,
+        108,
+        60,
+        hdr.dct_q_mask,
+        &probs.coeffs,
+        &scan,
+        &filter,
+        &prev,
+        &golden,
+        None,
+    );
+
+    // MB (0,31): luma cols 496..512, rows 0..16; chroma cols 248..256,
+    // rows 0..8 — bit-exact against oracle frame 1.
+    let o1 = &expected[YUV_FRAME_LEN..2 * YUV_FRAME_LEN];
+    let oy = &o1[..DISPLAY_W * DISPLAY_H];
+    let ou = &o1[DISPLAY_W * DISPLAY_H..DISPLAY_W * DISPLAY_H + (DISPLAY_W / 2) * (DISPLAY_H / 2)];
+    let ov = &o1[DISPLAY_W * DISPLAY_H + (DISPLAY_W / 2) * (DISPLAY_H / 2)..];
+    let yw = frame.y.width();
+    for r in 0..16 {
+        for c in 0..16 {
+            let (x, y) = (31 * 16 + c, r);
+            assert_eq!(
+                frame.y.samples()[y * yw + x],
+                oy[y * DISPLAY_W + x],
+                "MB (0,31) luma ({x},{y})"
+            );
+        }
+    }
+    let cw = frame.u.width();
+    for r in 0..8 {
+        for c in 0..8 {
+            let (x, y) = (31 * 8 + c, r);
+            assert_eq!(
+                frame.u.samples()[y * cw + x],
+                ou[y * (DISPLAY_W / 2) + x],
+                "MB (0,31) U ({x},{y})"
+            );
+            assert_eq!(
+                frame.v.samples()[y * cw + x],
+                ov[y * (DISPLAY_W / 2) + x],
+                "MB (0,31) V ({x},{y})"
+            );
+        }
+    }
+}

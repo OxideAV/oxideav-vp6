@@ -14,6 +14,27 @@ Specification" (document version 1.02, August 2006), staged at
 `docs/video/vp6/vp6-errata-and-clarifications.md`. No third-party VP6
 source has been consulted at any stage.
 
+**Round 450 — P-frame inter reconstruction gate; the blocker is
+narrowed to the §11.1 MV wire.** The first P-frame's first content
+macroblock, MB (0,31), now reconstructs **pixel-exactly** under its
+oracle-recovered motion: driving the §13 coefficient pass with the
+per-MB motion supplied externally (static prefix zero-motion, MB (0,31)
+`CODE_INTER_PLUS_MV` at `(-1, 24)` ¼-pel), its luma and both chroma
+blocks match the oracle bit-for-bit — the first gate to exercise §11.4
+fractional-pixel motion compensation, the §15/§16 inter residual path
+and the §17 recombination on real vendor coefficients. The round then
+probed the mode/MV wire by whole-partition synthesis (re-encoding a
+semantically-identical partition 1 and letting the oracle judge scripted
+BoolCoder symbols) plus single-bit-flip ownership mapping. Result: the
+§10 mode-decode grammar reproduces the vendor wire for the whole frame
+when scripted (it is **not** the blocker), and the sole open defect is
+the **§11.1 motion-vector component grammar** — the first-decoded
+component is the vertical motion (not the horizontal the spec implies),
+and the printed short-vector tree over-reads MB (0,31)'s horizontal
+magnitude by one. Closing it needs the staged decoder extraction
+(`provenance/03` leaves P-frames un-established); the fixture's
+`notes.md` Appendix C records the measured facts and the precise ask.
+
 **Round 447 — P-frame arithmetic-path beachhead + a new Table 18
 erratum.** Verify-first: the round-2 Extractor-03 staging (docs commit
 2026-08-10) was already consumed by round 439, so the round attacked

@@ -138,8 +138,6 @@ expected.yuv  3e24da31aa790e085c265dd596223af3d2f66862843ec7e77072a00d8f079cbb
 - §13.2.2 Huffman Decoding DC Values.
 - §13.3.3.2 Decoding Huffman AC Zero Runs.
 - §13.4 Decoding Huffman EOB and DC-0 Runs.
-</content>
-</invoke>
 
 ---
 
@@ -323,3 +321,84 @@ coupling unknown. The discriminating blocks are recorded in the
 round-447 report; the question is directly answerable by static
 extraction of the vendor decoder's DC-context selection and §14
 bookkeeping.
+
+## Appendix C — round 450 P-frame §10/§11.1 wire characterisation
+
+Round 450 attacked the open P-frame blocker with two black-box methods
+over the decode oracle (no third-party decoder source read; the oracle
+YUV is decoded *output data*):
+
+1. **Partition-1 single-bit-flip ownership.** Each bit of the first
+   P-frame's partition 1 was flipped in `input.flv`, the frame decoded
+   with the oracle binary, and the first macroblock whose pixels changed
+   recorded. This maps the mode/MV wire onto the MB grid and gives a
+   staircase of exact wire boundaries (the first bit whose flip perturbs
+   MB *m* or later), which any candidate reading must reproduce.
+2. **Whole-partition synthesis.** A semantically-identical partition 1
+   is re-encoded through the crate's own encoders (header tail, the
+   `VP6_ModeVq[1][13]` baseline reset the frame actually carries, no MV
+   updates, the coefficient-probability updates re-emitted current→
+   target), then an arbitrary script of BoolCoder `(probability, bit)`
+   symbols is appended and the original partition 2 spliced back on.
+   Feeding the result through the oracle and scoring by whole-frame
+   re-synchronisation (how many later, static macroblocks still match a
+   pure-static baseline decode) turns the oracle into a yes/no judge of
+   any hypothesised wire fragment: a scripted symbol sequence that
+   *exactly matches the vendor grammar's node probabilities* is read back
+   unchanged and keeps full sync, while any mismatch drifts the decode.
+
+### Established (all oracle-verified)
+
+* **The §10 mode-decode grammar is correct as the crate reads it.** A
+  scripted mode layer — root `B(probModeSame)` "same as last" bit, the
+  Figure-10 nine-node tree, the `ModeAvailability` neighbour walk, and
+  the `VP6_BaselineXmittedProbs` / `VP6_ModeVq` banks — re-synchronises
+  the *entire* frame (1580/1580 non-prefix macroblocks) when driven
+  through the synthesis harness. The mode wire is not the blocker.
+* **MB (0,31) is `CODE_INTER_PLUS_MV`, motion `(-1, 24)` ¼-pel.** The
+  mode decodes correctly from the real wire (the crate already reports
+  `InterPlusMv` there); the motion is pinned by pixel reconstruction
+  (unique horizontal, `|x| ≤ 1`, with the round-447 vertical band
+  `24..26` narrowed to 24 by the synthesis cross-checks) and is the
+  vector under which the new `pframe_mb31_inter_reconstruction_pixel_exact`
+  gate reconstructs the macroblock bit-exactly.
+
+### The open defect — §11.1 motion-vector component grammar
+
+The crate decodes MB (0,31)'s motion as `(-5, -73)`; the wire carries
+`(-1, 24)`. Two discriminated symptoms:
+
+* **Component order / axis.** The first-decoded MV component (read with
+  the `IsMvShortProbs[0]`/`ShortMvProbs[0]` bank) yields **24**, which is
+  the *vertical* motion — not the horizontal that §11.1's "When decoding
+  a motion vector the X component is decoded first" implies. The crate
+  assembles the first-decoded component as the x field, which transposes
+  the reconstructed vector.
+* **Short-vector magnitude.** From the coder state after the first
+  component, the second component's bits drive the printed Figure-11
+  short tree along `>3 = 0, >1 = 1, >2 = 0`, which the §11.1 pseudo-code
+  evaluates to magnitude **2**. The reconstruction admits only a
+  horizontal magnitude `≤ 1` at this macroblock, so the printed tree
+  over-reads by one. A search over short-tree node-probability
+  assignments recovers magnitude 1 (and MB (0,31)'s exact `(-1, 24)`)
+  under a specific remapping, but that single remapping does not extend
+  cleanly past the first row of content macroblocks, so the full
+  component grammar is **not** closed here.
+
+### DOCS-GAP — Extractor round 3 ask
+
+Settling the §11.1 wire from the spec plus this one fixture is
+under-determined; it is the `provenance/03` "P-frames un-established"
+item. A clean-room static extraction of the vendor decoder's motion-
+vector decode should record, as it did for the Huffman residual path:
+the exact order and axis of the two component decodes and how each maps
+to the reconstructed vector; the operative short-vector tree node
+structure and its `ShortMvProbs` node-to-index mapping (the printed
+Figure-11 reading over-reads by one on the arbitration datum); the
+long-vector bit order and the implicit-bit-3 rule as the decoder applies
+them; the §11 differential-reference selection (which neighbour supplies
+the predictor, and when a new vector is coded absolutely); and the §10
+`ModeAvailability` neighbour-walk length and same-reference gating that
+feeds `probXmitted` row selection. The mode grammar above can be treated
+as confirmed; the extraction need only settle §11.1 and the §10
+availability walk.
