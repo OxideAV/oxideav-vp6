@@ -6,6 +6,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-vp6/compare/v0.0.8...v0.0.9) - 2026-08-23
+
+### Fixed
+
+- fixture notes: round 447 P-frame pixel-arbitration appendix
+
+### Other
+
+- record the §11.1 wire under-determination root cause (letterbox)
+- P-frame MB (0,31) inter reconstruction gate + §11.1 wire characterisation
+- round 447 - P-frame beachhead, Table 18 erratum, sharpened wire asks
+- P-frame arithmetic-path gates + tolerant two-pass diagnostics
+- Table 18 extra-bit probabilities pair MSB-first (fixture-arbitrated)
+- coded_geometry accessor + CENTER/aspect-fit end-to-end driver gates
+- apply §9 output scaling end-to-end + downsampled-encode path
+- multistream keyframe encoder with retrained banks (the fixture keyframe's shape)
+- round 439 — whole-keyframe pixel-exact decode; P-frame wire semantics are the remaining conformance blocker
+- vp6f keyframe decodes pixel-exact end-to-end: §7.2.1 tie-break, keyframe carry-forward, §13/§14 corrections
+- clamp reference+delta sums to the §11 ±127 component bound
+- Hide internal plumbing behind #[doc(hidden)]; keep stable decode/encode surface
+- dc_pred + fixture notes: differential bit-flip probe map and the chroma DC tree/seed findings
+- §16 descales are `>> 16` as printed plus a final `(x + 8) >> 4` rounding add (fixture erratum)
+
 ### Added (clean-room round 450, 2026-08-24) — **P-frame inter reconstruction gate + §11.1 MV-wire characterisation**
 
 - **The first P-frame's first content macroblock, MB (0,31), now
