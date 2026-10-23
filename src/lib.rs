@@ -985,8 +985,9 @@ pub use inter_frame::{BorderedRef, ReferenceFrames};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use block_decode::{
+    AcProbBank, BLOCK_SIZE, BlockCoeffs, DequantizedBlock, ZeroRunProbBank,
     decode_block_coefficients, decode_block_coefficients_ctx, decode_block_to_raster,
-    dequantize_to_raster, AcProbBank, BlockCoeffs, DequantizedBlock, ZeroRunProbBank, BLOCK_SIZE,
+    dequantize_to_raster,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -994,38 +995,38 @@ pub use bool_coder::{BoolCoder, BoolEncoder};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use coeff_prob_update::{
-    decode_coefficient_prob_updates, encode_coefficient_prob_updates,
+    CoeffProbBanks, decode_coefficient_prob_updates, encode_coefficient_prob_updates,
     encode_coefficient_prob_updates_full, encode_coefficient_prob_updates_with_scan,
-    node_prob_update_representable, CoeffProbBanks,
+    node_prob_update_representable,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use dc_pred::{
-    average_both_neighbours, sign as dc_sign, DcPredictionContext, Neighbour, ReferenceBucket,
+    DcPredictionContext, Neighbour, ReferenceBucket, average_both_neighbours, sign as dc_sign,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use dct_decode::{
-    decode_ac_coefficient, decode_ac_token, decode_ac_zero_run, decode_dc, decode_dc_token,
-    decode_token_value, AcOutcome,
+    AcOutcome, decode_ac_coefficient, decode_ac_token, decode_ac_zero_run, decode_dc,
+    decode_dc_token, decode_token_value,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use dequant::{DequantContext, AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE};
+pub use dequant::{AC_QUANTIZATION_TABLE, DC_QUANTIZATION_TABLE, DequantContext};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use forward_dct::fdct_block;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use fourmv::{
+    FOURMV_BLOCK_MODES, FourMvMacroblock, NUM_FOURMV_BLOCK_MODES, NUM_LUMA_BLOCKS_PER_MB,
     average_four_away_from_zero, decode_fourmv_block_mode, decode_fourmv_block_modes,
-    derive_fourmv_chroma_mv, reconstruct_fourmv_macroblock, FourMvMacroblock, FOURMV_BLOCK_MODES,
-    NUM_FOURMV_BLOCK_MODES, NUM_LUMA_BLOCKS_PER_MB,
+    derive_fourmv_chroma_mv, reconstruct_fourmv_macroblock,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use frame_assembly::{
-    mb_cols_for, mb_rows_for, BLOCK_DIM, MB_LUMA_BLOCKS, MB_LUMA_BLOCK_OFFSETS, MB_LUMA_DIM,
+    BLOCK_DIM, MB_LUMA_BLOCK_OFFSETS, MB_LUMA_BLOCKS, MB_LUMA_DIM, mb_cols_for, mb_rows_for,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -1036,8 +1037,8 @@ pub use frame_header::{
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use huffman::{
-    codeword_for, create_huffman_tree, decode_symbol, tree_depth, HuffNode, HuffmanError,
-    INTERNAL_SYMBOL, NO_CHILD,
+    HuffNode, HuffmanError, INTERNAL_SYMBOL, NO_CHILD, codeword_for, create_huffman_tree,
+    decode_symbol, tree_depth,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -1045,28 +1046,28 @@ pub use idct::idct_block;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use inter::{
-    chroma_frac, fetch_prediction_block, fetch_prediction_block_clamped, inter_block_to_pixels,
-    luma_frac, predict_inter_block_subpel, reconstruct_inter_block, reconstruct_inter_macroblock,
-    whole_sample_aligned, FilterFamily, MvShift, PredictionFilterPolicy, ReconstructedMacroblock,
-    RefPlane,
+    FilterFamily, MvShift, PredictionFilterPolicy, ReconstructedMacroblock, RefPlane, chroma_frac,
+    fetch_prediction_block, fetch_prediction_block_clamped, inter_block_to_pixels, luma_frac,
+    predict_inter_block_subpel, reconstruct_inter_block, reconstruct_inter_macroblock,
+    whole_sample_aligned,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use inter_encode::{
-    encode_inter_frame, encode_inter_frame_me, encode_inter_frame_me_fourmv,
-    encode_inter_frame_me_fourmv_packet, encode_inter_frame_me_golden,
-    encode_inter_frame_me_golden_packet, encode_inter_frame_me_golden_packet_refresh,
-    encode_inter_frame_me_packet, encode_inter_frame_packet, FOURMV_SAD_MARGIN,
-    GOLDEN_SWITCH_PENALTY, ME_LAMBDA_SAD,
+    FOURMV_SAD_MARGIN, GOLDEN_SWITCH_PENALTY, ME_LAMBDA_SAD, encode_inter_frame,
+    encode_inter_frame_me, encode_inter_frame_me_fourmv, encode_inter_frame_me_fourmv_packet,
+    encode_inter_frame_me_golden, encode_inter_frame_me_golden_packet,
+    encode_inter_frame_me_golden_packet_refresh, encode_inter_frame_me_packet,
+    encode_inter_frame_packet,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use inter_frame::{decode_inter_frame, decode_inter_frame_with_refs, FilterConfig, InterProbs};
+pub use inter_frame::{FilterConfig, InterProbs, decode_inter_frame, decode_inter_frame_with_refs};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use interp::{
-    bicubic_block, bicubic_point, bilinear_block, bilinear_point, var_16_point, BICUBIC_FILTER_SET,
-    BICUBIC_VP61_INDEX, BILINEAR_CHROMA_FILTERS, BILINEAR_LUMA_FILTERS,
+    BICUBIC_FILTER_SET, BICUBIC_VP61_INDEX, BILINEAR_CHROMA_FILTERS, BILINEAR_LUMA_FILTERS,
+    bicubic_block, bicubic_point, bilinear_block, bilinear_point, var_16_point,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -1076,12 +1077,12 @@ pub use intra_encode::{
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use intra_frame::{decode_intra_frame, IntraProbs};
+pub use intra_frame::{IntraProbs, decode_intra_frame};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use loopfilter::{
-    bound, boundary_whole_pixel, boundary_x, boundary_y, filter_horizontal_boundary,
-    filter_vertical_boundary, prediction_loop_filter_function, PREDICTION_LOOP_FILTER_LIMIT_VALUES,
+    PREDICTION_LOOP_FILTER_LIMIT_VALUES, bound, boundary_whole_pixel, boundary_x, boundary_y,
+    filter_horizontal_boundary, filter_vertical_boundary, prediction_loop_filter_function,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -1092,47 +1093,46 @@ pub use mode_encode::{encode_mode, encode_mode_descend, encode_mode_from_probs};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use mode_prob_update::{
-    apply_prob_difference, decode_mode_prob_difference, decode_mode_prob_update_value,
-    update_mode_probs, update_mode_probs_for_situation, FIGURE9_NODE_PROBS, LONG_DIFFERENCE_BITS,
-    SET_NEW_BASELINE_PROBS_FLAG, SIGN_PROB, UPDATE_FLAG_PROB, VECTOR_UPDATES_PRESENT_FLAG,
-    WHICH_VECTOR_BITS,
+    FIGURE9_NODE_PROBS, LONG_DIFFERENCE_BITS, SET_NEW_BASELINE_PROBS_FLAG, SIGN_PROB,
+    UPDATE_FLAG_PROB, VECTOR_UPDATES_PRESENT_FLAG, WHICH_VECTOR_BITS, apply_prob_difference,
+    decode_mode_prob_difference, decode_mode_prob_update_value, update_mode_probs,
+    update_mode_probs_for_situation,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use modes::{
-    build_mode_decision_tree, build_probability_mode_same, mode_decision_tree_node_probability,
-    probability_mode_same, CodingMode, ModeAvailability, ModeDecisionTree, ModeDecisionTreeRow,
-    NEAR_MACROBLOCKS, NUM_CODING_MODES, NUM_MODE_DECISION_NODES, NUM_MODE_VQ_VECTORS,
-    NUM_PROBABILITY_SITUATIONS, PROB_XMITTED_ROW_LEN, VP6_BASELINE_XMITTED_PROBS, VP6_MODE_VQ,
+    CodingMode, ModeAvailability, ModeDecisionTree, ModeDecisionTreeRow, NEAR_MACROBLOCKS,
+    NUM_CODING_MODES, NUM_MODE_DECISION_NODES, NUM_MODE_VQ_VECTORS, NUM_PROBABILITY_SITUATIONS,
+    PROB_XMITTED_ROW_LEN, VP6_BASELINE_XMITTED_PROBS, VP6_MODE_VQ, build_mode_decision_tree,
+    build_probability_mode_same, mode_decision_tree_node_probability, probability_mode_same,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use mv_decode::{
-    decode_long_mv_magnitude, decode_mv_component, decode_mv_pair, decode_short_mv_magnitude,
-    MvProbs, IS_MV_SHORT_PROBS_DEFAULTS, MV_AXIS_X, MV_AXIS_Y, MV_SIGN_PROBS_DEFAULTS,
-    MV_SIZE_PROBS_DEFAULTS, NUM_MV_AXES, NUM_MV_SIZE_NODES, NUM_SHORT_MV_NODES,
-    SHORT_MV_PROBS_DEFAULTS,
+    IS_MV_SHORT_PROBS_DEFAULTS, MV_AXIS_X, MV_AXIS_Y, MV_SIGN_PROBS_DEFAULTS,
+    MV_SIZE_PROBS_DEFAULTS, MvProbs, NUM_MV_AXES, NUM_MV_SIZE_NODES, NUM_SHORT_MV_NODES,
+    SHORT_MV_PROBS_DEFAULTS, decode_long_mv_magnitude, decode_mv_component, decode_mv_pair,
+    decode_short_mv_magnitude,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use mv_diff::{
-    reconstruct_diff_mv, reconstruct_new_mv, reconstruct_new_mv_from_grid,
-    select_diff_reference_mv, select_diff_reference_mv_from_grid, DIFF_REFERENCE_OFFSETS,
+    DIFF_REFERENCE_OFFSETS, reconstruct_diff_mv, reconstruct_new_mv, reconstruct_new_mv_from_grid,
+    select_diff_reference_mv, select_diff_reference_mv_from_grid,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use mv_encode::{encode_mv_component, encode_mv_pair, MAX_MV_MAGNITUDE};
+pub use mv_encode::{MAX_MV_MAGNITUDE, encode_mv_component, encode_mv_pair};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use mv_prob_update::{
-    update_mv_probs, LONG_VECTOR_BIT_ORDER, UPDATE_IS_MV_SHORT_PROBABILITIES,
-    UPDATE_LONG_VECTOR_BIT_PROBABILITIES, UPDATE_MV_SIGN_PROBABILITIES,
-    UPDATE_SHORT_VECTOR_NODE_PROBABILITIES,
+    LONG_VECTOR_BIT_ORDER, UPDATE_IS_MV_SHORT_PROBABILITIES, UPDATE_LONG_VECTOR_BIT_PROBABILITIES,
+    UPDATE_MV_SIGN_PROBABILITIES, UPDATE_SHORT_VECTOR_NODE_PROBABILITIES, update_mv_probs,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use near_mv::{
-    resolve_near_mvs, resolve_near_mvs_from_grid, MotionVector, NearMvResolution, NeighbourMv,
+    MotionVector, NearMvResolution, NeighbourMv, resolve_near_mvs, resolve_near_mvs_from_grid,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -1142,7 +1142,7 @@ pub use prob_update::{
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use rate_control::{
-    select_quantiser_for_budget, select_quantiser_for_target_size, QuantiserChoice, MAX_Q, MIN_Q,
+    MAX_Q, MIN_Q, QuantiserChoice, select_quantiser_for_budget, select_quantiser_for_target_size,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -1153,21 +1153,21 @@ pub use reconstruct::{intra_block_to_pixels, reconstruct_intra_block};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use scaling::{
-    apply_output_scaling, resample_frame, resample_plane, FrameGeometry, OutputScaling,
-    ScalingMode, ScalingPlan, FRAGMENT_DIM, MACROBLOCK_DIM,
+    FRAGMENT_DIM, FrameGeometry, MACROBLOCK_DIM, OutputScaling, ScalingMode, ScalingPlan,
+    apply_output_scaling, resample_frame, resample_plane,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use scan::{
-    raster_to_zigzag_block, zigzag_to_raster_block, DEFAULT_SCAN_ORDER,
-    DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG,
+    DEFAULT_SCAN_ORDER, DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG, raster_to_zigzag_block,
+    zigzag_to_raster_block,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use scan_update::{
-    build_custom_scan_order, custom_scan_order_to_raster, decode_coeff_band_updates,
-    decode_scan_order_update, BandAssignment, COEFF_BAND_UPDATE_FLAG_PROBS,
-    CUSTOM_SCAN_BAND_RANGES, DEFAULT_BAND_ASSIGNMENT, NUM_AC_POSITIONS, NUM_SCAN_BANDS,
+    BandAssignment, COEFF_BAND_UPDATE_FLAG_PROBS, CUSTOM_SCAN_BAND_RANGES, DEFAULT_BAND_ASSIGNMENT,
+    NUM_AC_POSITIONS, NUM_SCAN_BANDS, build_custom_scan_order, custom_scan_order_to_raster,
+    decode_coeff_band_updates, decode_scan_order_update,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -1178,23 +1178,22 @@ pub use token_encode::{
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use tokens::{
-    baseline_ac_probs, baseline_dc_probs, dc_probs_to_node_contexts,
-    dct_token_bool_tree_to_huff_probs, AcBand, AcPlane, AcPrecContext, DcContext,
-    DcZeroContextTracker, DctToken, TreeNode, AC_UPDATE_PROBS, DC_NODE_EQS, NUM_AC_BANDS,
-    NUM_AC_PREC_CONTEXTS, NUM_DCT_TOKENS, NUM_DC_CONTEXTS, NUM_DC_NODE_EQS, NUM_PLANES,
-    NUM_TREE_NODES, VP6_DC_UPDATE_PROBS,
+    AC_UPDATE_PROBS, AcBand, AcPlane, AcPrecContext, DC_NODE_EQS, DcContext, DcZeroContextTracker,
+    DctToken, NUM_AC_BANDS, NUM_AC_PREC_CONTEXTS, NUM_DC_CONTEXTS, NUM_DC_NODE_EQS, NUM_DCT_TOKENS,
+    NUM_PLANES, NUM_TREE_NODES, TreeNode, VP6_DC_UPDATE_PROBS, baseline_ac_probs,
+    baseline_dc_probs, dc_probs_to_node_contexts, dct_token_bool_tree_to_huff_probs,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use umv::{
-    build_extended_buffer, extend_border, extended_height, extended_stride, origin_offset,
-    UMV_BORDER_SIZE,
+    UMV_BORDER_SIZE, build_extended_buffer, extend_border, extended_height, extended_stride,
+    origin_offset,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use zrl::{
-    build_zrl_huffman_tree, zrl_bool_tree_to_huff_probs, ZrlBand, ZrlNode, NUM_ZRL_BANDS,
-    NUM_ZRL_HUFF_PROBS, NUM_ZRL_NODES, ZERO_RUN_PROB_DEFAULTS, ZRL_UPDATE_PROBS,
+    NUM_ZRL_BANDS, NUM_ZRL_HUFF_PROBS, NUM_ZRL_NODES, ZERO_RUN_PROB_DEFAULTS, ZRL_UPDATE_PROBS,
+    ZrlBand, ZrlNode, build_zrl_huffman_tree, zrl_bool_tree_to_huff_probs,
 };
 
 /// Crate-local error type.

@@ -51,7 +51,7 @@
 //! behavioural P-frame trace.
 
 use oxideav_vp6::bool_coder::BoolCoder;
-use oxideav_vp6::coeff_prob_update::{decode_coefficient_prob_updates_keyframe, CoeffProbBanks};
+use oxideav_vp6::coeff_prob_update::{CoeffProbBanks, decode_coefficient_prob_updates_keyframe};
 use oxideav_vp6::decode_frame::Vp6Decoder;
 use oxideav_vp6::dequant::DequantContext;
 use oxideav_vp6::frame_header::{CodingProfile, Vp3Version, Vp6FrameHeader, Vp6HeaderTail};
@@ -528,7 +528,7 @@ fn pframe_first_content_mb_tokens_decode_exact() {
         b.coeffs
             .iter()
             .enumerate()
-            .filter(|(_, &v)| v != 0)
+            .filter(|&(_, &v)| v != 0)
             .map(|(i, &v)| (i, v))
             .collect()
     };
@@ -601,7 +601,7 @@ fn pframe_static_prefix_reconstructs_pixel_exact() {
     use oxideav_vp6::coeff_prob_update::decode_coefficient_prob_updates;
     use oxideav_vp6::coeff_source::CoeffSource;
     use oxideav_vp6::inter_frame::{
-        decode_inter_frame_multistream_traced, FilterConfig, InterProbs, ReferenceFrames,
+        FilterConfig, InterProbs, ReferenceFrames, decode_inter_frame_multistream_traced,
     };
     use oxideav_vp6::mode_prob_update::update_mode_probs;
     use oxideav_vp6::mv_prob_update::update_mv_probs;
@@ -739,8 +739,8 @@ fn pframe_mb31_inter_reconstruction_pixel_exact() {
     use oxideav_vp6::coeff_prob_update::decode_coefficient_prob_updates;
     use oxideav_vp6::coeff_source::CoeffSource;
     use oxideav_vp6::inter_frame::{
-        decode_inter_frame_multistream_pass2, ExternalMbMotion, FilterConfig, InterProbs,
-        ReferenceFrames,
+        ExternalMbMotion, FilterConfig, InterProbs, ReferenceFrames,
+        decode_inter_frame_multistream_pass2,
     };
     use oxideav_vp6::mode_prob_update::update_mode_probs;
     use oxideav_vp6::modes::CodingMode;

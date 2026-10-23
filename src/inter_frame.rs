@@ -61,6 +61,7 @@
 //! clean-room errata at `docs/video/vp6/vp6-errata-and-clarifications.md`.
 //! No external library code was consulted.
 
+use crate::Error;
 use crate::block_decode::BLOCK_SIZE;
 use crate::coeff_source::CoeffSource;
 use crate::dc_pred::{DcPredictionContext, Neighbour, ReferenceBucket};
@@ -68,19 +69,18 @@ use crate::dequant::DequantContext;
 use crate::frame_assembly::Frame;
 use crate::idct::idct_block;
 use crate::inter::{
-    predict_inter_block_subpel, reconstruct_inter_block, MvShift, PredictionFilterPolicy,
+    MvShift, PredictionFilterPolicy, predict_inter_block_subpel, reconstruct_inter_block,
 };
 use crate::intra_frame::IntraProbs;
 use crate::mode_decode::decode_macroblock_modes;
 use crate::modes::{
     CodingMode, ModeAvailability, MvSource, NUM_PROBABILITY_SITUATIONS, PROB_XMITTED_ROW_LEN,
 };
-use crate::mv_decode::{reconstruct_macroblock_mv, MvProbs, NUM_MV_AXES};
-use crate::near_mv::{resolve_near_mvs, MotionVector, NeighbourMv};
+use crate::mv_decode::{MvProbs, NUM_MV_AXES, reconstruct_macroblock_mv};
+use crate::near_mv::{MotionVector, NeighbourMv, resolve_near_mvs};
 use crate::reconstruct::intra_block_to_pixels;
 use crate::tokens::{AcPlane, DcContext};
 use crate::umv::build_extended_buffer;
-use crate::Error;
 
 /// A §11.5-UMV-bordered reference frame: the previous-frame or golden-
 /// frame reconstruction with each plane extended by 48 samples on every
@@ -437,7 +437,7 @@ fn decode_block(
             .coeffs
             .iter()
             .enumerate()
-            .filter(|(_, &v)| v != 0)
+            .filter(|&(_, &v)| v != 0)
             .map(|(i, &v)| (i, v))
             .collect();
         eprintln!("TRACE blk plane={plane:?} ctx={dc_context:?} scan_nz={nz:?}");

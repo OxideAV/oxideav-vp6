@@ -39,8 +39,9 @@
 
 use crate::bool_coder::BoolEncoder;
 use crate::modes::{
-    mode_decision_tree_node_probability, probability_mode_same, CodingMode, ModeAvailability,
-    ModeDecisionTreeRow, NUM_MODE_DECISION_NODES, NUM_PROBABILITY_SITUATIONS, PROB_XMITTED_ROW_LEN,
+    CodingMode, ModeAvailability, ModeDecisionTreeRow, NUM_MODE_DECISION_NODES,
+    NUM_PROBABILITY_SITUATIONS, PROB_XMITTED_ROW_LEN, mode_decision_tree_node_probability,
+    probability_mode_same,
 };
 
 /// The node-bit path the Figure 10 descent takes to reach `mode`, as a
@@ -148,7 +149,7 @@ mod tests {
     use super::*;
     use crate::bool_coder::BoolCoder;
     use crate::mode_decode::{decode_mode, decode_mode_from_probs, descend_mode_tree};
-    use crate::modes::{build_mode_decision_tree, VP6_BASELINE_XMITTED_PROBS};
+    use crate::modes::{VP6_BASELINE_XMITTED_PROBS, build_mode_decision_tree};
 
     /// Encode then decode a single mode via the prebuilt-tree entry
     /// points; the decoder must recover exactly the mode that was

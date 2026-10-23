@@ -660,8 +660,10 @@ mod tests {
             HuffmanError::LengthMismatch.to_string(),
             "symbols and probabilities must be the same length"
         );
-        assert!(HuffmanError::InvalidProbability
-            .to_string()
-            .contains("1..=255"));
+        assert!(
+            HuffmanError::InvalidProbability
+                .to_string()
+                .contains("1..=255")
+        );
     }
 }

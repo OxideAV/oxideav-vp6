@@ -78,14 +78,14 @@
 
 use oxideav_core::bits::BitWriter;
 
-use crate::block_decode::{AcProbBank, BlockCoeffs, ZeroRunProbBank, BLOCK_SIZE};
+use crate::Error;
+use crate::block_decode::{AcProbBank, BLOCK_SIZE, BlockCoeffs, ZeroRunProbBank};
 use crate::coeff_prob_update::CoeffProbBanks;
-use crate::huffman::{codeword_for, create_huffman_tree, HuffNode};
+use crate::huffman::{HuffNode, codeword_for, create_huffman_tree};
 use crate::raw_bits::RawBitReader;
 use crate::token_encode::token_for_magnitude;
 use crate::tokens::{AcPlane, AcPrecContext, DctToken, NUM_PLANES, NUM_TREE_NODES};
-use crate::zrl::{ZrlBand, NUM_ZRL_BANDS, NUM_ZRL_HUFF_PROBS};
-use crate::Error;
+use crate::zrl::{NUM_ZRL_BANDS, NUM_ZRL_HUFF_PROBS, ZrlBand};
 
 /// Number of Table 36 Huffman AC bands (coefficient 1 / 2–4 / 5–10 /
 /// 11–63) — the §13.3.2 four-band split, versus the arithmetic coder's
@@ -126,11 +126,7 @@ pub const fn huff_ac_band(coeff_index: usize) -> Option<usize> {
 /// position its siblings allow.
 #[inline]
 fn clamp_prob(p: u8) -> u8 {
-    if p == 0 {
-        1
-    } else {
-        p
-    }
+    if p == 0 { 1 } else { p }
 }
 
 /// One §7.2 Huffman tree plus its precomputed encode-side codewords.

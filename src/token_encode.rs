@@ -26,10 +26,10 @@
 //! (#67, the magnitude-only probability slice). No external library code
 //! was consulted.
 
-use crate::block_decode::{AcProbBank, ZeroRunProbBank, BLOCK_SIZE};
+use crate::block_decode::{AcProbBank, BLOCK_SIZE, ZeroRunProbBank};
 use crate::bool_coder::BoolEncoder;
-use crate::tokens::{AcBand, AcPlane, AcPrecContext, DctToken, TreeNode, NUM_TREE_NODES};
-use crate::zrl::{ZrlBand, ZrlNode, NUM_ZRL_NODES};
+use crate::tokens::{AcBand, AcPlane, AcPrecContext, DctToken, NUM_TREE_NODES, TreeNode};
+use crate::zrl::{NUM_ZRL_NODES, ZrlBand, ZrlNode};
 
 /// Classify a signed coefficient magnitude into the value-carrying
 /// [`DctToken`] whose `Min..=Max` range (§13 Table 18) contains it.

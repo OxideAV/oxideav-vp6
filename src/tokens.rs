@@ -473,8 +473,8 @@ pub const fn baseline_dc_probs() -> [[u8; NUM_TREE_NODES]; NUM_PLANES] {
 /// keyframe to each subsequent interframe and is updated in-place by
 /// the §13.3 Table 31–35 BoolCoder bitstream (deferred).
 #[inline]
-pub const fn baseline_ac_probs(
-) -> [[[[u8; NUM_TREE_NODES]; NUM_AC_BANDS]; NUM_AC_PREC_CONTEXTS]; NUM_PLANES] {
+pub const fn baseline_ac_probs()
+-> [[[[u8; NUM_TREE_NODES]; NUM_AC_BANDS]; NUM_AC_PREC_CONTEXTS]; NUM_PLANES] {
     [[[[128; NUM_TREE_NODES]; NUM_AC_BANDS]; NUM_AC_PREC_CONTEXTS]; NUM_PLANES]
 }
 
@@ -1887,7 +1887,7 @@ mod tests {
         // col 1: left non-zero, above absent → exactly one.
         assert_eq!(t.context_for(), DcContext::OneNonZero);
         t.record(false); // block 1 had zero DC
-                         // col 2: left zero, above absent → both zero.
+        // col 2: left zero, above absent → both zero.
         assert_eq!(t.context_for(), DcContext::BothZero);
         t.record(true);
     }
@@ -1903,7 +1903,7 @@ mod tests {
         // → exactly one.
         assert_eq!(t.context_for(), DcContext::OneNonZero);
         t.record(false); // block at row1 col0 had zero DC
-                         // Row 1, col 1: left zero, above (col 1) was non-zero → one.
+        // Row 1, col 1: left zero, above (col 1) was non-zero → one.
         assert_eq!(t.context_for(), DcContext::OneNonZero);
         t.record(true);
     }
@@ -1917,7 +1917,7 @@ mod tests {
         // Row 1, col 0: above non-zero, no left → one.
         assert_eq!(t.context_for(), DcContext::OneNonZero);
         t.record(true); // row1 col0 non-zero
-                        // Row 1, col 1: left non-zero AND above (col1) non-zero → both.
+        // Row 1, col 1: left non-zero AND above (col1) non-zero → both.
         assert_eq!(t.context_for(), DcContext::BothNonZero);
         t.record(true);
     }

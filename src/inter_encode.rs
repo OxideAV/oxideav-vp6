@@ -51,22 +51,22 @@
 //! §9–§17) plus the in-tree errata. No external library code was
 //! consulted.
 
+use crate::Error;
 use crate::bool_coder::BoolEncoder;
 use crate::dc_pred::{DcPredictionContext, Neighbour, ReferenceBucket};
 use crate::dequant::DequantContext;
 use crate::forward_dct::fdct_block;
-use crate::frame_assembly::{Frame, BLOCK_DIM};
-use crate::inter::{predict_inter_block_subpel, MvShift};
+use crate::frame_assembly::{BLOCK_DIM, Frame};
+use crate::inter::{MvShift, predict_inter_block_subpel};
 use crate::inter_frame::{BorderedRef, FilterConfig, InterProbs};
 use crate::mode_encode::encode_mode_from_probs;
 use crate::modes::{CodingMode, ModeAvailability};
 use crate::mv_diff::select_diff_reference_mv_from_grid;
-use crate::mv_encode::{encode_mv_pair, MAX_MV_MAGNITUDE};
-use crate::near_mv::{resolve_near_mvs, MotionVector, NearMvResolution, NeighbourMv};
+use crate::mv_encode::{MAX_MV_MAGNITUDE, encode_mv_pair};
+use crate::near_mv::{MotionVector, NearMvResolution, NeighbourMv, resolve_near_mvs};
 use crate::scan::DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG;
 use crate::token_encode::encode_block_coefficients;
 use crate::tokens::{AcPlane, DcContext};
-use crate::Error;
 
 /// Emit the three §8 Figure 1 pre-data sub-streams a conformant inter
 /// frame carries between the §9 InterHeader tail and the per-macroblock
@@ -908,15 +908,15 @@ fn decide_ref_mode(inp: &MbModeInputs, is_golden: bool) -> RefChoice {
     // Candidate implicit-MV options: (mode, mv, sad). Zero is always
     // available; Nearest/Near only when the §10 walk found them.
     let mut best_implicit = (m_zero, MotionVector::ZERO, inp.zero_sad);
-    if let (Some(mv), Some(sad)) = (inp.nearest_mv, inp.nearest_sad) {
-        if sad < best_implicit.2 {
-            best_implicit = (m_nearest, mv, sad);
-        }
+    if let (Some(mv), Some(sad)) = (inp.nearest_mv, inp.nearest_sad)
+        && sad < best_implicit.2
+    {
+        best_implicit = (m_nearest, mv, sad);
     }
-    if let (Some(mv), Some(sad)) = (inp.near_mv, inp.near_sad) {
-        if sad < best_implicit.2 {
-            best_implicit = (m_near, mv, sad);
-        }
+    if let (Some(mv), Some(sad)) = (inp.near_mv, inp.near_sad)
+        && sad < best_implicit.2
+    {
+        best_implicit = (m_near, mv, sad);
     }
 
     // A New-MV is worth its bits only if it beats the best implicit option by
@@ -1973,8 +1973,8 @@ pub fn encode_inter_frame_me_fourmv_packet(
     header.write_u32(1, 1); // FrameType = 1 (inter)
     header.write_u32(dct_q_mask as u32, 6);
     header.write_u32(0, 1); // MultiStream = 0
-                            // Table 3 Buff2Offset R(16): present because the carried profile is
-                            // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
+    // Table 3 Buff2Offset R(16): present because the carried profile is
+    // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
     header.write_u32(0, 16);
     let raw_prefix = header.finish();
 
@@ -2075,8 +2075,8 @@ pub fn encode_inter_frame_packet(
     header.write_u32(1, 1); // FrameType = 1 (inter)
     header.write_u32(dct_q_mask as u32, 6);
     header.write_u32(0, 1); // MultiStream = 0
-                            // Table 3 Buff2Offset R(16): present because the carried profile is
-                            // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
+    // Table 3 Buff2Offset R(16): present because the carried profile is
+    // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
     header.write_u32(0, 16);
     let raw_prefix = header.finish();
 
@@ -2136,8 +2136,8 @@ pub fn encode_inter_frame_me_packet(
     header.write_u32(1, 1); // FrameType = 1 (inter)
     header.write_u32(dct_q_mask as u32, 6);
     header.write_u32(0, 1); // MultiStream = 0
-                            // Table 3 Buff2Offset R(16): present because the carried profile is
-                            // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
+    // Table 3 Buff2Offset R(16): present because the carried profile is
+    // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
     header.write_u32(0, 16);
     let raw_prefix = header.finish();
 
@@ -2223,8 +2223,8 @@ pub fn encode_inter_frame_me_golden_packet_refresh(
     header.write_u32(1, 1); // FrameType = 1 (inter)
     header.write_u32(dct_q_mask as u32, 6);
     header.write_u32(0, 1); // MultiStream = 0
-                            // Table 3 Buff2Offset R(16): present because the carried profile is
-                            // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
+    // Table 3 Buff2Offset R(16): present because the carried profile is
+    // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
     header.write_u32(0, 16);
     let raw_prefix = header.finish();
 
@@ -2292,8 +2292,8 @@ pub fn encode_inter_frame_packet_with_banks(
     header.write_u32(1, 1); // FrameType = 1 (inter)
     header.write_u32(dct_q_mask as u32, 6);
     header.write_u32(0, 1); // MultiStream = 0
-                            // Table 3 Buff2Offset R(16): present because the carried profile is
-                            // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
+    // Table 3 Buff2Offset R(16): present because the carried profile is
+    // Simple (`MultiStream || SIMPLE_PROFILE`); 0 with a single partition.
     header.write_u32(0, 16);
     let raw_prefix = header.finish();
 
@@ -2537,7 +2537,7 @@ mod tests {
     use super::*;
     use crate::bool_coder::BoolCoder;
     use crate::inter::{FilterFamily, PredictionFilterPolicy};
-    use crate::inter_frame::{decode_inter_frame, InterProbs};
+    use crate::inter_frame::{InterProbs, decode_inter_frame};
     use crate::intra_frame::IntraProbs;
     use crate::scan::DEFAULT_SCAN_ORDER;
 
@@ -2789,7 +2789,7 @@ mod tests {
     #[test]
     fn keyframe_then_pframe_gop_round_trips() {
         use crate::frame_header::{Vp6FrameHeader, Vp6HeaderTail};
-        use crate::inter_frame::{decode_inter_frame_with_refs, ReferenceFrames};
+        use crate::inter_frame::{ReferenceFrames, decode_inter_frame_with_refs};
         use crate::intra_frame::decode_intra_frame;
 
         let q = 40u8;
@@ -2864,7 +2864,7 @@ mod tests {
     #[test]
     fn gop_unchanged_pframe_is_exact() {
         use crate::frame_header::{Vp6FrameHeader, Vp6HeaderTail};
-        use crate::inter_frame::{decode_inter_frame_with_refs, ReferenceFrames};
+        use crate::inter_frame::{ReferenceFrames, decode_inter_frame_with_refs};
         use crate::intra_frame::decode_intra_frame;
 
         let q = 16u8;
@@ -2925,7 +2925,7 @@ mod tests {
     #[test]
     fn gop_filter_config_from_header_round_trips() {
         use crate::frame_header::{Vp6FrameHeader, Vp6HeaderTail};
-        use crate::inter_frame::{decode_inter_frame_with_refs, ReferenceFrames};
+        use crate::inter_frame::{ReferenceFrames, decode_inter_frame_with_refs};
         use crate::intra_frame::decode_intra_frame;
 
         let q = 24u8;
@@ -3091,7 +3091,7 @@ mod tests {
     #[test]
     fn me_keyframe_then_pframe_gop_round_trips() {
         use crate::frame_header::{Vp6FrameHeader, Vp6HeaderTail};
-        use crate::inter_frame::{decode_inter_frame_with_refs, ReferenceFrames};
+        use crate::inter_frame::{ReferenceFrames, decode_inter_frame_with_refs};
         use crate::intra_frame::decode_intra_frame;
 
         let q = 32u8;
@@ -3374,7 +3374,7 @@ mod tests {
     /// real §4 reference bookkeeping.
     #[test]
     fn golden_gop_recovers_from_golden_reference() {
-        use crate::inter_frame::{decode_inter_frame_with_refs, ReferenceFrames};
+        use crate::inter_frame::{ReferenceFrames, decode_inter_frame_with_refs};
 
         let q = 24u8;
         let key = gradient(6, 6);

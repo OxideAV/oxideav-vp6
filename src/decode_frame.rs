@@ -76,17 +76,17 @@
 //! (`docs/video/vp6/vp6_format.pdf` §4 / §9–§17 plus the in-tree errata).
 //! No external library code was consulted.
 
+use crate::Error;
 use crate::bool_coder::BoolCoder;
 use crate::coeff_prob_update::{
-    decode_coefficient_prob_updates, decode_coefficient_prob_updates_keyframe, CoeffProbBanks,
+    CoeffProbBanks, decode_coefficient_prob_updates, decode_coefficient_prob_updates_keyframe,
 };
 use crate::coeff_source::CoeffSource;
 use crate::frame_assembly::Frame;
 use crate::frame_header::{CodingProfile, Vp3Version, Vp6FrameHeader, Vp6HeaderTail};
 use crate::huff_coeff::HuffmanCoeffTables;
-use crate::inter_frame::{decode_inter_frame_with_refs, FilterConfig, InterProbs, ReferenceFrames};
+use crate::inter_frame::{FilterConfig, InterProbs, ReferenceFrames, decode_inter_frame_with_refs};
 use crate::intra_frame::decode_intra_frame_from_source;
-use crate::Error;
 
 /// A stateful VP6 frame decoder: feed it whole compressed frames in
 /// stream order and it produces reconstructed [`Frame`]s, carrying the
@@ -1125,7 +1125,7 @@ mod tests {
     fn coeff_banks_persist_from_keyframe_into_pframes() {
         use crate::coeff_prob_update::CoeffProbBanks;
         use crate::intra_encode::encode_intra_frame_with_banks;
-        use crate::mv_decode::{MvProbs, MV_AXIS_X, MV_AXIS_Y};
+        use crate::mv_decode::{MV_AXIS_X, MV_AXIS_Y, MvProbs};
 
         let src = pattern_frame(4, 4);
         let q = 40;
@@ -1353,7 +1353,7 @@ mod tests {
     #[test]
     fn downsampled_encode_reconstructs_source_through_scaled_decode() {
         use crate::intra_encode::encode_intra_frame_scaled;
-        use crate::scaling::{resample_frame, FrameGeometry, OutputScaling, ScalingMode};
+        use crate::scaling::{FrameGeometry, OutputScaling, ScalingMode, resample_frame};
 
         // A smooth 8x8-block (4x4 MB, 64x64) gradient source — smooth
         // content survives the down/up resample cycle with little loss.

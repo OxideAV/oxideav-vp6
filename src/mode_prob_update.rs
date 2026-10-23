@@ -97,11 +97,11 @@
 //! traversal: it merely prepares the `probXmitted` table the traversal
 //! later consults.
 
+use crate::Error;
 use crate::bool_coder::BoolCoder;
 use crate::modes::{
     ModeAvailability, NUM_PROBABILITY_SITUATIONS, PROB_XMITTED_ROW_LEN, VP6_MODE_VQ,
 };
-use crate::Error;
 
 /// Flag probability for `SetNewBaselineProbs` (Table 7: `B(174)`).
 pub const SET_NEW_BASELINE_PROBS_FLAG: u8 = 174;

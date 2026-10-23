@@ -43,7 +43,8 @@
 //! clean-room errata at `docs/video/vp6/vp6-errata-and-clarifications.md`.
 //! No external library code was consulted.
 
-use crate::block_decode::{AcProbBank, ZeroRunProbBank, BLOCK_SIZE};
+use crate::Error;
+use crate::block_decode::{AcProbBank, BLOCK_SIZE, ZeroRunProbBank};
 use crate::coeff_source::CoeffSource;
 use crate::dc_pred::{DcPredictionContext, Neighbour, ReferenceBucket};
 use crate::dequant::DequantContext;
@@ -51,9 +52,8 @@ use crate::frame_assembly::Frame;
 use crate::idct::idct_block;
 use crate::reconstruct::intra_block_to_pixels;
 use crate::tokens::{
-    dc_probs_to_node_contexts, AcPlane, DcContext, NUM_DC_CONTEXTS, NUM_PLANES, NUM_TREE_NODES,
+    AcPlane, DcContext, NUM_DC_CONTEXTS, NUM_PLANES, NUM_TREE_NODES, dc_probs_to_node_contexts,
 };
-use crate::Error;
 
 /// A per-plane record of each decoded block's coded DC coefficient and
 /// its zero-ness, indexed by `(block_row, block_col)` in the plane's

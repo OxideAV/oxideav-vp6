@@ -515,8 +515,8 @@ pub fn reconstruct_inter_macroblock(
 // ===================================================================
 
 use crate::interp::{
-    bicubic_block, bilinear_block, var_16_point_clamped, BICUBIC_FILTER_SET,
-    BILINEAR_CHROMA_FILTERS, BILINEAR_LUMA_FILTERS,
+    BICUBIC_FILTER_SET, BILINEAR_CHROMA_FILTERS, BILINEAR_LUMA_FILTERS, bicubic_block,
+    bilinear_block, var_16_point_clamped,
 };
 use crate::loopfilter::{
     boundary_whole_pixel, boundary_x, boundary_y, filter_horizontal_boundary,
@@ -729,39 +729,39 @@ pub fn predict_inter_block_subpel(
     const MARGIN: i32 = 3;
     const WIN: usize = 8 + 2 * MARGIN as usize; // 14×14 working window.
 
-    if let Some(qi) = loop_filter_qi {
-        if mv_x != 0 || mv_y != 0 {
-            // §11.3 derives the boundary offsets from a *round-toward-zero*
-            // whole-pixel reduction of the MV (distinct from §11.4's
-            // arithmetic-shift floor `whole_dx`/`whole_dy` used for the
-            // source position and variance window). For negative MV
-            // components the two differ, and feeding the floor value here
-            // would straddle a boundary the spec leaves unfiltered.
-            let bx = boundary_x(boundary_whole_pixel(mv_x, shift.bits()));
-            let by = boundary_y(boundary_whole_pixel(mv_y, shift.bits()));
-            if bx != 0 || by != 0 {
-                // Copy the WIN×WIN window centred so the block's top-left
-                // (src_pos) lands at window offset (MARGIN, MARGIN).
-                let mut win = [0u8; WIN * WIN];
-                let win_origin = MARGIN as usize * WIN + MARGIN as usize;
-                for r in 0..WIN as i32 {
-                    let sr = src_pos as i32 + (r - MARGIN) * ref_stride as i32;
-                    for c in 0..WIN as i32 {
-                        let s = (sr + (c - MARGIN)) as usize;
-                        win[(r * WIN as i32 + c) as usize] = ref_buf[s];
-                    }
+    if let Some(qi) = loop_filter_qi
+        && (mv_x != 0 || mv_y != 0)
+    {
+        // §11.3 derives the boundary offsets from a *round-toward-zero*
+        // whole-pixel reduction of the MV (distinct from §11.4's
+        // arithmetic-shift floor `whole_dx`/`whole_dy` used for the
+        // source position and variance window). For negative MV
+        // components the two differ, and feeding the floor value here
+        // would straddle a boundary the spec leaves unfiltered.
+        let bx = boundary_x(boundary_whole_pixel(mv_x, shift.bits()));
+        let by = boundary_y(boundary_whole_pixel(mv_y, shift.bits()));
+        if bx != 0 || by != 0 {
+            // Copy the WIN×WIN window centred so the block's top-left
+            // (src_pos) lands at window offset (MARGIN, MARGIN).
+            let mut win = [0u8; WIN * WIN];
+            let win_origin = MARGIN as usize * WIN + MARGIN as usize;
+            for r in 0..WIN as i32 {
+                let sr = src_pos as i32 + (r - MARGIN) * ref_stride as i32;
+                for c in 0..WIN as i32 {
+                    let s = (sr + (c - MARGIN)) as usize;
+                    win[(r * WIN as i32 + c) as usize] = ref_buf[s];
                 }
-                // Apply the deblocking filter at the straddled
-                // boundaries inside the window's 8×8 block region.
-                if bx != 0 {
-                    filter_vertical_boundary(&mut win, win_origin, WIN, bx as usize, 0, 8, qi);
-                }
-                if by != 0 {
-                    filter_horizontal_boundary(&mut win, win_origin, WIN, by as usize, 0, 8, qi);
-                }
-                interpolate_subpel(&win, WIN, win_origin, frac_x, frac_y, shift, family, pred);
-                return;
             }
+            // Apply the deblocking filter at the straddled
+            // boundaries inside the window's 8×8 block region.
+            if bx != 0 {
+                filter_vertical_boundary(&mut win, win_origin, WIN, bx as usize, 0, 8, qi);
+            }
+            if by != 0 {
+                filter_horizontal_boundary(&mut win, win_origin, WIN, by as usize, 0, 8, qi);
+            }
+            interpolate_subpel(&win, WIN, win_origin, frac_x, frac_y, shift, family, pred);
+            return;
         }
     }
 
@@ -981,7 +981,7 @@ mod tests {
         }
         let base = 5 * stride + 5;
         let (mvx, mvy) = (8i32, 12i32); // ¼-pixel units, both whole-pixel.
-                                        // Phase must be zero for this to be a §17.3 (not §17.4) case.
+        // Phase must be zero for this to be a §17.3 (not §17.4) case.
         assert_eq!(luma_frac(mvx), 0);
         assert_eq!(luma_frac(mvy), 0);
         let dx = whole_sample_aligned(mvx, MvShift::Luma);
@@ -1151,7 +1151,7 @@ mod tests {
     /// `flat + residual` clipped.
     #[test]
     fn fractional_vector_uses_interp_output() {
-        use crate::interp::{bilinear_block, BILINEAR_LUMA_FILTERS};
+        use crate::interp::{BILINEAR_LUMA_FILTERS, bilinear_block};
 
         let stride = 16usize;
         let src = [120u8; 16 * 16];

@@ -85,13 +85,13 @@
 //!
 //! No third-party VP6 source has been consulted at any stage.
 
-use crate::dct_decode::{decode_ac_coefficient, decode_ac_zero_run, decode_dc, AcOutcome};
+use crate::dct_decode::{AcOutcome, decode_ac_coefficient, decode_ac_zero_run, decode_dc};
 use crate::dequant::DequantContext;
 use crate::tokens::{
     AcBand, AcPlane, AcPrecContext, DcContext, NUM_AC_BANDS, NUM_AC_PREC_CONTEXTS, NUM_DC_CONTEXTS,
     NUM_PLANES, NUM_TREE_NODES,
 };
-use crate::zrl::{ZrlBand, NUM_ZRL_BANDS, NUM_ZRL_NODES};
+use crate::zrl::{NUM_ZRL_BANDS, NUM_ZRL_NODES, ZrlBand};
 use crate::{BoolCoder, Error};
 
 /// The number of DCT coefficients in an 8x8 block — the §13.3.1
@@ -345,10 +345,10 @@ pub fn decode_block_to_raster(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::{zigzag_to_raster_block, DEFAULT_SCAN_ORDER};
+    use crate::scan::{DEFAULT_SCAN_ORDER, zigzag_to_raster_block};
     use crate::scan_update::{build_custom_scan_order, custom_scan_order_to_raster};
     use crate::tokens::{
-        baseline_ac_probs, baseline_dc_probs, dc_probs_to_node_contexts, TreeNode,
+        TreeNode, baseline_ac_probs, baseline_dc_probs, dc_probs_to_node_contexts,
     };
     use crate::zrl::ZERO_RUN_PROB_DEFAULTS;
 

@@ -731,9 +731,9 @@ pub fn mode_decision_tree_node_probability(
     let denom = 1 + branch_sum;
     let num = 255u32 * left_sum;
     let p = 1 + num / denom; // truncating int division per spec pseudocode
-                             // Clip to 1..=255 (BoolCoder probabilities live in this range per
-                             // §7). The +1 floor handles the lower bound; cap defensively for
-                             // the upper.
+    // Clip to 1..=255 (BoolCoder probabilities live in this range per
+    // §7). The +1 floor handles the lower bound; cap defensively for
+    // the upper.
     p.min(255) as u8
 }
 

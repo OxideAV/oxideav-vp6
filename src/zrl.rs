@@ -80,7 +80,7 @@
 //! (On2 Technologies, document version 1.02, August 2006). No
 //! third-party VP6 implementation has been consulted.
 
-use crate::huffman::{create_huffman_tree, HuffNode, HuffmanError};
+use crate::huffman::{HuffNode, HuffmanError, create_huffman_tree};
 
 /// Number of ZRL bands (Table 37): two — runs starting at AC
 /// coefficient positions 1–5 (band 0) and 6–63 (band 1).
@@ -435,7 +435,7 @@ pub fn build_zrl_huffman_tree(node_prob: &[u8; 8]) -> Result<Vec<HuffNode>, Huff
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::huffman::{tree_depth, INTERNAL_SYMBOL, NO_CHILD};
+    use crate::huffman::{INTERNAL_SYMBOL, NO_CHILD, tree_depth};
 
     // -------- ZrlBand enum surface --------
 
@@ -560,7 +560,9 @@ mod tests {
         // Spec listing row 0, verbatim.
         assert_eq!(
             ZERO_RUN_PROB_DEFAULTS[0],
-            [198, 197, 196, 146, 198, 204, 169, 142, 130, 136, 149, 149, 191, 249,]
+            [
+                198, 197, 196, 146, 198, 204, 169, 142, 130, 136, 149, 149, 191, 249,
+            ]
         );
     }
 
@@ -569,7 +571,9 @@ mod tests {
         // Spec listing row 1, verbatim.
         assert_eq!(
             ZERO_RUN_PROB_DEFAULTS[1],
-            [135, 201, 181, 154, 98, 117, 132, 126, 146, 169, 184, 240, 246, 254,]
+            [
+                135, 201, 181, 154, 98, 117, 132, 126, 146, 169, 184, 240, 246, 254,
+            ]
         );
     }
 
@@ -585,7 +589,9 @@ mod tests {
     fn zrl_update_probs_first_row_verbatim_values() {
         assert_eq!(
             ZRL_UPDATE_PROBS[0],
-            [219, 246, 238, 249, 232, 239, 249, 255, 248, 253, 239, 244, 241, 248,]
+            [
+                219, 246, 238, 249, 232, 239, 249, 255, 248, 253, 239, 244, 241, 248,
+            ]
         );
     }
 
@@ -593,7 +599,9 @@ mod tests {
     fn zrl_update_probs_second_row_verbatim_values() {
         assert_eq!(
             ZRL_UPDATE_PROBS[1],
-            [198, 232, 251, 253, 219, 241, 253, 255, 248, 249, 244, 238, 251, 255,]
+            [
+                198, 232, 251, 253, 219, 241, 253, 255, 248, 249, 244, 238, 251, 255,
+            ]
         );
     }
 

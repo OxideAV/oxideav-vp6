@@ -47,8 +47,8 @@
 //!
 //! No third-party VP6 source has been consulted at any stage.
 
-use crate::tokens::{AcPrecContext, DctToken, TreeNode, NUM_TREE_NODES};
-use crate::zrl::{ZrlBand, ZrlNode, NUM_ZRL_NODES};
+use crate::tokens::{AcPrecContext, DctToken, NUM_TREE_NODES, TreeNode};
+use crate::zrl::{NUM_ZRL_NODES, ZrlBand, ZrlNode};
 use crate::{BoolCoder, Error};
 
 /// Read the magnitude-bit suffix and sign bit for a category token and
@@ -568,10 +568,10 @@ pub fn decode_ac_zero_run(
     probs: &[u8; NUM_ZRL_NODES],
 ) -> Result<u32, Error> {
     let _ = band; // The band is the caller's index into `ZeroRunProbs`;
-                  // the row is already passed in via `probs`. Retained
-                  // in the signature to keep the §13.3.3.1 listing's
-                  // `ZeroRunProbPtr = pbi->ZeroRunProbs[ZrlBand[pos]]`
-                  // structure visible in callers.
+    // the row is already passed in via `probs`. Retained
+    // in the signature to keep the §13.3.3.1 listing's
+    // `ZeroRunProbPtr = pbi->ZeroRunProbs[ZrlBand[pos]]`
+    // structure visible in callers.
     let p = |node: ZrlNode| probs[node.index()];
 
     if bc.decode_bool(p(ZrlNode::GreaterThan4))? == 0 {
@@ -1254,14 +1254,16 @@ mod tests {
                             if mag == 1 {
                                 saw_mag_one = true;
                                 assert_eq!(
-                                    next_prec, AcPrecContext::WasOne,
+                                    next_prec,
+                                    AcPrecContext::WasOne,
                                     "|coeff|=1 → next_prec must be WasOne (prec={prec:?}, ec={ec}, seed={seed:#x}, probs={node_probs:?})"
                                 );
                             } else {
                                 assert!(mag >= 2, "|coeff| must be ≥ 1 (got {coeff})");
                                 saw_mag_gt_one = true;
                                 assert_eq!(
-                                    next_prec, AcPrecContext::WasGreaterThanOne,
+                                    next_prec,
+                                    AcPrecContext::WasGreaterThanOne,
                                     "|coeff|>1 → next_prec must be WasGreaterThanOne (prec={prec:?}, ec={ec}, seed={seed:#x}, probs={node_probs:?})"
                                 );
                             }

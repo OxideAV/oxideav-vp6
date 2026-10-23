@@ -408,7 +408,7 @@ pub fn encode_no_mv_prob_updates(enc: &mut BoolEncoder) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv_decode::{MvProbs, MV_AXIS_X, MV_AXIS_Y};
+    use crate::mv_decode::{MV_AXIS_X, MV_AXIS_Y, MvProbs};
 
     fn bc_over(bytes: &[u8]) -> BoolCoder<'_> {
         BoolCoder::new(bytes).expect("at least 4 bytes")

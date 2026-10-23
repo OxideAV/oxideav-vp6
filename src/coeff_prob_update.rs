@@ -71,22 +71,22 @@
 //! is §12.2 / §13.2 / §13.3 / §13.3.3 as cited on each primitive. No
 //! external library code was consulted.
 
+use crate::Error;
 use crate::bool_coder::{BoolCoder, BoolEncoder};
 use crate::intra_frame::IntraProbs;
 use crate::prob_update::{
-    update_ac_probs, update_ac_probs_keyframe, update_dc_probs, update_dc_probs_keyframe,
-    update_zero_run_probs, KeyframeNodeCarry,
+    KeyframeNodeCarry, update_ac_probs, update_ac_probs_keyframe, update_dc_probs,
+    update_dc_probs_keyframe, update_zero_run_probs,
 };
 use crate::scan::DEFAULT_SCAN_ORDER;
 use crate::scan_update::{
-    build_custom_scan_order, custom_scan_order_to_raster, decode_scan_order_update, BandAssignment,
-    COEFF_BAND_UPDATE_FLAG_PROBS, DEFAULT_BAND_ASSIGNMENT,
+    BandAssignment, COEFF_BAND_UPDATE_FLAG_PROBS, DEFAULT_BAND_ASSIGNMENT, build_custom_scan_order,
+    custom_scan_order_to_raster, decode_scan_order_update,
 };
 use crate::tokens::{
-    dc_probs_to_node_contexts, AC_UPDATE_PROBS, NUM_PLANES, NUM_TREE_NODES, VP6_DC_UPDATE_PROBS,
+    AC_UPDATE_PROBS, NUM_PLANES, NUM_TREE_NODES, VP6_DC_UPDATE_PROBS, dc_probs_to_node_contexts,
 };
 use crate::zrl::ZRL_UPDATE_PROBS;
-use crate::Error;
 
 /// The persistent §13 coefficient-probability banks a decoder carries
 /// across frames, in the *raw* (pre-expansion) form the Figure-5 update
@@ -370,7 +370,7 @@ fn encode_coeff_band_updates_from(
 /// above `1` cannot be transmitted by the §13 update mechanism; this
 /// predicate lets a caller pick representable targets.
 pub fn node_prob_update_representable(target: u8) -> bool {
-    target == 1 || (target != 0 && target % 2 == 0)
+    target == 1 || (target != 0 && target.is_multiple_of(2))
 }
 
 /// The `b(7)` `NewNodeProbValue` that decodes to `target` via the §13
@@ -380,7 +380,7 @@ fn node_prob_update_value(target: u8) -> Option<u32> {
     if target == 1 {
         // value 0 → doubled 0 → clipped to 1.
         Some(0)
-    } else if target != 0 && target % 2 == 0 {
+    } else if target != 0 && target.is_multiple_of(2) {
         Some((target >> 1) as u32)
     } else {
         None

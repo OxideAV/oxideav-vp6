@@ -50,9 +50,9 @@
 //! the round-15 [`BoolCoder`] primitives (`decode_b1` / `decode_bool`
 //! / `decode_b`) over the verbatim §12.2 tables.
 
+use crate::Error;
 use crate::bool_coder::BoolCoder;
 use crate::scan::DEFAULT_SCAN_ORDER;
-use crate::Error;
 
 /// Number of custom scan order bands (§12.2 Table 16: band numbers
 /// `0..=15`).
@@ -329,9 +329,11 @@ mod tests {
         // Tail of the table saturates at 255.
         assert!(COEFF_BAND_UPDATE_FLAG_PROBS[51..].iter().all(|&p| p == 255));
         // Every non-dummy entry is a legal §7 node probability.
-        assert!(COEFF_BAND_UPDATE_FLAG_PROBS[1..]
-            .iter()
-            .all(|&p| (1..=255).contains(&p)));
+        assert!(
+            COEFF_BAND_UPDATE_FLAG_PROBS[1..]
+                .iter()
+                .all(|&p| (1..=255).contains(&p))
+        );
     }
 
     /// The default band assignment places zig-zag coefficient `c`

@@ -506,7 +506,7 @@ fn blit_buffer(dst: &mut Plane, left: usize, top: usize, data: &[u8], w: usize, 
 /// erratum #338, and the only shape this crate's drivers produce); a
 /// non-MB-aligned frame is returned unchanged.
 pub fn apply_output_scaling(frame: &Frame, scaling: OutputScaling) -> Frame {
-    if frame.h_fragments % 2 != 0 || frame.v_fragments % 2 != 0 {
+    if !frame.h_fragments.is_multiple_of(2) || !frame.v_fragments.is_multiple_of(2) {
         return frame.clone();
     }
     let coded = FrameGeometry::of_frame(frame);

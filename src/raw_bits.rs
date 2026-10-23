@@ -81,7 +81,7 @@
 
 use oxideav_core::bits::BitReader;
 
-use crate::huffman::{decode_symbol, HuffNode};
+use crate::huffman::{HuffNode, decode_symbol};
 
 /// Error returned when an `R(n)` read runs past the end of the byte
 /// stream the reader was constructed over.

@@ -113,7 +113,7 @@ impl Vp6CodecEncoder {
                 "vp6 encoder: width and height must be positive",
             ));
         }
-        if width % 8 != 0 || height % 8 != 0 {
+        if !width.is_multiple_of(8) || !height.is_multiple_of(8) {
             return Err(CoreError::invalid(
                 "vp6 encoder: width and height must be multiples of 8",
             ));
@@ -187,7 +187,7 @@ impl Vp6CodecEncoder {
             return Ok(self);
         }
         let f = factor as usize;
-        if self.h_fragments % 2 != 0 || self.v_fragments % 2 != 0 {
+        if !self.h_fragments.is_multiple_of(2) || !self.v_fragments.is_multiple_of(2) {
             return Err(CoreError::invalid(
                 "vp6 encoder: downscale needs macroblock-aligned dimensions (multiples of 16)",
             ));
@@ -379,8 +379,8 @@ pub fn make_encoder_with_q(params: &CodecParameters, dct_q_mask: u8) -> Result<B
 mod tests {
     use super::*;
     use crate::decoder::Vp6CodecDecoder;
-    use oxideav_core::frame::VideoPlane;
     use oxideav_core::Decoder;
+    use oxideav_core::frame::VideoPlane;
 
     fn params(w: u32, h: u32) -> CodecParameters {
         let mut p = CodecParameters::video(CodecId::new(VP6_CODEC_ID));

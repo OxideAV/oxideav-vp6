@@ -63,13 +63,13 @@
 //! Sourced from `docs/video/vp6/vp6_format.pdf` §10 / Table 10 (On2
 //! Technologies, document version 1.02, August 2006).
 
+use crate::Error;
 use crate::bool_coder::BoolCoder;
 use crate::dc_pred::ReferenceBucket;
 use crate::modes::CodingMode;
-use crate::mv_decode::{decode_mv_pair, MvProbs};
+use crate::mv_decode::{MvProbs, decode_mv_pair};
 use crate::mv_diff::{reconstruct_diff_mv, select_diff_reference_mv};
-use crate::near_mv::{resolve_near_mvs, MotionVector, NeighbourMv};
-use crate::Error;
+use crate::near_mv::{MotionVector, NeighbourMv, resolve_near_mvs};
 
 /// Number of luma blocks the §10 `CODE_INTER_FOURMV` mode covers
 /// per macroblock.
@@ -714,11 +714,7 @@ mod tests {
         for sum in -508..=508i32 {
             let expected = {
                 let q = (sum.abs() + 3) / 4; // ceil for non-negative
-                if sum < 0 {
-                    -q
-                } else {
-                    q
-                }
+                if sum < 0 { -q } else { q }
             };
             let got = i32::from(average_four_away_from_zero(sum));
             assert_eq!(got, expected, "mismatch at sum={sum}");

@@ -24,13 +24,13 @@
 //! Sourced from `docs/video/vp6/vp6_format.pdf` §5/§6/§13; no external
 //! library code was consulted.
 
-use crate::block_decode::{decode_block_coefficients_ctx, BlockCoeffs};
+use crate::Error;
+use crate::block_decode::{BlockCoeffs, decode_block_coefficients_ctx};
 use crate::bool_coder::BoolCoder;
-use crate::huff_coeff::{decode_block_coefficients_huffman, HuffmanCoeffTables, HuffmanRunState};
+use crate::huff_coeff::{HuffmanCoeffTables, HuffmanRunState, decode_block_coefficients_huffman};
 use crate::intra_frame::IntraProbs;
 use crate::raw_bits::RawBitReader;
 use crate::tokens::{AcPlane, DcContext};
-use crate::Error;
 
 /// Where (and with which coder) a frame's §13 DCT tokens are read from.
 /// See the module docs for the three §5/§6 shapes.

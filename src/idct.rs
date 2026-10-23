@@ -379,7 +379,7 @@ mod tests {
         let max_dequant: i32 = 2114 * 376;
         let mut block = [max_dequant; 64];
         idct_block(&mut block); // must not panic
-                                // And a single max DC coefficient (the worst single-term case).
+        // And a single max DC coefficient (the worst single-term case).
         let mut dc_block = [0i32; 64];
         dc_block[0] = max_dequant;
         idct_block(&mut dc_block);

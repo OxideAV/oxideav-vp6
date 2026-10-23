@@ -75,12 +75,12 @@
 //! (On2 Technologies, document version 1.02, August 2006). No
 //! third-party VP6 implementation has been consulted at any stage.
 
+use crate::Error;
 use crate::bool_coder::BoolCoder;
 use crate::dc_pred::ReferenceBucket;
 use crate::modes::{CodingMode, MvSource};
 use crate::mv_diff::{reconstruct_diff_mv, select_diff_reference_mv};
-use crate::near_mv::{resolve_near_mvs, MotionVector, NeighbourMv};
-use crate::Error;
+use crate::near_mv::{MotionVector, NeighbourMv, resolve_near_mvs};
 
 /// Number of motion-vector axes (`x = 0`, `y = 1`).
 ///

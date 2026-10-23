@@ -41,17 +41,17 @@
 //! sequenced from `docs/video/vp6/vp6_format.pdf` §9–§17) plus the
 //! in-tree errata. No external library code was consulted.
 
+use crate::Error;
 use crate::bool_coder::BoolEncoder;
 use crate::coeff_prob_update::CoeffProbBanks;
 use crate::dc_pred::{DcPredictionContext, Neighbour, ReferenceBucket};
 use crate::dequant::DequantContext;
 use crate::forward_dct::fdct_block;
-use crate::frame_assembly::{Frame, BLOCK_DIM};
+use crate::frame_assembly::{BLOCK_DIM, Frame};
 use crate::reconstruct::INTRA_DC_LEVEL_SHIFT;
 use crate::scan::DEFAULT_SCAN_ORDER_RASTER_TO_ZIGZAG;
 use crate::token_encode::encode_block_coefficients;
 use crate::tokens::AcPlane;
-use crate::Error;
 
 /// Quantise one 8x8 raster-order DCT-coefficient block into scan-order
 /// quantised coefficients (the §15 dequant inverse).
@@ -467,7 +467,7 @@ fn encode_intra_frame_with_banks_impl(
     // §9 Table 2 transmits the geometry in 16-px MACROBLOCK units
     // (fixture-arbitrated erratum — see `Vp6HeaderTail`), so the coded
     // frame must be MB-aligned and each axis caps at 255 macroblocks.
-    if h_fragments % 2 != 0 || v_fragments % 2 != 0 {
+    if !h_fragments.is_multiple_of(2) || !v_fragments.is_multiple_of(2) {
         return Err(Error::NotImplemented);
     }
     let (mb_cols, mb_rows) = (h_fragments / 2, v_fragments / 2);
@@ -629,7 +629,7 @@ fn encode_intra_frame_multistream_with_banks_impl(
     let h_fragments = frame.h_fragments;
     let v_fragments = frame.v_fragments;
     // §9 geometry is in macroblock units (see `encode_intra_frame_with_banks`).
-    if h_fragments % 2 != 0 || v_fragments % 2 != 0 {
+    if !h_fragments.is_multiple_of(2) || !v_fragments.is_multiple_of(2) {
         return Err(Error::NotImplemented);
     }
     let (mb_cols, mb_rows) = (h_fragments / 2, v_fragments / 2);

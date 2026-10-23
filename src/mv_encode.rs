@@ -42,7 +42,7 @@
 //! implementation was consulted.
 
 use crate::bool_coder::BoolEncoder;
-use crate::mv_decode::{MvProbs, MV_AXIS_X, MV_AXIS_Y, NUM_MV_AXES};
+use crate::mv_decode::{MV_AXIS_X, MV_AXIS_Y, MvProbs, NUM_MV_AXES};
 
 /// The largest magnitude a single MV component can carry (§11.1: the long
 /// bit-stream is 8 bits, so the value tops out at `0xFF = 255`, but the

@@ -31,9 +31,9 @@ use oxideav_core::{
     Error as CoreError, Frame, Packet, Result, RuntimeContext, VideoFrame,
 };
 
+use crate::Error as Vp6Error;
 use crate::decode_frame::Vp6Decoder;
 use crate::frame_assembly::Frame as Vp6Frame;
-use crate::Error as Vp6Error;
 
 /// Canonical codec id under which this decoder registers — matches the
 /// `oxideav-vp8` / `oxideav-vp9` naming convention.

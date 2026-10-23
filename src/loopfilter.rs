@@ -869,7 +869,7 @@ mod tests {
     /// needed).
     #[test]
     fn boundaries_from_inter_decomposition() {
-        use crate::inter::{whole_sample_aligned, MvShift};
+        use crate::inter::{MvShift, whole_sample_aligned};
         // Luma MV (¼-sample units) that decomposes to whole=8: that's
         // an exact 8x8-aligned whole-sample offset.
         let mv_x = 32; // 32 / 4 = 8 whole samples.
