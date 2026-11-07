@@ -1202,6 +1202,7 @@ pub use zrl::{
 /// (parse the raw-bit frame-header prefix); future rounds will expand
 /// this as the decoder/encoder come online.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Input ran out before all required syntactic elements were
     /// consumed.

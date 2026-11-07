@@ -6,6 +6,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]`: the error enums `Error` and `AssemblyError` (code outside the crate that `match`es them needs a `_ =>` arm). The bitstream modules were already `#[doc(hidden)]`; the plane containers `Frame` / `Plane` and the two-slot `ReferenceFrames` are unchanged.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-vp6/compare/v0.0.9...v0.0.10) - 2026-10-23
 
 ### Other

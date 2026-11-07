@@ -115,6 +115,7 @@ pub const MB_LUMA_BLOCK_OFFSETS: [(usize, usize); MB_LUMA_BLOCKS] =
 
 /// Errors the frame-assembly stage can surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AssemblyError {
     /// A block placement would write outside the plane's pixel
     /// rectangle (block coordinate beyond the plane's block grid).
